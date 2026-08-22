@@ -66,6 +66,12 @@ precedence over the active config profile:
 The CLI does not perform an OAuth login flow yet. In bearer mode, provide an
 access token issued by your ServiceNow OAuth setup.
 
+Verify a configured instance end to end:
+
+```sh
+servicenow doctor
+```
+
 ## Incidents
 
 ```sh
@@ -162,3 +168,23 @@ make check
 
 The test suite uses a mock HTTP server and never requires a live ServiceNow
 instance.
+
+### Personal Developer Instance
+
+ServiceNow provides free Personal Developer Instances for development and
+learning. Copy the environment template and add the admin credentials shown on
+the Developer Site:
+
+```sh
+cp .env.e2e.example .env.e2e
+$EDITOR .env.e2e
+chmod 600 .env.e2e
+make test-e2e
+```
+
+The ignored live suite creates a uniquely named incident, verifies create/read/
+update/query/display-value/delete behavior, and cleans up its fixture. It also
+checks that invalid credentials map to the documented authentication error.
+
+Sign in to the Developer Site at least once every ten days to keep a free PDI
+from being reclaimed. Never use a PDI for production or business workloads.

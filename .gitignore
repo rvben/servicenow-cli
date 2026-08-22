@@ -1,4 +1,5 @@
 /target
 /dist
+/.env.e2e
 *.swp
 .DS_Store

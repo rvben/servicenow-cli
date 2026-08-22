@@ -3,6 +3,8 @@ use std::process::Command;
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::TempDir;
+use wiremock::matchers::{method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn command(config_home: &TempDir) -> Command {
     let mut command = Command::cargo_bin("servicenow").unwrap();
@@ -103,4 +105,50 @@ fn delete_requires_explicit_confirmation_before_network_access() {
             .unwrap()
             .contains("--yes")
     );
+}
+
+#[tokio::test]
+async fn doctor_verifies_authentication_and_table_access() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_user"))
+        .and(query_param(
+            "sysparm_query",
+            "sys_id=javascript:gs.getUserID()",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": "0123456789abcdef0123456789abcdef",
+                "user_name": "admin",
+                "name": "System Administrator",
+                "active": "true"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = command(&config_home)
+        .env("SERVICENOW_INSTANCE", server.uri())
+        .env("SERVICENOW_USERNAME", "admin")
+        .env("SERVICENOW_PASSWORD", "secret")
+        .arg("doctor")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["checks"][1]["name"], "authentication");
+    assert_eq!(result["checks"][1]["detail"], "admin");
+    assert_eq!(result["checks"][2]["name"], "table_api");
 }

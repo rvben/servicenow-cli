@@ -58,6 +58,9 @@ enum Command {
     #[command(subcommand)]
     Config(ConfigCommand),
 
+    /// Verify configuration, authentication, and Table API access
+    Doctor,
+
     /// Print the command tree as JSON for agent introspection
     Schema,
 
@@ -382,7 +385,76 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     match cli.command {
         Command::Incidents(command) => run_incidents(command, &client, &config, &output).await?,
         Command::Tables(command) => run_tables(command, &client, &config, &output).await?,
+        Command::Doctor => run_doctor(&client, &config, &output).await?,
         Command::Config(_) | Command::Schema | Command::Completions { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+async fn run_doctor(
+    client: &ServiceNowClient,
+    config: &Config,
+    output: &OutputConfig,
+) -> Result<(), ApiError> {
+    let users = client
+        .list_records(
+            "sys_user",
+            &ListOptions {
+                query: Some("sys_id=javascript:gs.getUserID()".into()),
+                fields: Some(vec![
+                    "sys_id".into(),
+                    "user_name".into(),
+                    "name".into(),
+                    "active".into(),
+                ]),
+                limit: 1,
+                ..ListOptions::default()
+            },
+        )
+        .await?;
+    let user = users.first().ok_or_else(|| {
+        ApiError::Other("authentication succeeded, but the current user was not returned".into())
+    })?;
+    let username = field_text(user, "user_name").unwrap_or_else(|| "unknown".into());
+
+    client
+        .list_records(
+            "incident",
+            &ListOptions {
+                fields: Some(vec!["sys_id".into(), "number".into()]),
+                limit: 1,
+                ..ListOptions::default()
+            },
+        )
+        .await?;
+
+    let checks = serde_json::json!([
+        {"name": "configuration", "ok": true, "detail": config.instance},
+        {"name": "authentication", "ok": true, "detail": username},
+        {"name": "table_api", "ok": true, "detail": "incident table is readable"},
+        {
+            "name": "write_safety",
+            "ok": true,
+            "detail": if config.read_only { "read-only mode enabled" } else { "write operations enabled" }
+        }
+    ]);
+    let result = serde_json::json!({
+        "ok": true,
+        "instance": client.site_url(),
+        "checks": checks,
+    });
+    if output.json {
+        output.value(&result);
+    } else {
+        println!("ServiceNow connection\n");
+        for check in result["checks"].as_array().expect("checks are an array") {
+            println!(
+                "  ✓ {:<16} {}",
+                check["name"].as_str().unwrap_or("check"),
+                check["detail"].as_str().unwrap_or("")
+            );
+        }
+        println!("\nReady.");
     }
     Ok(())
 }
@@ -660,6 +732,21 @@ fn combine_query(first: Option<&str>, second: Option<&str>) -> Option<String> {
 fn insert(body: &mut Map<String, Value>, name: &str, value: Option<String>) {
     if let Some(value) = value {
         body.insert(name.into(), Value::String(value));
+    }
+}
+
+fn field_text(record: &Value, field: &str) -> Option<String> {
+    let value = record.get(field)?;
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Object(value) => value
+            .get("display_value")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("value").and_then(Value::as_str))
+            .map(str::to_string),
+        _ => None,
     }
 }
 
