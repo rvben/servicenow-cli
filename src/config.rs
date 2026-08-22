@@ -232,7 +232,6 @@ impl Config {
 pub fn config_path() -> PathBuf {
     config_dir()
         .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("servicenow")
         .join("config.toml")
 }
 
@@ -424,9 +423,13 @@ fn save_file(file: &RawConfig) -> Result<(), ApiError> {
 }
 
 fn config_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SERVICENOW_CONFIG_DIR").filter(|value| !value.is_empty())
+    {
+        return Some(PathBuf::from(path));
+    }
     #[cfg(target_os = "windows")]
     {
-        dirs::config_dir()
+        dirs::config_dir().map(|path| path.join("servicenow"))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -434,6 +437,7 @@ fn config_dir() -> Option<PathBuf> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+            .map(|path| path.join("servicenow"))
     }
 }
 

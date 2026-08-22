@@ -10,6 +10,10 @@ fn command(config_home: &TempDir) -> Command {
     let mut command = Command::cargo_bin("servicenow").unwrap();
     command
         .env("XDG_CONFIG_HOME", config_home.path())
+        .env(
+            "SERVICENOW_CONFIG_DIR",
+            config_home.path().join("servicenow"),
+        )
         .env("XDG_CACHE_HOME", config_home.path().join("cache"))
         .env(
             "SERVICENOW_CACHE_DIR",
@@ -22,8 +26,6 @@ fn command(config_home: &TempDir) -> Command {
         .env_remove("SERVICENOW_AUTH_TYPE")
         .env_remove("SERVICENOW_PROFILE")
         .env_remove("SERVICENOW_READ_ONLY");
-    #[cfg(windows)]
-    command.env("APPDATA", config_home.path());
     command
 }
 
