@@ -66,7 +66,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: dist/*.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -101,7 +101,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --compatibility pypi --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
@@ -121,7 +121,7 @@ jobs:
           command: sdist
           args: --out dist
       - run: cp target/package/*.crate dist/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source-distributions
           path: dist/*
