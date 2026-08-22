@@ -1,5 +1,7 @@
 /target
 /dist
 /.env.e2e
+/AGENTS.md
+/ROADMAP.md
 *.swp
 .DS_Store

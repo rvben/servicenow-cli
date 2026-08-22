@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 
+use comfy_table::presets::UTF8_FULL_CONDENSED;
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use serde_json::{Map, Value};
 
 use crate::api::ApiError;
@@ -73,7 +75,7 @@ pub fn record_sys_id(record: &Value) -> Result<&str, ApiError> {
         .ok_or_else(|| ApiError::Other("ServiceNow response omitted sys_id".into()))
 }
 
-pub fn print_records(records: &[Value], requested_fields: Option<&[String]>) {
+pub fn print_records(records: &[Value], requested_fields: Option<&[String]>, color: bool) {
     if records.is_empty() {
         println!("No records found.");
         return;
@@ -91,10 +93,10 @@ pub fn print_records(records: &[Value], requested_fields: Option<&[String]>) {
                 .collect()
         })
         .collect();
-    print_table(&fields, &rows);
+    print_table(&fields, &rows, color);
 }
 
-pub fn print_record(record: &Value) {
+pub fn print_record(record: &Value, color: bool) {
     let Some(object) = record.as_object() else {
         println!("{}", display_value(record));
         return;
@@ -103,7 +105,7 @@ pub fn print_record(record: &Value) {
         .iter()
         .map(|(field, value)| vec![field.clone(), display_value(value)])
         .collect();
-    print_table(&["FIELD".into(), "VALUE".into()], &rows);
+    print_table(&["FIELD".into(), "VALUE".into()], &rows, color);
 }
 
 fn infer_fields(records: &[Value]) -> Vec<String> {
@@ -158,38 +160,24 @@ fn display_value(value: &Value) -> String {
     }
 }
 
-fn print_table(headers: &[String], rows: &[Vec<String>]) {
-    let widths: Vec<usize> = headers
-        .iter()
-        .enumerate()
-        .map(|(index, header)| {
-            rows.iter()
-                .filter_map(|row| row.get(index))
-                .map(|cell| cell.chars().count())
-                .max()
-                .unwrap_or(0)
-                .max(header.chars().count())
-                .min(60)
-        })
-        .collect();
-    print_row(headers, &widths);
-    let separators: Vec<String> = widths.iter().map(|width| "-".repeat(*width)).collect();
-    print_row(&separators, &widths);
-    for row in rows {
-        print_row(row, &widths);
+fn print_table(headers: &[String], rows: &[Vec<String>], color: bool) {
+    let header = headers.iter().map(|value| {
+        let cell = Cell::new(value).add_attribute(Attribute::Bold);
+        if color { cell.fg(Color::Cyan) } else { cell }
+    });
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(header)
+        .set_truncation_indicator("…");
+    if !color {
+        table.force_no_tty();
     }
-}
-
-fn print_row(cells: &[String], widths: &[usize]) {
-    let rendered: Vec<String> = cells
-        .iter()
-        .zip(widths)
-        .map(|(cell, width)| {
-            let shortened: String = cell.chars().take(*width).collect();
-            format!("{shortened:width$}")
-        })
-        .collect();
-    println!("{}", rendered.join("  ").trim_end());
+    for row in rows {
+        table.add_row(row);
+    }
+    println!("{table}");
 }
 
 #[cfg(test)]

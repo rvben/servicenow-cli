@@ -1,88 +1,80 @@
 # servicenow-cli
 
-An unofficial, agent-friendly command-line client for ServiceNow. It combines convenient
-incident commands with generic access to every table your ServiceNow account is
-allowed to use.
+[![CI](https://github.com/rvben/servicenow-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/rvben/servicenow-cli/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/servicenow-cli.svg)](https://crates.io/crates/servicenow-cli)
+[![PyPI](https://img.shields.io/pypi/v/servicenow-cli.svg)](https://pypi.org/project/servicenow-cli/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-- Auto-JSON when stdout is piped
-- Stable error kinds and exit codes
-- Basic and bearer-token authentication
-- Named config profiles and a read-only safety mode
-- Generic Table API CRUD for standard and custom tables
-- Offline command schema and shell completions
+Fast, safe, human-friendly ServiceNow operations from the terminal.
 
-## Build and install
+`servicenow` is an unofficial open-source CLI for people, scripts, and agents.
+It pairs focused daily workflows with generic Table API access, works through
+supported instance APIs, and requires no instance-side CLI plugin.
+
+```text
+$ servicenow incidents mine
+┌────────────┬──────────┬─────────────────────────┬─────────────┐
+│ number     │ priority │ short_description       │ state       │
+╞════════════╪══════════╪═════════════════════════╪═════════════╡
+│ INC0010042 │ 2        │ VPN unavailable         │ In Progress │
+└────────────┴──────────┴─────────────────────────┴─────────────┘
+```
+
+## Why it feels different
+
+- Workflow-first commands for incidents, with every table still available.
+- Human inputs such as incident numbers, user names, emails, group names, and
+  `@me`; no routine `sys_id` hunting.
+- Secure interactive login with Basic, bearer, or OAuth + PKCE authentication.
+- Credentials in the operating-system keychain, not plaintext profile files.
+- Beautiful responsive tables for humans; deterministic JSON, JSONL, YAML, and
+  CSV for automation.
+- Read-only profiles, semantic editor patches, dry runs, and explicit dangerous
+  operation confirmation.
+- Stable error kinds and exit codes for scripts and agents.
+
+## Install
+
+Both packages install the `servicenow` binary:
+
+```sh
+cargo install servicenow-cli --locked
+
+# or
+pipx install servicenow-cli
+```
+
+From a checkout:
 
 ```sh
 cargo install --path .
-
-# Or, from this checkout:
-make install
 ```
 
-The installed binary is `servicenow`.
-
-## Configuration
-
-Run `servicenow config init` to print the resolved config path and an example.
-On macOS and Linux the default is `~/.config/servicenow/config.toml`, honoring
-`XDG_CONFIG_HOME` when set.
-
-```toml
-[default]
-instance = "dev12345"
-username = "api-user"
-password = "your-password"
-auth_type = "basic"
-read_only = false
-
-[profiles.production]
-instance = "company"
-token = "oauth-access-token"
-auth_type = "bearer"
-read_only = true
-```
-
-Keep the file private:
+## Two-minute start
 
 ```sh
-chmod 600 ~/.config/servicenow/config.toml
-```
+# Prompts securely; the password is stored in your OS keychain.
+servicenow auth login work \
+  --instance company \
+  --method basic \
+  --username api-user
 
-Credentials are intentionally not accepted as command-line flags because
-process arguments can be visible to other users. Environment variables take
-precedence over the active config profile:
-
-| Variable | Purpose |
-|---|---|
-| `SERVICENOW_INSTANCE` | Short instance name, host, or full base URL |
-| `SERVICENOW_USERNAME` | Basic-auth username |
-| `SERVICENOW_PASSWORD` | Basic-auth password |
-| `SERVICENOW_TOKEN` | OAuth bearer access token |
-| `SERVICENOW_AUTH_TYPE` | `basic` (default) or `bearer` |
-| `SERVICENOW_PROFILE` | Named profile |
-| `SERVICENOW_READ_ONLY` | Block all mutations when true |
-
-The CLI does not perform an OAuth login flow yet. In bearer mode, provide an
-access token issued by your ServiceNow OAuth setup.
-
-Verify a configured instance end to end:
-
-```sh
 servicenow doctor
+servicenow incidents mine
+servicenow incidents show INC0010042
 ```
 
-## Incidents
+For OAuth, bearer-token, CI, migration, and production-profile guidance, see
+[Authentication and profiles](docs/authentication.md).
+
+## Incident workflows
 
 ```sh
-# List and filter with an encoded ServiceNow query
+# Find work
 servicenow incidents list --active
 servicenow incidents list --query 'priority=1^ORDERBYDESCsys_updated_on'
 servicenow incidents mine
-
-# Show by incident number or sys_id
-servicenow incidents show INC0010001
-servicenow incidents show 0123456789abcdef0123456789abcdef
+servicenow incidents show INC0010042
 
 # Create and update
 servicenow incidents create \
@@ -90,60 +82,81 @@ servicenow incidents create \
   --description "Unable to connect since 08:30" \
   --impact 2 --urgency 2
 
-servicenow incidents update INC0010001 \
-  --state 2 --work-notes "Investigating the gateway"
+servicenow incidents update INC0010042 --state 2
+
+# Focused daily actions
+servicenow incidents note INC0010042 "Investigating the gateway"
+servicenow incidents assign INC0010042 --to ada@example.com --group "Network"
+servicenow incidents open INC0010042
+servicenow incidents watch INC0010042
 ```
 
-Use repeated `--field name=value` arguments for instance-specific fields. Values
-that are valid JSON become their corresponding JSON type; other values remain
-strings.
+Edit safely in `$EDITOR`. The document contains only curated editable fields;
+the CLI shows a diff, confirms, and PATCHes only values that changed:
 
 ```sh
-servicenow incidents create --short-description "Laptop setup" \
-  --field u_office=Amsterdam --field notify=true
+servicenow incidents edit INC0010042
+
+# Review a non-interactive plan without writing, even on a read-only profile.
+servicenow incidents edit INC0010042 --file incident.yaml --dry-run
+servicenow incidents note INC0010042 --file note.md --dry-run
+servicenow incidents assign INC0010042 --to @me --dry-run
 ```
 
-## Generic Table API
+Use repeated `--field name=value` arguments for instance-specific fields.
+Values that parse as JSON retain their JSON type.
+
+## Discover your instance
+
+ServiceNow tables, choices, and custom fields vary by instance. The CLI can
+cache its dictionary locally and resolve human references before writes:
 
 ```sh
-# Read records from any allowed table
+servicenow schema incident --refresh
+servicenow choices incident state
+servicenow resolve user ada@example.com
+servicenow resolve group "Network"
+```
+
+Cached metadata contains no credentials or record data.
+
+## Every ServiceNow table
+
+Focused commands never take away generic access:
+
+```sh
 servicenow tables list cmdb_ci \
   --query 'operational_status=1' \
   --fields sys_id,name,sys_class_name --limit 100
 
 servicenow tables get cmdb_ci 0123456789abcdef0123456789abcdef
-
-# Create from inline JSON or stdin
 servicenow tables create u_example --data '{"name":"Demo","active":true}'
-printf '%s' '{"name":"Demo"}' | servicenow tables create u_example --data -
-
-# Update and delete
 servicenow tables update u_example 0123456789abcdef0123456789abcdef \
   --field active=false
 servicenow tables delete u_example 0123456789abcdef0123456789abcdef --yes
 ```
 
-ServiceNow reference fields can be returned as raw values, display values, or
-both:
+Only records and fields allowed by the authenticated user's ServiceNow ACLs are
+available.
+
+## Output and automation contract
+
+Interactive stdout uses a table. Piped stdout automatically becomes JSON. An
+explicit format always wins:
 
 ```sh
-servicenow incidents show INC0010001 --display-value all
-servicenow tables list sys_user --display-value true
+servicenow incidents list --output json
+servicenow incidents list --output jsonl
+servicenow incidents list --output yaml
+servicenow incidents list --output csv
+servicenow incidents list --output table
 ```
 
-## Automation contract
+Data goes to stdout; status messages and errors go to stderr. `--quiet`
+suppresses status messages. `--no-color` and the `NO_COLOR` environment
+variable disable ANSI color.
 
-When stdout is not a terminal, commands produce JSON automatically. Override
-that with `--output text` or `--output json`. Data goes to stdout; informational
-messages and errors go to stderr.
-
-```sh
-servicenow incidents list | jq '.result[].number'
-servicenow schema | jq '.commands[].name'
-servicenow completions zsh > _servicenow
-```
-
-Errors use this envelope in machine-readable mode:
+Machine-readable errors use a stable envelope:
 
 ```json
 {"error":{"kind":"not_found","message":"not found: ..."}}
@@ -160,31 +173,54 @@ Errors use this envelope in machine-readable mode:
 | 6 | Rate limited |
 | 7 | Conflict or ambiguous match |
 
-## Development
+The offline command schema and generated completions make integration easy:
+
+```sh
+servicenow schema | jq '.commands[].name'
+servicenow completions zsh > _servicenow
+```
+
+## Configuration precedence
+
+Command options override environment variables, which override the active
+profile. Environment variables are useful for ephemeral automation:
+
+| Variable | Purpose |
+|---|---|
+| `SERVICENOW_INSTANCE` | Instance name, hostname, or full base URL |
+| `SERVICENOW_USERNAME` | Basic-auth username |
+| `SERVICENOW_PASSWORD` | Basic-auth password |
+| `SERVICENOW_TOKEN` | Bearer/OAuth access token |
+| `SERVICENOW_AUTH_TYPE` | `basic`, `bearer`, or `oauth` |
+| `SERVICENOW_PROFILE` | Named profile |
+| `SERVICENOW_READ_ONLY` | Block all actual mutations when true |
+| `SERVICENOW_CACHE_DIR` | Override the metadata cache root |
+
+```sh
+servicenow profile list
+servicenow profile use production
+servicenow auth status
+servicenow auth logout
+```
+
+## Development and release trust
 
 ```sh
 make check
+make test-e2e # requires an ignored .env.e2e file and a PDI
 ```
 
-The test suite uses a mock HTTP server and never requires a live ServiceNow
-instance.
+The default suite uses mock servers. The ignored PDI lifecycle suite creates an
+isolated incident, verifies CRUD/query/display-value behavior, and cleans it up.
 
-### Personal Developer Instance
+CI runs formatting, linting, tests on Linux/macOS/Windows, and a RustSec audit.
+Tagged releases produce native archives, Cargo/PyPI packages, SHA-256 checksums,
+a CycloneDX SBOM, and GitHub artifact attestations. See [SECURITY.md](SECURITY.md),
+[SUPPORT.md](SUPPORT.md), and the [release runbook](docs/releasing.md).
 
-ServiceNow provides free Personal Developer Instances for development and
-learning. Copy the environment template and add the admin credentials shown on
-the Developer Site:
+## Status
 
-```sh
-cp .env.e2e.example .env.e2e
-$EDITOR .env.e2e
-chmod 600 .env.e2e
-make test-e2e
-```
+This project is unofficial and is not affiliated with or supported by
+ServiceNow. ServiceNow is a trademark of ServiceNow, Inc.
 
-The ignored live suite creates a uniquely named incident, verifies create/read/
-update/query/display-value/delete behavior, and cleans up its fixture. It also
-checks that invalid credentials map to the documented authentication error.
-
-Sign in to the Developer Site at least once every ten days to keep a free PDI
-from being reclaimed. Never use a PDI for production or business workloads.
+Licensed under the [MIT License](LICENSE).

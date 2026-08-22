@@ -9,7 +9,13 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
+description = "Fast, safe, human-friendly ServiceNow operations from the terminal"
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/rvben/servicenow-cli"
+Repository = "https://github.com/rvben/servicenow-cli"
+Issues = "https://github.com/rvben/servicenow-cli/issues"
 
 [tool.maturin]
 bindings = "bin"

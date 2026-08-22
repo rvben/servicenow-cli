@@ -1,6 +1,9 @@
 mod client;
 
-pub use client::{DisplayValue, ListOptions, ServiceNowClient};
+pub use client::{
+    DisplayValue, ListOptions, ServiceNowClient, normalize_instance, validate_sys_id,
+    validate_table,
+};
 
 use std::fmt;
 

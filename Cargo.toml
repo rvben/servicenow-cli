@@ -1,9 +1,12 @@
 [package]
 name = "servicenow-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
-description = "Unofficial agent-friendly CLI for ServiceNow"
+description = "Fast, safe, human-friendly ServiceNow operations from the terminal"
+homepage = "https://github.com/rvben/servicenow-cli"
+repository = "https://github.com/rvben/servicenow-cli"
+documentation = "https://docs.rs/servicenow-cli"
 license = "MIT"
 keywords = ["servicenow", "cli", "incidents", "itsm"]
 categories = ["command-line-utilities"]
@@ -16,15 +19,23 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
+comfy-table = "8"
+csv = "1"
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 dirs = "6"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
+keyring = "4.1"
+oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
+open = "5.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "form"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde-saphyr = "1.1"
+similar = "3.1"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
 toml = "1.1"
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
-tempfile = "3"
 wiremock = "0.6"

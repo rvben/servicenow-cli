@@ -1,18 +1,27 @@
+use std::io::{IsTerminal, Read};
+
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use dialoguer::{Confirm, Editor, Input, Password};
 use serde_json::{Map, Value};
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::commands::{
     INCIDENT_LIST_FIELDS, build_body, parse_fields, print_record, print_records, record_sys_id,
 };
-use servicenow_cli::config::{Config, config_path, init_document};
-use servicenow_cli::output::{OutputConfig, exit_code, print_error};
+use servicenow_cli::config::{
+    AuthType, Config, ProfileConfig, active_profile_name, config_path, init_document,
+    profile_summaries, remove_profile, save_profile, use_profile,
+};
+use servicenow_cli::credentials::{self, StoredCredential};
+use servicenow_cli::incident;
+use servicenow_cli::metadata::{self, ReferenceKind};
+use servicenow_cli::output::{OutputConfig, OutputFormat, exit_code, print_error};
 
 #[derive(Parser)]
 #[command(
     name = "servicenow",
     version,
-    about = "Agent-friendly CLI for ServiceNow",
+    about = "Fast, safe, human-friendly ServiceNow operations from the terminal",
     arg_required_else_help = true
 )]
 struct Cli {
@@ -28,7 +37,7 @@ struct Cli {
     #[arg(long, env = "SERVICENOW_PROFILE")]
     profile: Option<String>,
 
-    /// Output format: auto, text, or json
+    /// Output format: auto, table, text, json, jsonl, yaml, or csv
     #[arg(short, long, global = true, default_value = "auto")]
     output: String,
 
@@ -40,12 +49,24 @@ struct Cli {
     #[arg(long, global = true)]
     quiet: bool,
 
+    /// Disable ANSI color even when stdout is a terminal
+    #[arg(long, global = true)]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Sign in securely and inspect authentication
+    #[command(subcommand)]
+    Auth(AuthCommand),
+
+    /// Manage named instance profiles
+    #[command(subcommand, visible_alias = "profiles")]
+    Profile(ProfileCommand),
+
     /// Work with incidents
     #[command(subcommand, visible_alias = "incident")]
     Incidents(IncidentsCommand),
@@ -61,13 +82,110 @@ enum Command {
     /// Verify configuration, authentication, and Table API access
     Doctor,
 
-    /// Print the command tree as JSON for agent introspection
-    Schema,
+    /// Inspect the command tree or an instance table schema
+    Schema {
+        /// Table whose dictionary metadata should be shown
+        table: Option<String>,
+
+        /// Refresh metadata from the instance
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// List the configured choices for a table field
+    Choices {
+        table: String,
+        field: String,
+
+        /// Refresh metadata from the instance
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Resolve a human user/group identifier to a ServiceNow record
+    Resolve {
+        #[arg(value_enum)]
+        kind: ReferenceKind,
+        value: String,
+    },
 
     /// Generate shell completions
     Completions {
         /// Shell whose completion script to generate
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Sign in and store the credential in the operating-system keychain
+    Login {
+        /// Profile name to create or replace
+        #[arg(default_value = "default")]
+        profile: String,
+
+        /// Instance name, hostname, or URL
+        #[arg(long)]
+        instance: Option<String>,
+
+        /// Authentication method
+        #[arg(long, value_enum, default_value = "basic")]
+        method: AuthType,
+
+        /// Username for Basic authentication
+        #[arg(long)]
+        username: Option<String>,
+
+        /// OAuth application client ID
+        #[arg(long)]
+        client_id: Option<String>,
+
+        /// Space-separated OAuth scopes
+        #[arg(long, default_value = "useraccount")]
+        scope: String,
+
+        /// Registered loopback OAuth redirect URI
+        #[arg(long, default_value = "http://127.0.0.1:8484/callback")]
+        redirect_uri: String,
+
+        /// Read the password/token/client secret from stdin
+        #[arg(long)]
+        secret_stdin: bool,
+
+        /// Print the OAuth URL without opening a browser
+        #[arg(long)]
+        no_browser: bool,
+
+        /// Block all writes when this profile is active
+        #[arg(long)]
+        read_only: bool,
+    },
+
+    /// Remove the stored credential but keep profile settings
+    Logout {
+        /// Profile whose credential should be removed
+        profile: Option<String>,
+    },
+
+    /// Show the active identity and credential health
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List configured profiles
+    List,
+
+    /// Select the default profile for future commands
+    Use { name: String },
+
+    /// Remove a profile and its keychain credential
+    Remove {
+        name: String,
+
+        /// Confirm removal without prompting
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -197,6 +315,87 @@ enum IncidentsCommand {
         #[arg(long = "field")]
         fields: Vec<String>,
     },
+
+    /// Edit an incident safely in your preferred editor
+    Edit {
+        /// Incident number or sys_id
+        identifier: String,
+
+        /// Read edited YAML from a file instead of opening an editor
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+
+        /// Preview the semantic patch without updating ServiceNow
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Apply without an interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Append a work note to an incident
+    Note {
+        /// Incident number or sys_id
+        identifier: String,
+
+        /// Work note text
+        text: Option<String>,
+
+        /// Read the work note from a file, or - for stdin
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+
+        /// Preview the update without sending it
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Assign an incident using a user name, email, group name, or sys_id
+    Assign {
+        /// Incident number or sys_id
+        identifier: String,
+
+        /// User name, email, display name, @me, or sys_id
+        #[arg(long = "to")]
+        assignee: Option<String>,
+
+        /// Assignment group name or sys_id
+        #[arg(long)]
+        group: Option<String>,
+
+        /// Preview the update without sending it
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Open an incident in the ServiceNow web interface
+    Open {
+        /// Incident number or sys_id
+        identifier: String,
+
+        /// Print the URL instead of opening a browser
+        #[arg(long)]
+        print: bool,
+    },
+
+    /// Watch an incident and stream field changes
+    Watch {
+        /// Incident number or sys_id
+        identifier: String,
+
+        /// Polling interval in seconds
+        #[arg(long, default_value = "5")]
+        interval: u64,
+
+        /// Stop after this many polls; omit to watch until Ctrl-C
+        #[arg(long)]
+        count: Option<usize>,
+
+        /// Comma-separated fields to watch
+        #[arg(long)]
+        fields: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -298,9 +497,11 @@ enum ConfigCommand {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let machine_errors = cli.output == "json"
-        || (cli.output == "auto"
-            && (cli.json || !std::io::IsTerminal::is_terminal(&std::io::stdout())));
+    let machine_errors = matches!(
+        cli.output.as_str(),
+        "json" | "jsonl" | "ndjson" | "yaml" | "yml" | "csv"
+    ) || (cli.output == "auto"
+        && (cli.json || !std::io::IsTerminal::is_terminal(&std::io::stdout())));
     if let Err(error) = run(cli).await {
         print_error(&error, machine_errors);
         std::process::exit(exit_code(&error));
@@ -308,10 +509,104 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), ApiError> {
-    let output = OutputConfig::new(&cli.output, cli.json, cli.quiet)?;
+    let output = OutputConfig::new(&cli.output, cli.json, cli.quiet, cli.no_color)?;
 
     match cli.command {
-        Command::Schema => {
+        Command::Auth(AuthCommand::Login {
+            profile,
+            instance,
+            method,
+            username,
+            client_id,
+            scope,
+            redirect_uri,
+            secret_stdin,
+            no_browser,
+            read_only,
+        }) => {
+            run_auth_login(
+                &output,
+                profile,
+                instance,
+                method,
+                username,
+                client_id,
+                scope,
+                redirect_uri,
+                secret_stdin,
+                no_browser,
+                read_only,
+            )
+            .await?;
+            return Ok(());
+        }
+        Command::Auth(AuthCommand::Logout { profile }) => {
+            let profile = profile.unwrap_or(active_profile_name()?);
+            let removed = credentials::delete(&profile)?;
+            let value = serde_json::json!({
+                "profile": profile,
+                "loggedOut": removed,
+            });
+            if output.json {
+                output.value(&value);
+            } else if removed {
+                println!("Logged out of profile {profile}.");
+            } else {
+                println!("Profile {profile} had no stored credential.");
+            }
+            return Ok(());
+        }
+        Command::Profile(ProfileCommand::List) => {
+            let profiles = profile_summaries()?;
+            if output.json {
+                output.value(&serde_json::json!({"result": profiles}));
+            } else {
+                let records = profiles
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| ApiError::Other(error.to_string()))?;
+                print_records(&records, None, output.color);
+            }
+            return Ok(());
+        }
+        Command::Profile(ProfileCommand::Use { name }) => {
+            use_profile(&name)?;
+            if output.json {
+                output.value(&serde_json::json!({"activeProfile": name}));
+            } else {
+                println!("Now using profile {name}.");
+            }
+            return Ok(());
+        }
+        Command::Profile(ProfileCommand::Remove { name, yes }) => {
+            let confirmed = yes
+                || (std::io::stdin().is_terminal()
+                    && Confirm::new()
+                        .with_prompt(format!(
+                            "Remove profile '{name}' and its stored credential?"
+                        ))
+                        .default(false)
+                        .interact()
+                        .map_err(|error| ApiError::Other(error.to_string()))?);
+            if !confirmed {
+                return Err(ApiError::InvalidInput(
+                    "profile removal cancelled; use --yes for non-interactive removal".into(),
+                ));
+            }
+            let removed = remove_profile(&name)?;
+            let credential_removed = credentials::delete(&name)?;
+            if !removed && !credential_removed {
+                return Err(ApiError::NotFound(format!("config profile '{name}'")));
+            }
+            if output.json {
+                output.value(&serde_json::json!({"removed": true, "profile": name}));
+            } else {
+                println!("Removed profile {name}.");
+            }
+            return Ok(());
+        }
+        Command::Schema { table: None, .. } => {
             output.value(&command_schema(&Cli::command()));
             return Ok(());
         }
@@ -334,10 +629,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                     toml::to_string_pretty(&document["example"])
                         .unwrap_or_else(|_| "[default]\ninstance = \"dev12345\"".into())
                 );
-                println!(
-                    "{}",
-                    document["recommendedPermissions"].as_str().unwrap_or("")
-                );
+                println!("Next: {}", document["setupCommand"].as_str().unwrap_or(""));
             }
             return Ok(());
         }
@@ -352,7 +644,10 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         _ => {}
     }
 
-    let config = Config::load(cli.instance, cli.username, cli.profile)?;
+    let mut config = Config::load(cli.instance, cli.username, cli.profile)?;
+    if servicenow_cli::auth::refresh_if_needed(&mut config).await? {
+        output.message("OAuth access token refreshed.");
+    }
     if matches!(cli.command, Command::Config(ConfigCommand::Show)) {
         let masked = mask_secret(&config.secret);
         let value = serde_json::json!({
@@ -360,17 +655,14 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             "profile": config.profile,
             "instance": config.instance,
             "username": config.username,
-            "authType": match config.auth_type {
-                servicenow_cli::config::AuthType::Basic => "basic",
-                servicenow_cli::config::AuthType::Bearer => "bearer",
-            },
+            "authType": config.auth_type.as_str(),
             "secretMasked": masked,
             "readOnly": config.read_only,
         });
         if output.json {
             output.value(&value);
         } else {
-            print_record(&value);
+            print_record(&value, output.color);
         }
         return Ok(());
     }
@@ -385,10 +677,281 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     match cli.command {
         Command::Incidents(command) => run_incidents(command, &client, &config, &output).await?,
         Command::Tables(command) => run_tables(command, &client, &config, &output).await?,
-        Command::Doctor => run_doctor(&client, &config, &output).await?,
-        Command::Config(_) | Command::Schema | Command::Completions { .. } => unreachable!(),
+        Command::Schema {
+            table: Some(table),
+            refresh,
+        } => run_table_schema(&table, refresh, &client, &config, &output).await?,
+        Command::Choices {
+            table,
+            field,
+            refresh,
+        } => run_choices(&table, &field, refresh, &client, &config, &output).await?,
+        Command::Resolve { kind, value } => {
+            let record = metadata::resolve_reference(&client, kind, &value).await?;
+            emit_record(&output, record);
+        }
+        Command::Doctor | Command::Auth(AuthCommand::Status) => {
+            run_doctor(&client, &config, &output).await?
+        }
+        Command::Auth(_)
+        | Command::Profile(_)
+        | Command::Config(_)
+        | Command::Schema { .. }
+        | Command::Completions { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
+}
+
+async fn run_table_schema(
+    table: &str,
+    refresh: bool,
+    client: &ServiceNowClient,
+    config: &Config,
+    output: &OutputConfig,
+) -> Result<(), ApiError> {
+    let metadata = if refresh {
+        metadata::sync_table(client, &config.profile, table).await?
+    } else if let Some(metadata) = metadata::load(&config.profile, table)? {
+        metadata
+    } else {
+        output.message("No cached metadata found; fetching it from the instance.");
+        metadata::sync_table(client, &config.profile, table).await?
+    };
+    if output.json {
+        output.value(&serde_json::json!({"result": metadata}));
+    } else {
+        println!(
+            "{}  {} fields  {} choice fields\n",
+            output.heading(&metadata.table),
+            metadata.fields.len(),
+            metadata.choices.len()
+        );
+        let records = metadata::metadata_as_records(&metadata);
+        let fields = [
+            "field".into(),
+            "label".into(),
+            "type".into(),
+            "reference".into(),
+            "mandatory".into(),
+            "read_only".into(),
+            "choices".into(),
+        ];
+        print_records(&records, Some(&fields), output.color);
+    }
+    Ok(())
+}
+
+async fn run_choices(
+    table: &str,
+    field: &str,
+    refresh: bool,
+    client: &ServiceNowClient,
+    config: &Config,
+    output: &OutputConfig,
+) -> Result<(), ApiError> {
+    let metadata = if refresh {
+        metadata::sync_table(client, &config.profile, table).await?
+    } else if let Some(metadata) = metadata::load(&config.profile, table)? {
+        metadata
+    } else {
+        metadata::sync_table(client, &config.profile, table).await?
+    };
+    if metadata.field(field).is_none() {
+        return Err(ApiError::NotFound(format!("field {table}.{field}")));
+    }
+    let choices = metadata.choices.get(field).cloned().unwrap_or_default();
+    if output.json {
+        output.value(&serde_json::json!({
+            "table": table,
+            "field": field,
+            "result": choices,
+        }));
+    } else if choices.is_empty() {
+        println!("No configured choices for {table}.{field}.");
+    } else {
+        let records = choices
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ApiError::Other(error.to_string()))?;
+        print_records(
+            &records,
+            Some(&["value".into(), "label".into(), "sequence".into()]),
+            output.color,
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_auth_login(
+    output: &OutputConfig,
+    profile: String,
+    instance: Option<String>,
+    method: AuthType,
+    username: Option<String>,
+    client_id: Option<String>,
+    scope: String,
+    redirect_uri: String,
+    secret_stdin: bool,
+    no_browser: bool,
+    read_only: bool,
+) -> Result<(), ApiError> {
+    servicenow_cli::config::validate_profile_name(&profile)?;
+    credentials::available()?;
+    let instance = required_prompt(instance, "ServiceNow instance")?;
+    let mut username = username;
+    let mut configured_client_id = None;
+    let credential = match method {
+        AuthType::Basic => {
+            username = Some(required_prompt(username, "Username")?);
+            StoredCredential::Basic {
+                password: read_login_secret(secret_stdin, "Password", false)?,
+            }
+        }
+        AuthType::Bearer => StoredCredential::Bearer {
+            access_token: read_login_secret(secret_stdin, "Access token", false)?,
+        },
+        AuthType::OAuth => {
+            let id = required_prompt(client_id, "OAuth client ID")?;
+            configured_client_id = Some(id.clone());
+            let client_secret = read_login_secret(secret_stdin, "OAuth client secret", true)?;
+            servicenow_cli::auth::oauth_login(
+                &instance,
+                &id,
+                (!client_secret.is_empty()).then_some(client_secret),
+                Some(&scope),
+                &redirect_uri,
+                !no_browser,
+            )
+            .await?
+        }
+    };
+
+    let client =
+        ServiceNowClient::new(&instance, username.as_deref(), credential.secret(), method)?;
+    let users = client
+        .list_records(
+            "sys_user",
+            &ListOptions {
+                query: Some("sys_id=javascript:gs.getUserID()".into()),
+                fields: Some(vec!["sys_id".into(), "user_name".into(), "name".into()]),
+                limit: 1,
+                ..ListOptions::default()
+            },
+        )
+        .await?;
+    if let Some(user) = users.first() {
+        username = field_text(user, "user_name").or(username);
+    }
+
+    credentials::store(&profile, &credential)?;
+    let mut profile_config = ProfileConfig::default();
+    profile_config.instance = Some(instance);
+    profile_config.username = username.clone();
+    profile_config.auth_type = Some(method.as_str().into());
+    profile_config.read_only = Some(read_only);
+    profile_config.credential_store = Some("keyring".into());
+    profile_config.client_id = configured_client_id;
+    profile_config.oauth_scope = matches!(method, AuthType::OAuth).then_some(scope);
+    profile_config.redirect_uri = matches!(method, AuthType::OAuth).then_some(redirect_uri);
+    if let Err(error) = save_profile(&profile, profile_config, true) {
+        let _ = credentials::delete(&profile);
+        return Err(error);
+    }
+
+    let result = serde_json::json!({
+        "profile": profile,
+        "instance": client.site_url(),
+        "username": username,
+        "authType": method.as_str(),
+        "readOnly": read_only,
+        "credentialStore": "os-keychain",
+        "authenticated": true,
+    });
+    if output.json {
+        output.value(&result);
+    } else {
+        println!("Signed in successfully.\n");
+        println!(
+            "  Profile      {}",
+            result["profile"].as_str().unwrap_or("")
+        );
+        println!(
+            "  Instance     {}",
+            result["instance"].as_str().unwrap_or("")
+        );
+        println!(
+            "  User         {}",
+            result["username"].as_str().unwrap_or("")
+        );
+        println!(
+            "  Auth         {}",
+            result["authType"].as_str().unwrap_or("")
+        );
+        println!(
+            "  Safety       {}",
+            if read_only {
+                "read-only"
+            } else {
+                "writes enabled"
+            }
+        );
+        println!("  Credentials  OS keychain");
+    }
+    Ok(())
+}
+
+fn required_prompt(value: Option<String>, prompt: &str) -> Result<String, ApiError> {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        return Ok(value.trim().into());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(ApiError::InvalidInput(format!(
+            "{prompt} is required in non-interactive mode"
+        )));
+    }
+    Input::<String>::new()
+        .with_prompt(prompt)
+        .interact_text()
+        .map_err(|error| ApiError::Other(format!("failed to read {prompt}: {error}")))
+        .and_then(|value| {
+            (!value.trim().is_empty())
+                .then(|| value.trim().into())
+                .ok_or_else(|| ApiError::InvalidInput(format!("{prompt} cannot be empty")))
+        })
+}
+
+fn read_login_secret(
+    from_stdin: bool,
+    prompt: &str,
+    allow_empty: bool,
+) -> Result<String, ApiError> {
+    let value = if from_stdin {
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .map_err(|error| ApiError::Other(format!("failed to read secret: {error}")))?;
+        value.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        if !std::io::stdin().is_terminal() {
+            return Err(ApiError::InvalidInput(format!(
+                "{prompt} requires --secret-stdin in non-interactive mode"
+            )));
+        }
+        Password::new()
+            .with_prompt(prompt)
+            .allow_empty_password(allow_empty)
+            .interact()
+            .map_err(|error| ApiError::Other(format!("failed to read {prompt}: {error}")))?
+    };
+    if value.is_empty() && !allow_empty {
+        Err(ApiError::InvalidInput(format!("{prompt} cannot be empty")))
+    } else {
+        Ok(value)
+    }
 }
 
 async fn run_doctor(
@@ -549,10 +1112,18 @@ async fn run_incidents(
             insert(&mut body, "category", category);
             insert(&mut body, "impact", impact);
             insert(&mut body, "urgency", urgency);
-            insert(&mut body, "assignment_group", assignment_group);
-            insert(&mut body, "assigned_to", assignee);
+            insert(
+                &mut body,
+                "assignment_group",
+                resolve_reference_id(client, ReferenceKind::Group, assignment_group).await?,
+            );
+            insert(
+                &mut body,
+                "assigned_to",
+                resolve_reference_id(client, ReferenceKind::User, assignee).await?,
+            );
             let record = client.create_record("incident", &body).await?;
-            output.message("Incident created.");
+            output.success("Incident created.");
             emit_record(output, record);
         }
         IncidentsCommand::Update {
@@ -569,7 +1140,11 @@ async fn run_incidents(
             insert(&mut body, "short_description", short_description);
             insert(&mut body, "description", description);
             insert(&mut body, "state", state);
-            insert(&mut body, "assigned_to", assignee);
+            insert(
+                &mut body,
+                "assigned_to",
+                resolve_reference_id(client, ReferenceKind::User, assignee).await?,
+            );
             insert(&mut body, "work_notes", work_notes);
             if body.is_empty() {
                 return Err(ApiError::InvalidInput(
@@ -585,11 +1160,344 @@ async fn run_incidents(
             .await?;
             let sys_id = record_sys_id(&existing)?.to_string();
             let record = client.update_record("incident", &sys_id, &body).await?;
-            output.message("Incident updated.");
+            output.success("Incident updated.");
             emit_record(output, record);
+        }
+        IncidentsCommand::Edit {
+            identifier,
+            file,
+            dry_run,
+            yes,
+        } => {
+            let existing = resolve_incident(client, &identifier, None, DisplayValue::All).await?;
+            let sys_id = record_sys_id(&existing)?.to_string();
+            let original = incident::edit_document(
+                &existing,
+                metadata::load(&config.profile, "incident")?.as_ref(),
+            )?;
+            let edited = match file {
+                Some(path) => read_file_or_stdin(&path, "edited incident")?,
+                None if std::io::stdin().is_terminal() => Editor::new()
+                    .extension(".yaml")
+                    .edit(&original)
+                    .map_err(|error| ApiError::Other(format!("failed to open editor: {error}")))?
+                    .ok_or_else(|| ApiError::InvalidInput("incident edit cancelled".into()))?,
+                None => {
+                    return Err(ApiError::InvalidInput(
+                        "an interactive terminal or --file is required for incident edit".into(),
+                    ));
+                }
+            };
+            let body = incident::changed_fields(&existing, incident::parse_edit_document(&edited)?);
+            if body.is_empty() {
+                if output.json {
+                    output.value(&serde_json::json!({
+                        "changed": false,
+                        "incident": identifier,
+                        "changes": {},
+                    }));
+                } else {
+                    println!("No changes to apply.");
+                }
+                return Ok(());
+            }
+            if dry_run {
+                emit_mutation_plan(output, "update", &identifier, &body);
+                return Ok(());
+            }
+            config.require_writable()?;
+            if !yes {
+                if !std::io::stdin().is_terminal() {
+                    return Err(ApiError::InvalidInput(
+                        "confirmation requires an interactive terminal; rerun with --yes".into(),
+                    ));
+                }
+                let diff = incident::unified_diff(&original, &edited);
+                if !diff.is_empty() {
+                    eprintln!("{diff}");
+                }
+                let confirmed = Confirm::new()
+                    .with_prompt(format!(
+                        "Apply {} changed field(s) to {identifier}?",
+                        body.len()
+                    ))
+                    .default(false)
+                    .interact()
+                    .map_err(|error| {
+                        ApiError::Other(format!("failed to confirm update: {error}"))
+                    })?;
+                if !confirmed {
+                    return Err(ApiError::InvalidInput("incident edit cancelled".into()));
+                }
+            }
+            let record = client.update_record("incident", &sys_id, &body).await?;
+            output.success(&format!("Updated {identifier} ({} field(s)).", body.len()));
+            emit_record(output, record);
+        }
+        IncidentsCommand::Note {
+            identifier,
+            text,
+            file,
+            dry_run,
+        } => {
+            let note = match (text, file) {
+                (Some(_), Some(_)) => {
+                    return Err(ApiError::InvalidInput(
+                        "provide work note text or --file, not both".into(),
+                    ));
+                }
+                (Some(text), None) => text,
+                (None, Some(path)) => read_file_or_stdin(&path, "work note")?,
+                (None, None) => {
+                    return Err(ApiError::InvalidInput(
+                        "work note text or --file is required".into(),
+                    ));
+                }
+            };
+            if note.trim().is_empty() {
+                return Err(ApiError::InvalidInput("work note cannot be empty".into()));
+            }
+            let existing = resolve_incident(
+                client,
+                &identifier,
+                Some(vec!["sys_id".into()]),
+                DisplayValue::False,
+            )
+            .await?;
+            let mut body = Map::new();
+            body.insert("work_notes".into(), Value::String(note));
+            if dry_run {
+                emit_mutation_plan(output, "append_work_note", &identifier, &body);
+                return Ok(());
+            }
+            config.require_writable()?;
+            let record = client
+                .update_record("incident", record_sys_id(&existing)?, &body)
+                .await?;
+            output.success(&format!("Added a work note to {identifier}."));
+            emit_record(output, record);
+        }
+        IncidentsCommand::Assign {
+            identifier,
+            assignee,
+            group,
+            dry_run,
+        } => {
+            if assignee.is_none() && group.is_none() {
+                return Err(ApiError::InvalidInput(
+                    "provide --to, --group, or both".into(),
+                ));
+            }
+            let mut body = Map::new();
+            insert(
+                &mut body,
+                "assigned_to",
+                resolve_reference_id(client, ReferenceKind::User, assignee).await?,
+            );
+            insert(
+                &mut body,
+                "assignment_group",
+                resolve_reference_id(client, ReferenceKind::Group, group).await?,
+            );
+            let existing = resolve_incident(
+                client,
+                &identifier,
+                Some(vec!["sys_id".into()]),
+                DisplayValue::False,
+            )
+            .await?;
+            if dry_run {
+                emit_mutation_plan(output, "assign", &identifier, &body);
+                return Ok(());
+            }
+            config.require_writable()?;
+            let record = client
+                .update_record("incident", record_sys_id(&existing)?, &body)
+                .await?;
+            output.success(&format!("Assigned {identifier}."));
+            emit_record(output, record);
+        }
+        IncidentsCommand::Open { identifier, print } => {
+            let existing = resolve_incident(
+                client,
+                &identifier,
+                Some(vec!["sys_id".into(), "number".into()]),
+                DisplayValue::False,
+            )
+            .await?;
+            let url = client.record_url("incident", record_sys_id(&existing)?);
+            if output.json {
+                output.value(&serde_json::json!({
+                    "incident": field_text(&existing, "number").unwrap_or(identifier),
+                    "url": url,
+                }));
+            } else if print || !std::io::stdout().is_terminal() {
+                println!("{url}");
+            } else {
+                open::that(&url).map_err(|error| {
+                    ApiError::Other(format!("failed to open ServiceNow in a browser: {error}"))
+                })?;
+                output.success("Opened incident in ServiceNow.");
+            }
+        }
+        IncidentsCommand::Watch {
+            identifier,
+            interval,
+            count,
+            fields,
+        } => {
+            if interval == 0 {
+                return Err(ApiError::InvalidInput(
+                    "--interval must be greater than zero".into(),
+                ));
+            }
+            if count == Some(0) {
+                return Err(ApiError::InvalidInput(
+                    "--count must be greater than zero".into(),
+                ));
+            }
+            if output.format == OutputFormat::Csv {
+                return Err(ApiError::InvalidInput(
+                    "incident watch is a stream; use table, json, jsonl, or yaml output".into(),
+                ));
+            }
+            let fields = parse_fields(fields.as_deref()).unwrap_or_else(|| {
+                [
+                    "sys_id",
+                    "number",
+                    "short_description",
+                    "state",
+                    "priority",
+                    "assigned_to",
+                    "assignment_group",
+                    "sys_updated_on",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+            });
+            let mut previous =
+                resolve_incident(client, &identifier, Some(fields.clone()), DisplayValue::All)
+                    .await?;
+            let sys_id = record_sys_id(&previous)?.to_string();
+            emit_watch_event(output, &identifier, 0, &[], Some(&previous));
+            let mut polls = 0usize;
+            loop {
+                if count.is_some_and(|limit| polls >= limit) {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        output.message("Watch stopped.");
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+                }
+                polls += 1;
+                let current = client
+                    .get_record("incident", &sys_id, Some(&fields), DisplayValue::All)
+                    .await?;
+                let changes = incident::change_records(&previous, &current);
+                if !changes.is_empty() {
+                    emit_watch_event(output, &identifier, polls, &changes, None);
+                }
+                previous = current;
+            }
         }
     }
     Ok(())
+}
+
+async fn resolve_reference_id(
+    client: &ServiceNowClient,
+    kind: ReferenceKind,
+    value: Option<String>,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let record = metadata::resolve_reference(client, kind, &value).await?;
+    Ok(Some(record_sys_id(&record)?.to_string()))
+}
+
+fn read_file_or_stdin(path: &std::path::Path, label: &str) -> Result<String, ApiError> {
+    if path == std::path::Path::new("-") {
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .map_err(|error| {
+                ApiError::Other(format!("failed to read {label} from stdin: {error}"))
+            })?;
+        Ok(value)
+    } else {
+        std::fs::read_to_string(path).map_err(|error| {
+            ApiError::Other(format!(
+                "failed to read {label} from {}: {error}",
+                path.display()
+            ))
+        })
+    }
+}
+
+fn emit_mutation_plan(
+    output: &OutputConfig,
+    operation: &str,
+    identifier: &str,
+    body: &Map<String, Value>,
+) {
+    let plan = serde_json::json!({
+        "dryRun": true,
+        "operation": operation,
+        "table": "incident",
+        "incident": identifier,
+        "changes": body,
+    });
+    if output.json {
+        output.value(&plan);
+    } else {
+        println!("Dry run: {operation} {identifier}\n");
+        print_record(&plan["changes"], output.color);
+    }
+}
+
+fn emit_watch_event(
+    output: &OutputConfig,
+    identifier: &str,
+    poll: usize,
+    changes: &[Value],
+    initial: Option<&Value>,
+) {
+    let event = serde_json::json!({
+        "event": if initial.is_some() { "snapshot" } else { "change" },
+        "incident": identifier,
+        "poll": poll,
+        "changes": changes,
+        "record": initial,
+    });
+    match output.format {
+        OutputFormat::Json | OutputFormat::JsonLines => println!(
+            "{}",
+            serde_json::to_string(&event).expect("watch event is serializable")
+        ),
+        OutputFormat::Yaml => print!(
+            "---\n{}",
+            serde_saphyr::to_string(&event).expect("watch event is serializable")
+        ),
+        OutputFormat::Text => {
+            if let Some(record) = initial {
+                println!("Watching {identifier}. Press Ctrl-C to stop.\n");
+                print_record(record, output.color);
+            } else {
+                println!("\n{} changed", output.heading(identifier));
+                print_records(
+                    changes,
+                    Some(&["field".into(), "before".into(), "after".into()]),
+                    output.color,
+                );
+            }
+        }
+        OutputFormat::Csv => unreachable!("CSV watch output is rejected before polling"),
+    }
 }
 
 async fn run_tables(
@@ -706,7 +1614,7 @@ fn emit_records(output: &OutputConfig, records: Vec<Value>, fields: Option<&[Str
             "result": records,
         }));
     } else {
-        print_records(&records, fields);
+        print_records(&records, fields, output.color);
     }
 }
 
@@ -714,7 +1622,7 @@ fn emit_record(output: &OutputConfig, record: Value) {
     if output.json {
         output.value(&serde_json::json!({ "result": record }));
     } else {
-        print_record(&record);
+        print_record(&record, output.color);
     }
 }
 

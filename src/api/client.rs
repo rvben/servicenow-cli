@@ -78,7 +78,7 @@ impl ServiceNowClient {
                 let credentials = basic_auth(username, secret);
                 format!("Basic {credentials}")
             }
-            AuthType::Bearer => format!("Bearer {secret}"),
+            AuthType::Bearer | AuthType::OAuth => format!("Bearer {secret}"),
         };
 
         let mut headers = HeaderMap::new();
@@ -350,7 +350,7 @@ fn validate_query_literal(value: &str) -> Result<(), ApiError> {
     }
 }
 
-fn normalize_instance(instance: &str) -> Result<String, ApiError> {
+pub fn normalize_instance(instance: &str) -> Result<String, ApiError> {
     let instance = instance.trim().trim_end_matches('/');
     if instance.is_empty() {
         return Err(ApiError::InvalidInput(
