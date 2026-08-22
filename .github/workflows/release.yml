@@ -149,7 +149,7 @@ jobs:
       - name: Generate CycloneDX SBOM
         run: |
           cargo install cargo-cyclonedx --version 0.5.9 --locked
-          cargo cyclonedx --format json --override-filename servicenow-cli.cdx.json
+          cargo cyclonedx --format json --override-filename servicenow-cli.cdx
           cp servicenow-cli.cdx.json dist/
       - name: Generate checksums
         working-directory: dist
