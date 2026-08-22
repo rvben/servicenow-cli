@@ -2,6 +2,39 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.0 — 2026-08-22
+
+### Added
+
+- Attachment `list`, `upload`, `download`, and `delete` workflows for every
+  ServiceNow table.
+- Record resolution by number, `sys_id`, or a form URL from the active instance.
+- Streamed attachment transfers, inferred or explicit MIME types, and binary
+  download-to-stdout support.
+- Attachment upload and deletion dry runs plus a live PDI attachment lifecycle.
+- Post-publication Cargo and PyPI installation smoke tests for tagged releases.
+
+### Safety
+
+- Downloads sanitize server-provided names, write through a temporary file, and
+  refuse to replace an existing path unless `--force` is supplied.
+- Attachment mutations honor read-only profiles, and permanent deletion requires
+  an interactive confirmation or `--yes`.
+- Record and attachment URLs from a different ServiceNow instance are rejected.
+
+### Changed
+
+- GitHub Actions now use Node.js 24-compatible artifact actions.
+- RustSec auditing runs the pinned official `cargo-audit` tool directly.
+- Python wheels use the latest pinned maturin action and maturin release.
+
+## 0.2.1 — 2026-08-22
+
+### Fixed
+
+- Corrected the CycloneDX output name so the release workflow publishes the
+  SBOM, checksums, attestations, GitHub assets, and registry packages.
+
 ## 0.2.0 — 2026-08-22
 
 ### Added

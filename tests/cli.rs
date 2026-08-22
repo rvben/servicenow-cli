@@ -3,7 +3,7 @@ use std::process::Command;
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{body_bytes, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn command(config_home: &TempDir) -> Command {
@@ -433,4 +433,169 @@ async fn incident_watch_is_a_bounded_json_event_stream() {
     let snapshot: serde_json::Value = serde_json::from_str(events.trim()).unwrap();
     assert_eq!(snapshot["event"], "snapshot");
     assert_eq!(snapshot["record"]["number"], "INC0010001");
+}
+
+#[tokio::test]
+async fn attachment_commands_cover_the_complete_file_lifecycle() {
+    let config_home = TempDir::new().unwrap();
+    let files = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let record_id = "0123456789abcdef0123456789abcdef";
+    let attachment_id = "fedcba9876543210fedcba9876543210";
+    let metadata = serde_json::json!({
+        "sys_id": attachment_id,
+        "file_name": "diagnostic.txt",
+        "content_type": "text/plain",
+        "size_bytes": "11",
+        "table_name": "incident",
+        "table_sys_id": record_id,
+        "download_link": format!("{}/api/now/attachment/{attachment_id}/file", server.uri()),
+        "sys_created_by": "admin",
+        "sys_created_on": "2026-08-22 20:00:00"
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(query_param("sysparm_query", "number=INC0010001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{"sys_id": record_id, "number": "INC0010001"}]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/attachment"))
+        .and(query_param(
+            "sysparm_query",
+            format!("table_name=incident^table_sys_id={record_id}^ORDERBYDESCsys_created_on"),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"result": [metadata.clone()]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/now/attachment/file"))
+        .and(query_param("table_name", "incident"))
+        .and(query_param("table_sys_id", record_id))
+        .and(query_param("file_name", "diagnostic.txt"))
+        .and(header("content-type", "text/plain"))
+        .and(body_bytes(b"hello world"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({"result": metadata.clone()})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/attachment/{attachment_id}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"result": metadata.clone()})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/attachment/{attachment_id}/file")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/now/attachment/{attachment_id}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let listed = authenticated_command(&config_home, &server)
+        .args(["attachments", "list", "incident", "INC0010001"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["result"][0]["file_name"], "diagnostic.txt");
+
+    let source = files.path().join("diagnostic.txt");
+    std::fs::write(&source, b"hello world").unwrap();
+    let uploaded = authenticated_command(&config_home, &server)
+        .args([
+            "attachments",
+            "upload",
+            "incident",
+            "INC0010001",
+            source.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        uploaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uploaded.stderr)
+    );
+    let uploaded: serde_json::Value = serde_json::from_slice(&uploaded.stdout).unwrap();
+    assert_eq!(uploaded["result"]["sys_id"], attachment_id);
+
+    let destination = files.path().join("downloaded.txt");
+    let downloaded = authenticated_command(&config_home, &server)
+        .args([
+            "attachments",
+            "download",
+            attachment_id,
+            destination.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        downloaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&downloaded.stderr)
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), b"hello world");
+    let downloaded: serde_json::Value = serde_json::from_slice(&downloaded.stdout).unwrap();
+    assert_eq!(downloaded["sizeBytes"], 11);
+
+    let deleted = authenticated_command(&config_home, &server)
+        .args(["attachments", "delete", attachment_id, "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let deleted: serde_json::Value = serde_json::from_slice(&deleted.stdout).unwrap();
+    assert_eq!(deleted["deleted"], true);
+}
+
+#[test]
+fn attachment_delete_is_blocked_by_read_only_mode_before_network_access() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .env("SERVICENOW_INSTANCE", "http://127.0.0.1:9")
+        .env("SERVICENOW_USERNAME", "api-user")
+        .env("SERVICENOW_PASSWORD", "secret")
+        .env("SERVICENOW_READ_ONLY", "true")
+        .args([
+            "attachments",
+            "delete",
+            "0123456789abcdef0123456789abcdef",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("read-only")
+    );
 }

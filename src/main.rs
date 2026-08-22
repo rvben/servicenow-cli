@@ -5,6 +5,7 @@ use clap_complete::Shell;
 use dialoguer::{Confirm, Editor, Input, Password};
 use serde_json::{Map, Value};
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
+use servicenow_cli::attachment;
 use servicenow_cli::commands::{
     INCIDENT_LIST_FIELDS, build_body, parse_fields, print_record, print_records, record_sys_id,
 };
@@ -16,6 +17,7 @@ use servicenow_cli::credentials::{self, StoredCredential};
 use servicenow_cli::incident;
 use servicenow_cli::metadata::{self, ReferenceKind};
 use servicenow_cli::output::{OutputConfig, OutputFormat, exit_code, print_error};
+use servicenow_cli::record;
 
 #[derive(Parser)]
 #[command(
@@ -70,6 +72,10 @@ enum Command {
     /// Work with incidents
     #[command(subcommand, visible_alias = "incident")]
     Incidents(IncidentsCommand),
+
+    /// List, upload, download, and delete record attachments
+    #[command(subcommand, visible_alias = "attachment")]
+    Attachments(AttachmentsCommand),
 
     /// Perform generic CRUD operations through the Table API
     #[command(subcommand, visible_alias = "table")]
@@ -399,6 +405,77 @@ enum IncidentsCommand {
 }
 
 #[derive(Subcommand)]
+enum AttachmentsCommand {
+    /// List attachments on a record
+    List {
+        /// Table containing the record, such as incident or change_request
+        table: String,
+
+        /// Record number, sys_id, or same-instance form URL
+        record: String,
+
+        /// Maximum attachments to return
+        #[arg(short = 'n', long, default_value = "100")]
+        limit: usize,
+
+        /// Fetch every attachment
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Upload a file to a record
+    Upload {
+        /// Table containing the record, such as incident or change_request
+        table: String,
+
+        /// Record number, sys_id, or same-instance form URL
+        record: String,
+
+        /// Local file to upload
+        file: std::path::PathBuf,
+
+        /// Attachment name; defaults to the local file name
+        #[arg(long)]
+        name: Option<String>,
+
+        /// MIME type; inferred from the file name when omitted
+        #[arg(long)]
+        content_type: Option<String>,
+
+        /// Preview the upload without sending file contents
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Download an attachment by sys_id or same-instance Attachment API URL
+    Download {
+        /// Attachment sys_id or Attachment API URL
+        attachment: String,
+
+        /// File path, directory, or - for stdout; defaults to the attachment name
+        destination: Option<std::path::PathBuf>,
+
+        /// Replace an existing local file
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Permanently delete an attachment
+    Delete {
+        /// Attachment sys_id or same-instance Attachment API URL
+        attachment: String,
+
+        /// Confirm deletion without prompting
+        #[arg(long)]
+        yes: bool,
+
+        /// Preview the deletion without changing ServiceNow
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TablesCommand {
     /// List records from a table
     List {
@@ -676,6 +753,9 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
 
     match cli.command {
         Command::Incidents(command) => run_incidents(command, &client, &config, &output).await?,
+        Command::Attachments(command) => {
+            run_attachments(command, &client, &config, &output).await?
+        }
         Command::Tables(command) => run_tables(command, &client, &config, &output).await?,
         Command::Schema {
             table: Some(table),
@@ -1500,6 +1580,302 @@ fn emit_watch_event(
     }
 }
 
+async fn run_attachments(
+    command: AttachmentsCommand,
+    client: &ServiceNowClient,
+    config: &Config,
+    output: &OutputConfig,
+) -> Result<(), ApiError> {
+    match command {
+        AttachmentsCommand::List {
+            table,
+            record: identifier,
+            limit,
+            all,
+        } => {
+            let record = record::resolve(
+                client,
+                &table,
+                &identifier,
+                Some(vec!["sys_id".into(), "number".into()]),
+                DisplayValue::False,
+            )
+            .await?;
+            let sys_id = record_sys_id(&record)?;
+            let attachments = client.list_attachments(&table, sys_id, limit, all).await?;
+            emit_attachments(output, attachments)?;
+        }
+        AttachmentsCommand::Upload {
+            table,
+            record: identifier,
+            file,
+            name,
+            content_type,
+            dry_run,
+        } => {
+            if !dry_run {
+                config.require_writable()?;
+            }
+            let metadata = std::fs::metadata(&file).map_err(|error| {
+                ApiError::InvalidInput(format!(
+                    "cannot read attachment {}: {error}",
+                    file.display()
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(ApiError::InvalidInput(format!(
+                    "attachment source is not a regular file: {}",
+                    file.display()
+                )));
+            }
+            std::fs::File::open(&file).map_err(|error| {
+                ApiError::InvalidInput(format!(
+                    "cannot open attachment {}: {error}",
+                    file.display()
+                ))
+            })?;
+            let file_name = attachment::upload_file_name(&file, name.as_deref())?;
+            let content_type = attachment::content_type(&file, content_type.as_deref())?;
+            let record = record::resolve(
+                client,
+                &table,
+                &identifier,
+                Some(vec!["sys_id".into(), "number".into()]),
+                DisplayValue::False,
+            )
+            .await?;
+            let table_sys_id = record_sys_id(&record)?;
+            if dry_run {
+                let plan = serde_json::json!({
+                    "dryRun": true,
+                    "operation": "upload_attachment",
+                    "table": table,
+                    "record": identifier,
+                    "tableSysId": table_sys_id,
+                    "file": file,
+                    "fileName": file_name,
+                    "contentType": content_type,
+                    "sizeBytes": metadata.len(),
+                });
+                if output.json {
+                    output.value(&plan);
+                } else {
+                    println!("Dry run: upload {file_name} to {table}/{identifier}\n");
+                    print_record(&plan, output.color);
+                }
+                return Ok(());
+            }
+            let uploaded = client
+                .upload_attachment_file(&table, table_sys_id, &file_name, &content_type, &file)
+                .await?;
+            output.success(&format!(
+                "Uploaded {file_name} ({}) to {table}/{identifier}.",
+                attachment::human_size(&uploaded.size_bytes)
+            ));
+            emit_attachment(output, uploaded)?;
+        }
+        AttachmentsCommand::Download {
+            attachment: identifier,
+            destination,
+            force,
+        } => {
+            let sys_id = record::attachment_sys_id(client.site_url(), &identifier)?;
+            let metadata = client.get_attachment(&sys_id).await?;
+            let destination =
+                attachment::destination_path(destination.as_deref(), &metadata.file_name)?;
+            if destination == std::path::Path::new("-") {
+                let stdout = std::io::stdout();
+                let mut writer = stdout.lock();
+                let bytes = client.download_attachment(&sys_id, &mut writer).await?;
+                output.message(&format!(
+                    "Downloaded {} ({}) to stdout.",
+                    metadata.file_name,
+                    attachment::human_size(&bytes.to_string())
+                ));
+                return Ok(());
+            }
+            if destination.exists() && !force {
+                return Err(ApiError::Conflict(format!(
+                    "{} already exists; use --force to replace it",
+                    destination.display()
+                )));
+            }
+            let parent = destination
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            if !parent.is_dir() {
+                return Err(ApiError::InvalidInput(format!(
+                    "destination directory does not exist: {}",
+                    parent.display()
+                )));
+            }
+            let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+                ApiError::Other(format!(
+                    "failed to create a temporary download in {}: {error}",
+                    parent.display()
+                ))
+            })?;
+            let bytes = client.download_attachment(&sys_id, &mut temporary).await?;
+            temporary.as_file().sync_all().map_err(|error| {
+                ApiError::Other(format!("failed to sync downloaded attachment: {error}"))
+            })?;
+            if force {
+                temporary.persist(&destination).map_err(|error| {
+                    ApiError::Other(format!(
+                        "failed to save attachment to {}: {}",
+                        destination.display(),
+                        error.error
+                    ))
+                })?;
+            } else {
+                temporary.persist_noclobber(&destination).map_err(|error| {
+                    ApiError::Conflict(format!(
+                        "could not save {} without replacing a file: {}",
+                        destination.display(),
+                        error.error
+                    ))
+                })?;
+            }
+            let result = serde_json::json!({
+                "downloaded": true,
+                "attachment": sys_id,
+                "fileName": metadata.file_name,
+                "contentType": metadata.content_type,
+                "path": destination,
+                "sizeBytes": bytes,
+            });
+            output.success(&format!(
+                "Downloaded {} ({}) to {}.",
+                result["fileName"].as_str().unwrap_or("attachment"),
+                attachment::human_size(&bytes.to_string()),
+                destination.display()
+            ));
+            if output.json {
+                output.value(&result);
+            } else {
+                println!("{}", destination.display());
+            }
+        }
+        AttachmentsCommand::Delete {
+            attachment: identifier,
+            yes,
+            dry_run,
+        } => {
+            if !dry_run {
+                config.require_writable()?;
+            }
+            let sys_id = record::attachment_sys_id(client.site_url(), &identifier)?;
+            let metadata = client.get_attachment(&sys_id).await?;
+            if dry_run {
+                let plan = serde_json::json!({
+                    "dryRun": true,
+                    "operation": "delete_attachment",
+                    "attachment": sys_id,
+                    "fileName": metadata.file_name,
+                    "table": metadata.table_name,
+                    "tableSysId": metadata.table_sys_id,
+                    "sizeBytes": metadata.size_bytes,
+                });
+                if output.json {
+                    output.value(&plan);
+                } else {
+                    println!("Dry run: permanently delete {}\n", metadata.file_name);
+                    print_record(&plan, output.color);
+                }
+                return Ok(());
+            }
+            let confirmed = yes
+                || (std::io::stdin().is_terminal()
+                    && Confirm::new()
+                        .with_prompt(format!(
+                            "Permanently delete '{}' ({})?",
+                            metadata.file_name,
+                            attachment::human_size(&metadata.size_bytes)
+                        ))
+                        .default(false)
+                        .interact()
+                        .map_err(|error| {
+                            ApiError::Other(format!("failed to confirm deletion: {error}"))
+                        })?);
+            if !confirmed {
+                return Err(ApiError::InvalidInput(
+                    "attachment deletion cancelled; use --yes for non-interactive deletion".into(),
+                ));
+            }
+            client.delete_attachment(&sys_id).await?;
+            let result = serde_json::json!({
+                "deleted": true,
+                "attachment": sys_id,
+                "fileName": metadata.file_name,
+                "table": metadata.table_name,
+                "tableSysId": metadata.table_sys_id,
+            });
+            output.success(&format!(
+                "Deleted attachment {}.",
+                result["fileName"].as_str().unwrap_or("attachment")
+            ));
+            if output.json {
+                output.value(&result);
+            } else {
+                println!(
+                    "Deleted {}.",
+                    result["fileName"].as_str().unwrap_or("attachment")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_attachments(
+    output: &OutputConfig,
+    attachments: Vec<servicenow_cli::api::AttachmentMetadata>,
+) -> Result<(), ApiError> {
+    let mut records = attachments
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            ApiError::Other(format!("failed to encode attachment metadata: {error}"))
+        })?;
+    if output.json {
+        emit_records(output, records, None);
+    } else {
+        for record in &mut records {
+            if let Some(object) = record.as_object_mut() {
+                let size = object
+                    .get("size_bytes")
+                    .and_then(Value::as_str)
+                    .map(attachment::human_size)
+                    .unwrap_or_else(|| "-".into());
+                object.insert("size".into(), Value::String(size));
+            }
+        }
+        let fields = [
+            "file_name".into(),
+            "content_type".into(),
+            "size".into(),
+            "sys_created_by".into(),
+            "sys_created_on".into(),
+            "sys_id".into(),
+        ];
+        print_records(&records, Some(&fields), output.color);
+    }
+    Ok(())
+}
+
+fn emit_attachment(
+    output: &OutputConfig,
+    attachment: servicenow_cli::api::AttachmentMetadata,
+) -> Result<(), ApiError> {
+    let record = serde_json::to_value(attachment).map_err(|error| {
+        ApiError::Other(format!("failed to encode attachment metadata: {error}"))
+    })?;
+    emit_record(output, record);
+    Ok(())
+}
+
 async fn run_tables(
     command: TablesCommand,
     client: &ServiceNowClient,
@@ -1596,15 +1972,7 @@ async fn resolve_incident(
     fields: Option<Vec<String>>,
     display_value: DisplayValue,
 ) -> Result<Value, ApiError> {
-    if identifier.len() == 32 && identifier.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        client
-            .get_record("incident", identifier, fields.as_deref(), display_value)
-            .await
-    } else {
-        client
-            .find_one("incident", "number", identifier, fields, display_value)
-            .await
-    }
+    record::resolve(client, "incident", identifier, fields, display_value).await
 }
 
 fn emit_records(output: &OutputConfig, records: Vec<Value>, fields: Option<&[String]>) {

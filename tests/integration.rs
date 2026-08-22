@@ -1,6 +1,6 @@
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::config::AuthType;
-use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+use wiremock::matchers::{body_bytes, body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn client(server: &MockServer) -> ServiceNowClient {
@@ -174,4 +174,106 @@ async fn rejects_path_injection_before_sending_request() {
         .await
         .unwrap_err();
     assert!(matches!(error, ApiError::InvalidInput(_)));
+}
+
+#[tokio::test]
+async fn attachment_lifecycle_uses_the_supported_attachment_api() {
+    let server = MockServer::start().await;
+    let record_id = "0123456789abcdef0123456789abcdef";
+    let attachment_id = "fedcba9876543210fedcba9876543210";
+    let metadata = serde_json::json!({
+        "sys_id": attachment_id,
+        "file_name": "diagnostic.txt",
+        "content_type": "text/plain",
+        "size_bytes": "11",
+        "table_name": "incident",
+        "table_sys_id": record_id,
+        "download_link": format!("{}/api/now/attachment/{attachment_id}/file", server.uri()),
+        "sys_created_by": "api-user",
+        "sys_created_on": "2026-08-22 20:00:00"
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/api/now/attachment/file"))
+        .and(query_param("table_name", "incident"))
+        .and(query_param("table_sys_id", record_id))
+        .and(query_param("file_name", "diagnostic.txt"))
+        .and(header("content-type", "text/plain"))
+        .and(header("content-length", "11"))
+        .and(body_bytes(b"hello world"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(serde_json::json!({"result": metadata.clone()})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/attachment"))
+        .and(query_param(
+            "sysparm_query",
+            format!("table_name=incident^table_sys_id={record_id}^ORDERBYDESCsys_created_on"),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"result": [metadata.clone()]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/attachment/{attachment_id}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"result": metadata.clone()})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/attachment/{attachment_id}/file")))
+        .and(header("accept", "*/*"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/now/attachment/{attachment_id}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let uploaded = client
+        .upload_attachment_bytes(
+            "incident",
+            record_id,
+            "diagnostic.txt",
+            "text/plain",
+            b"hello world".to_vec(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uploaded.sys_id, attachment_id);
+
+    let listed = client
+        .list_attachments("incident", record_id, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].file_name, "diagnostic.txt");
+
+    let fetched = client.get_attachment(attachment_id).await.unwrap();
+    assert_eq!(fetched.content_type, "text/plain");
+
+    let mut downloaded = Vec::new();
+    let bytes = client
+        .download_attachment(attachment_id, &mut downloaded)
+        .await
+        .unwrap();
+    assert_eq!(bytes, 11);
+    assert_eq!(downloaded, b"hello world");
+
+    client.delete_attachment(attachment_id).await.unwrap();
 }

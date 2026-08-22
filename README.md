@@ -22,7 +22,7 @@ $ servicenow incidents mine
 
 ## Why it feels different
 
-- Workflow-first commands for incidents, with every table still available.
+- Workflow-first commands for incidents and attachments, with every table still available.
 - Human inputs such as incident numbers, user names, emails, group names, and
   `@me`; no routine `sys_id` hunting.
 - Secure interactive login with Basic, bearer, or OAuth + PKCE authentication.
@@ -105,6 +105,35 @@ servicenow incidents assign INC0010042 --to @me --dry-run
 
 Use repeated `--field name=value` arguments for instance-specific fields.
 Values that parse as JSON retain their JSON type.
+
+## Attachment workflows
+
+Attachment commands work with any table. Records can be identified by number,
+`sys_id`, or a form URL copied from the configured ServiceNow instance:
+
+```sh
+# Discover files without looking up the incident sys_id
+servicenow attachments list incident INC0010042
+
+# Stream the upload, infer text/plain, and keep status output off stdout
+servicenow attachments upload incident INC0010042 ./diagnostic.txt
+
+# Preview writes even when the active profile is read-only
+servicenow attachments upload incident INC0010042 ./diagnostic.txt --dry-run
+
+# Download atomically; existing files are never replaced accidentally
+servicenow attachments download 0123456789abcdef0123456789abcdef ./downloads/
+servicenow attachments download 0123456789abcdef0123456789abcdef - > diagnostic.txt
+
+# Inspect the exact deletion before permanently removing the attachment
+servicenow attachments delete 0123456789abcdef0123456789abcdef --dry-run
+servicenow attachments delete 0123456789abcdef0123456789abcdef --yes
+```
+
+Uploads and downloads are streamed rather than loaded entirely into memory.
+Server-provided file names are reduced to a safe local basename, downloads use
+a temporary file plus atomic persistence, and replacing a local file requires
+`--force`. Upload and delete operations honor profile-level read-only mode.
 
 ## Discover your instance
 
@@ -210,12 +239,14 @@ make check
 make test-e2e # requires an ignored .env.e2e file and a PDI
 ```
 
-The default suite uses mock servers. The ignored PDI lifecycle suite creates an
-isolated incident, verifies CRUD/query/display-value behavior, and cleans it up.
+The default suite uses mock servers. The ignored PDI lifecycle suite creates
+isolated records, verifies incident and attachment lifecycles, and cleans up
+every record and file it creates.
 
 CI runs formatting, linting, tests on Linux/macOS/Windows, and a RustSec audit.
 Tagged releases produce native archives, Cargo/PyPI packages, SHA-256 checksums,
-a CycloneDX SBOM, and GitHub artifact attestations. See [SECURITY.md](SECURITY.md),
+a CycloneDX SBOM, and GitHub artifact attestations, then install and execute both
+public packages as a final smoke test. See [SECURITY.md](SECURITY.md),
 [SUPPORT.md](SUPPORT.md), and the [release runbook](docs/releasing.md).
 
 ## Status

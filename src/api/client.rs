@@ -1,9 +1,17 @@
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use std::io::Write;
+use std::path::Path;
+
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio_util::io::ReaderStream;
 
 use super::ApiError;
 use crate::config::AuthType;
+
+const ATTACHMENT_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub enum DisplayValue {
@@ -51,10 +59,33 @@ struct Envelope<T> {
     result: T,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AttachmentMetadata {
+    #[serde(default)]
+    pub sys_id: String,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default)]
+    pub size_bytes: String,
+    #[serde(default)]
+    pub table_name: String,
+    #[serde(default)]
+    pub table_sys_id: String,
+    #[serde(default)]
+    pub download_link: String,
+    #[serde(default)]
+    pub sys_created_by: String,
+    #[serde(default)]
+    pub sys_created_on: String,
+}
+
 pub struct ServiceNowClient {
     http: reqwest::Client,
     site_url: String,
     table_url: String,
+    attachment_url: String,
 }
 
 impl ServiceNowClient {
@@ -94,11 +125,13 @@ impl ServiceNowClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         let table_url = format!("{site_url}/api/now/table");
+        let attachment_url = format!("{site_url}/api/now/attachment");
 
         Ok(Self {
             http,
             site_url,
             table_url,
+            attachment_url,
         })
     }
 
@@ -108,6 +141,216 @@ impl ServiceNowClient {
 
     pub fn record_url(&self, table: &str, sys_id: &str) -> String {
         format!("{}/{table}.do?sys_id={sys_id}", self.site_url)
+    }
+
+    pub async fn list_attachments(
+        &self,
+        table: &str,
+        table_sys_id: &str,
+        limit: usize,
+        all: bool,
+    ) -> Result<Vec<AttachmentMetadata>, ApiError> {
+        validate_table(table)?;
+        validate_sys_id(table_sys_id)?;
+        if limit == 0 && !all {
+            return Err(ApiError::InvalidInput(
+                "--limit must be greater than zero".into(),
+            ));
+        }
+
+        const PAGE_SIZE: usize = 1000;
+        let page_size = if all { PAGE_SIZE } else { limit };
+        let mut offset = 0usize;
+        let mut attachments = Vec::new();
+        loop {
+            let query = [
+                ("sysparm_limit", page_size.to_string()),
+                ("sysparm_offset", offset.to_string()),
+                (
+                    "sysparm_query",
+                    format!(
+                        "table_name={table}^table_sys_id={table_sys_id}^ORDERBYDESCsys_created_on"
+                    ),
+                ),
+            ];
+            let response = self
+                .http
+                .get(&self.attachment_url)
+                .query(&query)
+                .send()
+                .await?;
+            let page = self
+                .decode::<Envelope<Vec<AttachmentMetadata>>>(response)
+                .await?
+                .result;
+            let count = page.len();
+            attachments.extend(page);
+            if !all || count < page_size {
+                break;
+            }
+            offset += count;
+        }
+        Ok(attachments)
+    }
+
+    pub async fn get_attachment(
+        &self,
+        attachment_sys_id: &str,
+    ) -> Result<AttachmentMetadata, ApiError> {
+        validate_sys_id(attachment_sys_id)?;
+        let response = self
+            .http
+            .get(format!("{}/{attachment_sys_id}", self.attachment_url))
+            .send()
+            .await?;
+        self.decode::<Envelope<AttachmentMetadata>>(response)
+            .await
+            .map(|envelope| envelope.result)
+    }
+
+    pub async fn upload_attachment_file(
+        &self,
+        table: &str,
+        table_sys_id: &str,
+        file_name: &str,
+        content_type: &str,
+        path: &Path,
+    ) -> Result<AttachmentMetadata, ApiError> {
+        let file = tokio::fs::File::open(path).await.map_err(|error| {
+            ApiError::Other(format!(
+                "failed to open attachment {}: {error}",
+                path.display()
+            ))
+        })?;
+        let content_length = file
+            .metadata()
+            .await
+            .map_err(|error| {
+                ApiError::Other(format!(
+                    "failed to inspect attachment {}: {error}",
+                    path.display()
+                ))
+            })?
+            .len();
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
+        self.upload_attachment_body(
+            table,
+            table_sys_id,
+            file_name,
+            content_type,
+            Some(content_length),
+            body,
+        )
+        .await
+    }
+
+    pub async fn upload_attachment_bytes(
+        &self,
+        table: &str,
+        table_sys_id: &str,
+        file_name: &str,
+        content_type: &str,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Result<AttachmentMetadata, ApiError> {
+        let bytes = bytes.into();
+        let content_length = bytes.len() as u64;
+        self.upload_attachment_body(
+            table,
+            table_sys_id,
+            file_name,
+            content_type,
+            Some(content_length),
+            bytes.into(),
+        )
+        .await
+    }
+
+    async fn upload_attachment_body(
+        &self,
+        table: &str,
+        table_sys_id: &str,
+        file_name: &str,
+        content_type: &str,
+        content_length: Option<u64>,
+        body: reqwest::Body,
+    ) -> Result<AttachmentMetadata, ApiError> {
+        validate_table(table)?;
+        validate_sys_id(table_sys_id)?;
+        if file_name.trim().is_empty() || file_name.chars().any(char::is_control) {
+            return Err(ApiError::InvalidInput(
+                "attachment file name cannot be empty or contain control characters".into(),
+            ));
+        }
+        if file_name.contains(['/', '\\']) {
+            return Err(ApiError::InvalidInput(
+                "attachment file name cannot contain path separators".into(),
+            ));
+        }
+        let content_type = HeaderValue::from_str(content_type).map_err(|_| {
+            ApiError::InvalidInput(format!("invalid content type '{content_type}'"))
+        })?;
+        let query = [
+            ("table_name", table),
+            ("table_sys_id", table_sys_id),
+            ("file_name", file_name),
+        ];
+        let mut request = self
+            .http
+            .post(format!("{}/file", self.attachment_url))
+            .query(&query)
+            .header(CONTENT_TYPE, content_type)
+            .timeout(ATTACHMENT_TRANSFER_TIMEOUT)
+            .body(body);
+        if let Some(content_length) = content_length {
+            request = request.header(CONTENT_LENGTH, content_length);
+        }
+        let response = request.send().await?;
+        self.decode::<Envelope<AttachmentMetadata>>(response)
+            .await
+            .map(|envelope| envelope.result)
+    }
+
+    pub async fn download_attachment(
+        &self,
+        attachment_sys_id: &str,
+        writer: &mut impl Write,
+    ) -> Result<u64, ApiError> {
+        validate_sys_id(attachment_sys_id)?;
+        let mut response = self
+            .http
+            .get(format!("{}/{attachment_sys_id}/file", self.attachment_url))
+            .header(ACCEPT, "*/*")
+            .timeout(ATTACHMENT_TRANSFER_TIMEOUT)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(map_response_error(response).await);
+        }
+        let mut written = 0u64;
+        while let Some(chunk) = response.chunk().await? {
+            writer.write_all(&chunk).map_err(|error| {
+                ApiError::Other(format!("failed to write downloaded attachment: {error}"))
+            })?;
+            written += chunk.len() as u64;
+        }
+        writer.flush().map_err(|error| {
+            ApiError::Other(format!("failed to flush downloaded attachment: {error}"))
+        })?;
+        Ok(written)
+    }
+
+    pub async fn delete_attachment(&self, attachment_sys_id: &str) -> Result<(), ApiError> {
+        validate_sys_id(attachment_sys_id)?;
+        let response = self
+            .http
+            .delete(format!("{}/{attachment_sys_id}", self.attachment_url))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(map_response_error(response).await)
+        }
     }
 
     pub async fn list_records(

@@ -183,6 +183,114 @@ async fn pdi_rejects_invalid_credentials_as_auth_error() {
     assert!(matches!(result, Err(ApiError::Auth(_))));
 }
 
+/// Exercises upload, list, metadata, binary download, and deletion against a
+/// real attachment while guaranteeing cleanup of both attachment and incident.
+#[tokio::test]
+#[ignore = "requires a ServiceNow Personal Developer Instance"]
+async fn pdi_attachment_lifecycle() {
+    let pdi = Pdi::from_env();
+    let client = pdi.client();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after Unix epoch")
+        .as_nanos();
+    let marker = format!("servicenow-cli-attachment-e2e-{unique}");
+    let file_name = format!("{marker}.txt");
+    let contents = format!("temporary attachment created by {marker}").into_bytes();
+
+    let incident = client
+        .create_record(
+            "incident",
+            &object([
+                ("short_description", Value::String(marker.clone())),
+                (
+                    "description",
+                    Value::String("Temporary attachment lifecycle fixture".into()),
+                ),
+                ("impact", Value::String("3".into())),
+                ("urgency", Value::String("3".into())),
+            ]),
+        )
+        .await
+        .expect("create attachment test incident");
+    let incident_id = string_field(&incident, "sys_id")
+        .expect("created incident has sys_id")
+        .to_string();
+
+    let uploaded = match client
+        .upload_attachment_bytes(
+            "incident",
+            &incident_id,
+            &file_name,
+            "text/plain",
+            contents.clone(),
+        )
+        .await
+    {
+        Ok(uploaded) => uploaded,
+        Err(error) => {
+            client
+                .delete_record("incident", &incident_id)
+                .await
+                .expect("cleanup incident after failed attachment upload");
+            panic!("upload test attachment: {error}");
+        }
+    };
+    let attachment_id = uploaded.sys_id.clone();
+
+    let verification: Result<(), ApiError> = async {
+        if uploaded.file_name != file_name
+            || uploaded.table_name != "incident"
+            || uploaded.table_sys_id != incident_id
+        {
+            return Err(ApiError::Other(format!(
+                "unexpected uploaded attachment metadata: {uploaded:?}"
+            )));
+        }
+
+        let listed = client
+            .list_attachments("incident", &incident_id, 100, false)
+            .await?;
+        if !listed.iter().any(|item| item.sys_id == attachment_id) {
+            return Err(ApiError::Other(
+                "uploaded attachment was absent from record listing".into(),
+            ));
+        }
+
+        let metadata = client.get_attachment(&attachment_id).await?;
+        if metadata.file_name != file_name || metadata.content_type != "text/plain" {
+            return Err(ApiError::Other(format!(
+                "unexpected fetched attachment metadata: {metadata:?}"
+            )));
+        }
+
+        let mut downloaded = Vec::new();
+        let byte_count = client
+            .download_attachment(&attachment_id, &mut downloaded)
+            .await?;
+        if byte_count != contents.len() as u64 || downloaded != contents {
+            return Err(ApiError::Other(
+                "downloaded attachment did not match uploaded bytes".into(),
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    let attachment_cleanup = client.delete_attachment(&attachment_id).await;
+    let incident_cleanup = client.delete_record("incident", &incident_id).await;
+    if let Err(error) = verification {
+        attachment_cleanup.expect("cleanup attachment after failed verification");
+        incident_cleanup.expect("cleanup incident after failed verification");
+        panic!("PDI attachment verification failed: {error}");
+    }
+    attachment_cleanup.expect("delete test attachment");
+    incident_cleanup.expect("delete attachment test incident");
+
+    let deleted = client.get_attachment(&attachment_id).await;
+    assert!(matches!(deleted, Err(ApiError::NotFound(_))));
+}
+
 #[test]
 fn fixture_body_has_stable_keys() {
     let body = object([
