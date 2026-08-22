@@ -22,6 +22,8 @@ fn command(config_home: &TempDir) -> Command {
         .env_remove("SERVICENOW_AUTH_TYPE")
         .env_remove("SERVICENOW_PROFILE")
         .env_remove("SERVICENOW_READ_ONLY");
+    #[cfg(windows)]
+    command.env("APPDATA", config_home.path());
     command
 }
 
