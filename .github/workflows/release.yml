@@ -12,7 +12,7 @@ jobs:
     name: Verify release version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Match tag to package version
         run: |
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
@@ -46,7 +46,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -66,7 +66,7 @@ jobs:
         uses: actions/attest@v4
         with:
           subject-path: dist/*.tar.gz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -93,15 +93,15 @@ jobs:
             manylinux: auto
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
-          maturin-version: v1.11.5
+          maturin-version: v1.14.1
           command: build
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --compatibility pypi --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
@@ -112,16 +112,16 @@ jobs:
     needs: [version, verify]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo package --locked
-      - uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
-          maturin-version: v1.11.5
+          maturin-version: v1.14.1
           command: sdist
           args: --out dist
       - run: cp target/package/*.crate dist/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source-distributions
           path: dist/*
@@ -136,13 +136,13 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: binary-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source-distributions
           path: dist
@@ -172,7 +172,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Get temporary crates.io token
         id: crates-auth
@@ -191,12 +191,12 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: source-distributions
           path: source
@@ -205,3 +205,40 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+
+  post-publish-smoke:
+    name: Verify public packages
+    needs: [crates-io, pypi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      - name: Install and run the crates.io package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          root="${RUNNER_TEMP}/cargo-smoke"
+          for _ in 1 2 3 4 5 6; do
+            if cargo install --root "$root" servicenow-cli --version "$version" --locked; then
+              "$root/bin/servicenow" --version | grep -F "servicenow $version"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+      - name: Install and run the PyPI package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          environment="${RUNNER_TEMP}/pypi-smoke"
+          python -m venv "$environment"
+          for _ in 1 2 3 4 5 6; do
+            if "$environment/bin/pip" install --no-cache-dir "servicenow-cli==$version"; then
+              "$environment/bin/servicenow" --version | grep -F "servicenow $version"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1

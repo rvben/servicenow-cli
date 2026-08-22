@@ -29,7 +29,9 @@ version again before building anything.
 The workflow builds native archives and Python wheels, verifies all CI gates,
 creates source distributions, generates SHA-256 checksums and a CycloneDX SBOM,
 attests the artifacts, creates the GitHub release, and only then publishes to
-crates.io and PyPI through short-lived OIDC credentials.
+crates.io and PyPI through short-lived OIDC credentials. A final job waits for
+both indexes, installs each public package in a clean environment, and executes
+`servicenow --version` before the workflow is considered successful.
 
 ## Failed releases
 
