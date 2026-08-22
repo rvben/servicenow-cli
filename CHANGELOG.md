@@ -2,6 +2,31 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.1 — 2026-08-22
+
+### Added
+
+- A guided `servicenow setup` entry point with secure prompts and clear next
+  steps.
+- Compact, typed command discovery through `servicenow schema --command`,
+  including defaults, enums, side effects, confirmation, dry-run, output, and
+  exit-code metadata for agents.
+- Actionable empty states and configuration error remediation.
+
+### Changed
+
+- Incident lists now request readable display values for text output while
+  preserving raw values and the existing envelope for machine output.
+- Default human incident tables use curated columns, readable headers, terminal
+  width bounds, subtle semantic color, and no routine `sys_id` column.
+- Profile discovery now gives first-time users a direct setup command.
+
+### Compatibility
+
+- Piped and explicitly machine-readable incident output remains raw by default
+  and retains the stable `{count, result}` contract.
+- `--display-value false|true|all` continues to override the adaptive default.
+
 ## 0.3.0 — 2026-08-22
 
 ### Added

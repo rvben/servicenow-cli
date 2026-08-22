@@ -17,6 +17,15 @@ pub const INCIDENT_LIST_FIELDS: &[&str] = &[
     "sys_updated_on",
 ];
 
+pub const INCIDENT_HUMAN_FIELDS: &[&str] = &[
+    "number",
+    "priority",
+    "short_description",
+    "state",
+    "assigned_to",
+    "sys_updated_on",
+];
+
 pub fn parse_fields(fields: Option<&str>) -> Option<Vec<String>> {
     fields.map(|value| {
         value
@@ -76,8 +85,17 @@ pub fn record_sys_id(record: &Value) -> Result<&str, ApiError> {
 }
 
 pub fn print_records(records: &[Value], requested_fields: Option<&[String]>, color: bool) {
+    print_records_or(records, requested_fields, color, "No records found.");
+}
+
+pub fn print_records_or(
+    records: &[Value],
+    requested_fields: Option<&[String]>,
+    color: bool,
+    empty_message: &str,
+) {
     if records.is_empty() {
-        println!("No records found.");
+        println!("{empty_message}");
         return;
     }
     let fields = requested_fields
@@ -148,11 +166,15 @@ fn cell_value(value: &Value) -> Option<&str> {
 
 fn display_value(value: &Value) -> String {
     if let Some(value) = cell_value(value) {
-        value.to_string()
+        if value.trim().is_empty() {
+            "—".into()
+        } else {
+            value.to_string()
+        }
     } else if value.is_null() {
-        "-".into()
+        "—".into()
     } else if let Some(value) = value.as_bool() {
-        value.to_string()
+        if value { "Yes".into() } else { "No".into() }
     } else if value.is_number() {
         value.to_string()
     } else {
@@ -162,7 +184,7 @@ fn display_value(value: &Value) -> String {
 
 fn print_table(headers: &[String], rows: &[Vec<String>], color: bool) {
     let header = headers.iter().map(|value| {
-        let cell = Cell::new(value).add_attribute(Attribute::Bold);
+        let cell = Cell::new(header_label(value)).add_attribute(Attribute::Bold);
         if color { cell.fg(Color::Cyan) } else { cell }
     });
     let mut table = Table::new();
@@ -171,13 +193,57 @@ fn print_table(headers: &[String], rows: &[Vec<String>], color: bool) {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(header)
         .set_truncation_indicator("…");
+    table.set_width(terminal_width());
     if !color {
         table.force_no_tty();
     }
     for row in rows {
-        table.add_row(row);
+        let cells = row.iter().enumerate().map(|(index, value)| {
+            style_cell(
+                headers.get(index).map(String::as_str).unwrap_or(""),
+                value,
+                color,
+            )
+        });
+        table.add_row(cells);
     }
     println!("{table}");
+}
+
+fn header_label(field: &str) -> String {
+    match field {
+        "short_description" => "DESCRIPTION".into(),
+        "assigned_to" => "ASSIGNEE".into(),
+        "sys_updated_on" => "UPDATED".into(),
+        "sys_created_on" => "CREATED".into(),
+        "file_name" => "FILE".into(),
+        "content_type" => "TYPE".into(),
+        "sys_created_by" => "CREATED BY".into(),
+        other => other.replace('_', " ").to_uppercase(),
+    }
+}
+
+fn terminal_width() -> u16 {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .or_else(|| terminal_size::terminal_size().map(|(terminal_size::Width(width), _)| width))
+        .unwrap_or(120)
+        .clamp(72, 160)
+}
+
+fn style_cell(field: &str, value: &str, color: bool) -> Cell {
+    let cell = Cell::new(value);
+    if !color {
+        return cell;
+    }
+    match field {
+        "number" => cell.fg(Color::Cyan).add_attribute(Attribute::Bold),
+        "priority" if value.starts_with('1') => cell.fg(Color::Red).add_attribute(Attribute::Bold),
+        "priority" if value.starts_with('2') => cell.fg(Color::Yellow),
+        "sys_id" | "sys_updated_on" | "sys_created_on" => cell.fg(Color::DarkGrey),
+        _ => cell,
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +259,21 @@ mod tests {
         .unwrap();
         assert_eq!(body["active"], true);
         assert_eq!(body["priority"], 1);
+    }
+
+    #[test]
+    fn human_labels_and_values_are_readable() {
+        assert_eq!(header_label("short_description"), "DESCRIPTION");
+        assert_eq!(header_label("assignment_group"), "ASSIGNMENT GROUP");
+        assert_eq!(display_value(&Value::Null), "—");
+        assert_eq!(display_value(&Value::String(String::new())), "—");
+        assert_eq!(display_value(&Value::Bool(true)), "Yes");
+        assert_eq!(
+            display_value(&serde_json::json!({
+                "value": "2",
+                "display_value": "In Progress"
+            })),
+            "In Progress"
+        );
     }
 }

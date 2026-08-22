@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::attachment;
 use servicenow_cli::commands::{
-    INCIDENT_LIST_FIELDS, build_body, parse_fields, print_record, print_records, record_sys_id,
+    INCIDENT_HUMAN_FIELDS, INCIDENT_LIST_FIELDS, build_body, parse_fields, print_record,
+    print_records, print_records_or, record_sys_id,
 };
 use servicenow_cli::config::{
     AuthType, Config, ProfileConfig, active_profile_name, config_path, init_document,
@@ -61,6 +62,49 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Connect an instance with guided, secure setup
+    Setup {
+        /// Profile name to create or replace
+        #[arg(default_value = "default")]
+        profile: String,
+
+        /// Instance name, hostname, or URL
+        #[arg(long)]
+        instance: Option<String>,
+
+        /// Authentication method
+        #[arg(long, value_enum, default_value = "basic")]
+        method: AuthType,
+
+        /// Username for Basic authentication
+        #[arg(long)]
+        username: Option<String>,
+
+        /// OAuth application client ID
+        #[arg(long)]
+        client_id: Option<String>,
+
+        /// Space-separated OAuth scopes
+        #[arg(long, default_value = "useraccount")]
+        scope: String,
+
+        /// Registered loopback OAuth redirect URI
+        #[arg(long, default_value = "http://127.0.0.1:8484/callback")]
+        redirect_uri: String,
+
+        /// Read the password/token/client secret from stdin
+        #[arg(long)]
+        secret_stdin: bool,
+
+        /// Print the OAuth URL without opening a browser
+        #[arg(long)]
+        no_browser: bool,
+
+        /// Block all writes when this profile is active
+        #[arg(long)]
+        read_only: bool,
+    },
+
     /// Sign in securely and inspect authentication
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -92,6 +136,10 @@ enum Command {
     Schema {
         /// Table whose dictionary metadata should be shown
         table: Option<String>,
+
+        /// Return only one command and its arguments, such as "incidents list"
+        #[arg(long, conflicts_with = "table")]
+        command: Option<String>,
 
         /// Refresh metadata from the instance
         #[arg(long)]
@@ -224,8 +272,8 @@ enum IncidentsCommand {
         fields: Option<String>,
 
         /// Return raw values, display values, or both
-        #[arg(long, value_enum, default_value = "false")]
-        display_value: DisplayValue,
+        #[arg(long, value_enum)]
+        display_value: Option<DisplayValue>,
     },
 
     /// List incidents assigned to the authenticated user
@@ -241,6 +289,10 @@ enum IncidentsCommand {
         /// Fetch all pages
         #[arg(long)]
         all: bool,
+
+        /// Return raw values, display values, or both
+        #[arg(long, value_enum)]
+        display_value: Option<DisplayValue>,
     },
 
     /// Show an incident by number or sys_id
@@ -589,6 +641,37 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     let output = OutputConfig::new(&cli.output, cli.json, cli.quiet, cli.no_color)?;
 
     match cli.command {
+        Command::Setup {
+            profile,
+            instance,
+            method,
+            username,
+            client_id,
+            scope,
+            redirect_uri,
+            secret_stdin,
+            no_browser,
+            read_only,
+        } => {
+            run_auth_login(
+                &output,
+                profile,
+                instance,
+                method,
+                username,
+                client_id,
+                scope,
+                redirect_uri,
+                secret_stdin,
+                no_browser,
+                read_only,
+            )
+            .await?;
+            if !output.json {
+                println!("\nNext\n  servicenow doctor\n  servicenow incidents mine");
+            }
+            return Ok(());
+        }
         Command::Auth(AuthCommand::Login {
             profile,
             instance,
@@ -643,7 +726,12 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                     .map(serde_json::to_value)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| ApiError::Other(error.to_string()))?;
-                print_records(&records, None, output.color);
+                print_records_or(
+                    &records,
+                    None,
+                    output.color,
+                    "No profiles yet. Start here: `servicenow setup`.",
+                );
             }
             return Ok(());
         }
@@ -683,8 +771,19 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             }
             return Ok(());
         }
-        Command::Schema { table: None, .. } => {
-            output.value(&command_schema(&Cli::command()));
+        Command::Schema {
+            table: None,
+            command,
+            ..
+        } => {
+            let root = Cli::command();
+            let schema = if let Some(path) = command {
+                let selected = find_command(&root, &path)?;
+                command_document(selected, Some(&path))
+            } else {
+                command_document(&root, None)
+            };
+            output.value(&schema);
             return Ok(());
         }
         Command::Completions { shell } => {
@@ -760,6 +859,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         Command::Schema {
             table: Some(table),
             refresh,
+            ..
         } => run_table_schema(&table, refresh, &client, &config, &output).await?,
         Command::Choices {
             table,
@@ -773,7 +873,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         Command::Doctor | Command::Auth(AuthCommand::Status) => {
             run_doctor(&client, &config, &output).await?
         }
-        Command::Auth(_)
+        Command::Setup { .. }
+        | Command::Auth(_)
         | Command::Profile(_)
         | Command::Config(_)
         | Command::Schema { .. }
@@ -1119,6 +1220,7 @@ async fn run_incidents(
             display_value,
         } => {
             let query = combine_query(active.then_some("active=true"), query.as_deref());
+            let custom_fields = fields.is_some();
             let fields = parse_fields(fields.as_deref()).or_else(|| {
                 Some(
                     INCIDENT_LIST_FIELDS
@@ -1136,13 +1238,38 @@ async fn run_incidents(
                         limit,
                         offset,
                         all,
-                        display_value,
+                        display_value: display_value.unwrap_or_else(|| {
+                            if output.format == OutputFormat::Text {
+                                DisplayValue::True
+                            } else {
+                                DisplayValue::False
+                            }
+                        }),
                     },
                 )
                 .await?;
-            emit_records(output, records, fields.as_deref());
+            let human_fields: Vec<String> = INCIDENT_HUMAN_FIELDS
+                .iter()
+                .map(|field| (*field).into())
+                .collect();
+            let visible_fields = if custom_fields {
+                fields.as_deref()
+            } else {
+                Some(human_fields.as_slice())
+            };
+            emit_records_or(
+                output,
+                records,
+                visible_fields,
+                "No incidents matched. Try broadening --query or removing --active.",
+            );
         }
-        IncidentsCommand::Mine { query, limit, all } => {
+        IncidentsCommand::Mine {
+            query,
+            limit,
+            all,
+            display_value,
+        } => {
             let query = combine_query(
                 Some("assigned_to=javascript:gs.getUserID()"),
                 query.as_deref(),
@@ -1159,11 +1286,27 @@ async fn run_incidents(
                         fields: Some(fields.clone()),
                         limit,
                         all,
+                        display_value: display_value.unwrap_or_else(|| {
+                            if output.format == OutputFormat::Text {
+                                DisplayValue::True
+                            } else {
+                                DisplayValue::False
+                            }
+                        }),
                         ..ListOptions::default()
                     },
                 )
                 .await?;
-            emit_records(output, records, Some(&fields));
+            let human_fields: Vec<String> = INCIDENT_HUMAN_FIELDS
+                .iter()
+                .map(|field| (*field).into())
+                .collect();
+            emit_records_or(
+                output,
+                records,
+                Some(&human_fields),
+                "Nothing is assigned to you. You’re clear for now. Explore with `servicenow incidents list --active`.",
+            );
         }
         IncidentsCommand::Show {
             identifier,
@@ -1976,13 +2119,22 @@ async fn resolve_incident(
 }
 
 fn emit_records(output: &OutputConfig, records: Vec<Value>, fields: Option<&[String]>) {
+    emit_records_or(output, records, fields, "No records found.");
+}
+
+fn emit_records_or(
+    output: &OutputConfig,
+    records: Vec<Value>,
+    fields: Option<&[String]>,
+    empty_message: &str,
+) {
     if output.json {
         output.value(&serde_json::json!({
             "count": records.len(),
             "result": records,
         }));
     } else {
-        print_records(&records, fields, output.color);
+        print_records_or(&records, fields, output.color, empty_message);
     }
 }
 
@@ -2042,25 +2194,224 @@ fn mask_secret(secret: &str) -> String {
     }
 }
 
-fn command_schema(command: &clap::Command) -> Value {
+fn command_document(command: &clap::Command, selected_path: Option<&str>) -> Value {
+    let path = selected_path.unwrap_or(command.get_name());
+    let mut schema = command_schema(command, path);
+    let object = schema
+        .as_object_mut()
+        .expect("command schema is always an object");
+    object.insert("schemaVersion".into(), Value::String("1.0".into()));
+    object.insert(
+        "outputContract".into(),
+        serde_json::json!({
+            "default": "human table on a terminal; JSON when piped",
+            "listEnvelope": {"count": "integer", "result": "array"},
+            "recordEnvelope": {"result": "object"},
+            "errorEnvelope": {"error": {"kind": "string", "message": "string", "remediation": "string|null"}},
+            "streams": {"stdout": "data", "stderr": "status and errors"},
+            "exitCodes": {
+                "0": "success", "1": "unexpected", "2": "invalid_input", "3": "auth",
+                "4": "not_found", "5": "api_error", "6": "rate_limit", "7": "conflict"
+            }
+        }),
+    );
+    schema
+}
+
+fn find_command<'a>(root: &'a clap::Command, path: &str) -> Result<&'a clap::Command, ApiError> {
+    let mut command = root;
+    let mut parts = path.split_whitespace().peekable();
+    if parts.peek().is_none() {
+        return Err(ApiError::InvalidInput("--command cannot be empty".into()));
+    }
+    if parts.peek().copied() == Some(root.get_name()) {
+        parts.next();
+    }
+    for part in parts {
+        command = command.find_subcommand(part).ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "command '{path}'; inspect available commands with `servicenow schema`"
+            ))
+        })?;
+    }
+    Ok(command)
+}
+
+fn command_schema(command: &clap::Command, path: &str) -> Value {
     let args: Vec<Value> = command
         .get_arguments()
         .filter(|arg| arg.get_id() != "help" && arg.get_id() != "version")
         .map(|arg| {
+            let range = arg.get_num_args();
+            let takes_value = !matches!(
+                arg.get_action(),
+                clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count
+            );
+            let minimum = range
+                .map(|range| range.min_values())
+                .unwrap_or(usize::from(takes_value && arg.is_required_set()));
+            let max_values = range
+                .and_then(|range| {
+                    (range.max_values() != usize::MAX).then_some(range.max_values())
+                })
+                .or(takes_value.then_some(1));
+            let possible_values: Vec<String> = arg
+                .get_possible_values()
+                .into_iter()
+                .map(|value| value.get_name().to_string())
+                .collect();
+            let default_values: Vec<String> = arg
+                .get_default_values()
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
             serde_json::json!({
                 "id": arg.get_id().as_str(),
                 "long": arg.get_long(),
                 "short": arg.get_short().map(|value| value.to_string()),
                 "required": arg.is_required_set(),
                 "help": arg.get_help().map(|value| value.to_string()),
+                "type": argument_type(arg, &possible_values),
+                "action": argument_action(arg.get_action()),
+                "valueCardinality": {
+                    "minimum": minimum,
+                    "maximum": max_values,
+                },
+                "defaultValues": default_values,
+                "possibleValues": possible_values,
+                "repeatable": matches!(arg.get_action(), clap::ArgAction::Append | clap::ArgAction::Count),
+                "global": arg.is_global_set(),
+                "environment": arg.get_env().map(|value| value.to_string_lossy().into_owned()),
+                "valueHint": format!("{:?}", arg.get_value_hint()).to_lowercase(),
+                "dynamicDefault": (arg.get_id() == "display_value").then_some("display values for text output; raw values for machine output"),
             })
         })
         .collect();
-    let commands: Vec<Value> = command.get_subcommands().map(command_schema).collect();
+    let commands: Vec<Value> = command
+        .get_subcommands()
+        .map(|subcommand| {
+            let subcommand_path = format!("{path} {}", subcommand.get_name());
+            command_schema(subcommand, &subcommand_path)
+        })
+        .collect();
     serde_json::json!({
         "name": command.get_name(),
+        "path": path,
         "about": command.get_about().map(|value| value.to_string()),
         "arguments": args,
         "commands": commands,
+        "behavior": command_behavior(path),
+    })
+}
+
+fn argument_type(arg: &clap::Arg, possible_values: &[String]) -> &'static str {
+    match arg.get_action() {
+        clap::ArgAction::SetTrue | clap::ArgAction::SetFalse => "boolean",
+        clap::ArgAction::Count => "integer",
+        _ if !possible_values.is_empty() => "enum",
+        _ if matches!(
+            arg.get_id().as_str(),
+            "limit" | "offset" | "interval" | "count"
+        ) =>
+        {
+            "integer"
+        }
+        _ => "string",
+    }
+}
+
+fn argument_action(action: &clap::ArgAction) -> &'static str {
+    match action {
+        clap::ArgAction::Set => "set",
+        clap::ArgAction::Append => "append",
+        clap::ArgAction::SetTrue => "set_true",
+        clap::ArgAction::SetFalse => "set_false",
+        clap::ArgAction::Count => "count",
+        clap::ArgAction::Help => "help",
+        clap::ArgAction::HelpShort => "help_short",
+        clap::ArgAction::HelpLong => "help_long",
+        clap::ArgAction::Version => "version",
+        _ => "other",
+    }
+}
+
+fn command_behavior(path: &str) -> Value {
+    let remote_mutations = [
+        "incidents create",
+        "incidents update",
+        "incidents edit",
+        "incidents note",
+        "incidents assign",
+        "attachments upload",
+        "attachments delete",
+        "tables create",
+        "tables update",
+        "tables delete",
+    ];
+    let local_mutations = [
+        "setup",
+        "auth login",
+        "auth logout",
+        "profile use",
+        "profile remove",
+        "attachments download",
+    ];
+    let mutation = remote_mutations.iter().any(|suffix| path.ends_with(suffix))
+        || local_mutations.iter().any(|suffix| path.ends_with(suffix));
+    let remote_mutation = remote_mutations.iter().any(|suffix| path.ends_with(suffix));
+    let local_mutation = local_mutations.iter().any(|suffix| path.ends_with(suffix));
+    let side_effect = if path.ends_with("setup") || path.ends_with("auth login") {
+        "local_and_remote"
+    } else if remote_mutation {
+        "remote"
+    } else if local_mutation {
+        "local"
+    } else {
+        "none"
+    };
+    let network_access = if path == "servicenow"
+        || path == "auth"
+        || path == "schema"
+        || path.ends_with(" auth")
+        || path.ends_with(" schema")
+    {
+        "conditional"
+    } else if path == "profile"
+        || path == "config"
+        || path.ends_with(" profile")
+        || path.ends_with(" config")
+        || path.ends_with("completions")
+        || path.ends_with("profile list")
+        || path.ends_with("profile use")
+        || path.ends_with("profile remove")
+        || path.ends_with("auth logout")
+        || path.ends_with("config show")
+        || path.ends_with("config init")
+        || path.ends_with("config path")
+    {
+        "none"
+    } else {
+        "required"
+    };
+    let destructive = path.ends_with("attachments delete")
+        || path.ends_with("tables delete")
+        || path.ends_with("profile remove");
+    let requires_confirmation = destructive || path.ends_with("incidents edit");
+    let supports_dry_run = [
+        "incidents edit",
+        "incidents note",
+        "incidents assign",
+        "attachments upload",
+        "attachments delete",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix));
+    serde_json::json!({
+        "sideEffect": side_effect,
+        "networkAccess": network_access,
+        "mutation": mutation,
+        "destructive": destructive,
+        "requiresConfirmation": requires_confirmation,
+        "supportsDryRun": supports_dry_run,
     })
 }

@@ -130,7 +130,7 @@ impl Config {
             .or_else(|| normalize(file_profile.instance.clone()))
             .ok_or_else(|| {
                 ApiError::InvalidInput(
-                    "No ServiceNow instance configured. Run `servicenow auth login`.".into(),
+                    "No ServiceNow instance configured. Run `servicenow setup`.".into(),
                 )
             })?;
         let auth_type = env("SERVICENOW_AUTH_TYPE")
@@ -167,17 +167,15 @@ impl Config {
             })
             .ok_or_else(|| {
                 ApiError::InvalidInput(match auth_type {
-                    AuthType::Basic => {
-                        "No password configured. Run `servicenow auth login`.".into()
-                    }
+                    AuthType::Basic => "No password configured. Run `servicenow setup`.".into(),
                     AuthType::Bearer | AuthType::OAuth => {
-                        "No access token configured. Run `servicenow auth login`.".into()
+                        "No access token configured. Run `servicenow setup`.".into()
                     }
                 })
             })?;
         if matches!(auth_type, AuthType::Basic) && username.is_none() {
             return Err(ApiError::InvalidInput(
-                "No username configured. Run `servicenow auth login`.".into(),
+                "No username configured. Run `servicenow setup`.".into(),
             ));
         }
         let read_only = env("SERVICENOW_READ_ONLY")
@@ -261,7 +259,7 @@ pub fn init_document() -> serde_json::Value {
                 }
             }
         },
-        "setupCommand": "servicenow auth login work",
+        "setupCommand": "servicenow setup work",
         "secretStorage": "operating-system credential store"
     })
 }

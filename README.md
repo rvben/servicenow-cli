@@ -13,11 +13,11 @@ supported instance APIs, and requires no instance-side CLI plugin.
 
 ```text
 $ servicenow incidents mine
-┌────────────┬──────────┬─────────────────────────┬─────────────┐
-│ number     │ priority │ short_description       │ state       │
-╞════════════╪══════════╪═════════════════════════╪═════════════╡
-│ INC0010042 │ 2        │ VPN unavailable         │ In Progress │
-└────────────┴──────────┴─────────────────────────┴─────────────┘
+┌────────────┬──────────────┬─────────────────┬─────────────┬──────────┬─────────────────────┐
+│ NUMBER     │ PRIORITY     │ DESCRIPTION     │ STATE       │ ASSIGNEE │ UPDATED             │
+╞════════════╪══════════════╪═════════════════╪═════════════╪══════════╪═════════════════════╡
+│ INC0010042 │ 2 - High     │ VPN unavailable │ In Progress │ Ada      │ 2026-08-22 10:30:00 │
+└────────────┴──────────────┴─────────────────┴─────────────┴──────────┴─────────────────────┘
 ```
 
 ## Why it feels different
@@ -54,7 +54,7 @@ cargo install --path .
 
 ```sh
 # Prompts securely; the password is stored in your OS keychain.
-servicenow auth login work \
+servicenow setup work \
   --instance company \
   --method basic \
   --username api-user
@@ -145,6 +145,10 @@ servicenow schema incident --refresh
 servicenow choices incident state
 servicenow resolve user ada@example.com
 servicenow resolve group "Network"
+
+# Inspect the full offline contract, or one token-efficient command
+servicenow schema
+servicenow schema --command 'incidents list'
 ```
 
 Cached metadata contains no credentials or record data.
@@ -181,6 +185,10 @@ servicenow incidents list --output csv
 servicenow incidents list --output table
 ```
 
+Incident tables prefer ServiceNow display values and curated columns. Machine
+output intentionally keeps raw values by default for stable automation. Use
+`--display-value false|true|all` to override either behavior explicitly.
+
 Data goes to stdout; status messages and errors go to stderr. `--quiet`
 suppresses status messages. `--no-color` and the `NO_COLOR` environment
 variable disable ANSI color.
@@ -202,10 +210,13 @@ Machine-readable errors use a stable envelope:
 | 6 | Rate limited |
 | 7 | Conflict or ambiguous match |
 
-The offline command schema and generated completions make integration easy:
+The versioned offline command schema describes argument types, defaults, enums,
+side effects, confirmation and dry-run behavior, output envelopes, and exit
+codes. Query a single command to keep agent context small:
 
 ```sh
 servicenow schema | jq '.commands[].name'
+servicenow schema --command 'attachments delete'
 servicenow completions zsh > _servicenow
 ```
 

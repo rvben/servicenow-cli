@@ -45,7 +45,116 @@ fn schema_is_offline_and_machine_readable() {
     assert!(output.status.success());
     let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(schema["name"], "servicenow");
+    assert_eq!(schema["schemaVersion"], "1.0");
+    assert_eq!(schema["outputContract"]["listEnvelope"]["count"], "integer");
     assert!(schema["commands"].as_array().unwrap().len() >= 5);
+}
+
+#[test]
+fn schema_can_describe_one_command_compactly() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .args(["schema", "--command", "incidents list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(schema["name"], "list");
+    assert_eq!(schema["path"], "incidents list");
+    assert_eq!(schema["schemaVersion"], "1.0");
+    let arguments = schema["arguments"].as_array().unwrap();
+    let display_value = arguments
+        .iter()
+        .find(|argument| argument["id"] == "display_value")
+        .unwrap();
+    assert_eq!(display_value["type"], "enum");
+    assert_eq!(display_value["possibleValues"][2], "all");
+    assert!(
+        display_value["dynamicDefault"]
+            .as_str()
+            .unwrap()
+            .contains("machine")
+    );
+}
+
+#[test]
+fn schema_marks_destructive_and_dry_run_commands() {
+    let config_home = TempDir::new().unwrap();
+    let deletion = command(&config_home)
+        .args(["schema", "--command", "attachments delete"])
+        .output()
+        .unwrap();
+    let deletion: serde_json::Value = serde_json::from_slice(&deletion.stdout).unwrap();
+    assert_eq!(deletion["behavior"]["destructive"], true);
+    assert_eq!(deletion["behavior"]["requiresConfirmation"], true);
+    assert_eq!(deletion["behavior"]["supportsDryRun"], true);
+}
+
+#[tokio::test]
+async fn incident_machine_output_keeps_raw_values_by_default() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(query_param("sysparm_display_value", "false"))
+        .and(query_param(
+            "sysparm_fields",
+            "sys_id,number,short_description,state,priority,assigned_to,sys_updated_on",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{"sys_id": "0123456789abcdef0123456789abcdef", "number": "INC0010001", "state": "2"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["incidents", "list", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["count"], 1);
+    assert_eq!(value["result"][0]["state"], "2");
+    assert_eq!(
+        value["result"][0]["sys_id"],
+        "0123456789abcdef0123456789abcdef"
+    );
+}
+
+#[tokio::test]
+async fn incident_text_output_prefers_display_values_and_curated_columns() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(query_param("sysparm_display_value", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": "0123456789abcdef0123456789abcdef",
+                "number": "INC0010001",
+                "priority": "1 - Critical",
+                "short_description": "Email is unavailable",
+                "state": "In Progress",
+                "assigned_to": "Don Goodliffe",
+                "sys_updated_on": "2026-08-22 10:30:00"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["--output", "table", "incidents", "list", "--limit", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("DESCRIPTION"));
+    assert!(text.contains("ASSIGNEE"));
+    assert!(text.contains("Don Goodliffe"));
+    assert!(!text.contains("SYS ID"));
+    assert!(!text.contains("0123456789abcdef0123456789abcdef"));
 }
 
 #[test]

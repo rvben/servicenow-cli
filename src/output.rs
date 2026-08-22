@@ -43,10 +43,8 @@ impl OutputConfig {
                 )));
             }
         };
-        let color = format == OutputFormat::Text
-            && std::io::stdout().is_terminal()
-            && !no_color
-            && std::env::var_os("NO_COLOR").is_none();
+        let interactive = format == OutputFormat::Text && std::io::stdout().is_terminal();
+        let color = interactive && !no_color && std::env::var_os("NO_COLOR").is_none();
         Ok(Self {
             json: format != OutputFormat::Text,
             quiet,
@@ -196,18 +194,41 @@ pub fn exit_code(error: &ApiError) -> i32 {
 }
 
 pub fn print_error(error: &ApiError, machine_readable: bool) {
+    let remediation = error_remediation(error);
     if machine_readable {
         eprintln!(
             "{}",
             serde_json::json!({
                 "error": {
                     "kind": error_kind(error),
-                    "message": error.to_string()
+                    "message": error.to_string(),
+                    "remediation": remediation,
                 }
             })
         );
     } else {
         eprintln!("error: {error}");
+        if let Some(remediation) = remediation {
+            eprintln!("\nTry: {remediation}");
+        }
+    }
+}
+
+fn error_remediation(error: &ApiError) -> Option<&'static str> {
+    let message = error.to_string();
+    if message.contains("No ServiceNow instance configured")
+        || message.contains("No username configured")
+        || message.contains("No credential configured")
+        || message.contains("No password configured")
+        || message.contains("No access token configured")
+    {
+        Some("run `servicenow setup` to connect an instance securely")
+    } else {
+        match error {
+            ApiError::Auth(_) => Some("run `servicenow auth login` to refresh your credentials"),
+            ApiError::RateLimit => Some("wait briefly, then retry the command"),
+            _ => None,
+        }
     }
 }
 
