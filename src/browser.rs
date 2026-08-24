@@ -229,14 +229,13 @@ async fn wait_for_session_cookie(
             }
         };
         let completed_session: Result<Option<BrowserSession>, ApiError> = async {
-            if let Some(cookie) = service_now_cookie_header(&response, host, is_https) {
-                match validate_session(&http, site_url, &cookie).await? {
+            if let Some(cookie) = service_now_cookie_header(&response, host, is_https)
+                && let Some(user_token) =
+                    service_now_user_token(&mut socket, &mut id, &session_id).await?
+            {
+                match validate_session(&http, site_url, &cookie, &user_token).await? {
                     SessionValidation::Authenticated => {
-                        if let Some(user_token) =
-                            service_now_user_token(&mut socket, &mut id, &session_id).await?
-                        {
-                            return Ok(Some(BrowserSession { cookie, user_token }));
-                        }
+                        return Ok(Some(BrowserSession { cookie, user_token }));
                     }
                     SessionValidation::Waiting => {}
                 }
@@ -428,6 +427,7 @@ async fn validate_session(
     http: &reqwest::Client,
     site_url: &str,
     cookie: &str,
+    user_token: &str,
 ) -> Result<SessionValidation, ApiError> {
     let response = http
         .get(format!("{site_url}/api/now/table/sys_user"))
@@ -437,6 +437,7 @@ async fn validate_session(
             ("sysparm_limit", "1"),
         ])
         .header(reqwest::header::COOKIE, cookie)
+        .header("X-UserToken", user_token)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await?;
@@ -758,29 +759,29 @@ try {
             } | Sort-Object { $_.path.Length } -Descending)
             if ($cookies.Count -gt 0) {
                 $cookieHeader = ($cookies | ForEach-Object { "$($_.name)=$($_.value)" }) -join '; '
-                try {
-                    $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -Headers @{ Cookie = $cookieHeader; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
-                    if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
-                        $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = "typeof window.g_ck === 'string' ? window.g_ck : ''"; returnByValue = $true } $sessionId
-                        $userToken = $evaluated.result.result.value
-                        if ($userToken -and $userToken -notmatch '[\r\n]') {
+                $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = "typeof window.g_ck === 'string' ? window.g_ck : ''"; returnByValue = $true } $sessionId
+                $userToken = $evaluated.result.result.value
+                if ($userToken -and $userToken -notmatch '[\r\n]') {
+                    try {
+                        $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -Headers @{ Cookie = $cookieHeader; 'X-UserToken' = $userToken; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
+                        if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
                             $session = @{ cookie = $cookieHeader; user_token = $userToken }
                             Write-Output ('SERVICENOW_RESULT:' + ($session | ConvertTo-Json -Compress))
                             exit 0
                         }
+                    } catch {
+                        $status = 0
+                        $loggedIn = $false
+                        if ($_.Exception.Response) {
+                            $status = [int]$_.Exception.Response.StatusCode
+                            $loggedIn = $_.Exception.Response.Headers['X-Is-Logged-In'] -eq 'true'
+                        }
+                        if ($status -eq 403 -and $loggedIn) {
+                            Write-Output 'SERVICENOW_FORBIDDEN'
+                            exit 3
+                        }
+                        if ($status -ne 401 -and $status -ne 403 -and ($status -lt 300 -or $status -ge 400)) { throw }
                     }
-                } catch {
-                    $status = 0
-                    $loggedIn = $false
-                    if ($_.Exception.Response) {
-                        $status = [int]$_.Exception.Response.StatusCode
-                        $loggedIn = $_.Exception.Response.Headers['X-Is-Logged-In'] -eq 'true'
-                    }
-                    if ($status -eq 403 -and $loggedIn) {
-                        Write-Output 'SERVICENOW_FORBIDDEN'
-                        exit 3
-                    }
-                    if ($status -ne 401 -and $status -ne 403 -and ($status -lt 300 -or $status -ge 400)) { throw }
                 }
             }
         } finally {
@@ -840,6 +841,7 @@ mod tests {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--inprivate"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--incognito"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("Network.getCookies"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("'X-UserToken' = $userToken"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$instance.Host"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__INSTANCE_HEX__"));
         assert!(!WINDOWS_BROWSER_BRIDGE.contains("login.microsoftonline.com"));
@@ -964,6 +966,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/now/table/sys_user"))
             .and(header("cookie", "JSESSIONID=validated-session"))
+            .and(header("x-usertoken", "synthetic-user-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "result": [{"sys_id": "0123456789abcdef0123456789abcdef"}]
             })))
@@ -1056,6 +1059,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/now/table/sys_user"))
             .and(header("cookie", "JSESSIONID=browser-smoke"))
+            .and(header("x-usertoken", "browser-smoke-user-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "result": [{"sys_id": "0123456789abcdef0123456789abcdef"}]
             })))

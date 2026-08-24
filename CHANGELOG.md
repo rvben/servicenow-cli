@@ -2,6 +2,15 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.8 — 2026-08-24
+
+### Fixed
+
+- Browser-session sign-in now supplies ServiceNow's anti-CSRF user token while
+  validating the captured session. Instances that require `X-UserToken` for
+  session-bound REST requests now complete the CLI handoff after SSO instead of
+  waiting until timeout.
+
 ## 0.3.7 — 2026-08-24
 
 ### Fixed
