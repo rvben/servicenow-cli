@@ -2,6 +2,24 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## Unreleased
+
+### Added
+
+- `servicenow setup` and `servicenow auth login` now inspect the public instance
+  login route and automatically select local Basic authentication or
+  browser-based OAuth for Microsoft Entra and other external SSO providers.
+- Inconclusive interactive discovery presents an authentication chooser, while
+  non-interactive setup asks for an explicit `--method` instead of guessing.
+- SSO onboarding explains the required ServiceNow OAuth registration and prints
+  a copy-ready administrator request containing the loopback redirect URI.
+
+### Safety
+
+- Login discovery sends no credentials and follows redirects only while they
+  remain on the ServiceNow instance; external identity-provider URLs are
+  classified without being requested.
+
 ## 0.3.2 — 2026-08-24
 
 ### Fixed

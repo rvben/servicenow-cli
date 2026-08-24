@@ -25,7 +25,7 @@ $ servicenow incidents mine
 - Workflow-first commands for incidents and attachments, with every table still available.
 - Human inputs such as incident numbers, user names, emails, group names, and
   `@me`; no routine `sys_id` hunting.
-- Secure interactive login with Basic, bearer, or OAuth + PKCE authentication.
+- Login-route detection that selects local credentials or browser-based OAuth + PKCE.
 - Credentials in the operating-system keychain, with a permission-locked file fallback for
   environments such as WSL2 that do not provide a credential service.
 - Beautiful responsive tables for humans; deterministic JSON, JSONL, YAML, and
@@ -54,15 +54,11 @@ cargo install --path .
 ## Two-minute start
 
 ```sh
-# Prompts securely; the password is stored in your OS keychain when available.
-servicenow setup work \
-  --instance company \
-  --method basic \
-  --username api-user
+# Detects local login or SSO, then asks only for what that method needs.
+servicenow setup work --instance company
 
 # On headless Linux/WSL2, choose the permission-locked file fallback directly:
-servicenow setup work --insecure-storage \
-  --instance company --method basic --username api-user
+servicenow setup work --instance company --insecure-storage
 
 servicenow doctor
 servicenow incidents mine

@@ -3,15 +3,22 @@
 The recommended setup is an OS-keychain-backed named profile:
 
 ```sh
-servicenow auth login work --instance company --method basic --username api-user
+servicenow setup work --instance company
 servicenow auth status
 servicenow profile list
 ```
 
-The password prompt is hidden and the secret is stored in Keychain Access on
-macOS, Credential Manager on Windows, or the platform credential service on
-Linux. The profile's instance, username, authentication type, and safety mode
-are stored in the configuration file.
+When `--method` is omitted, setup inspects the instance's public login route. It
+recognizes Microsoft Entra and other external SSO redirects and chooses
+browser-based OAuth; a local ServiceNow login selects Basic authentication. The
+probe never sends credentials and never follows a redirect to the external
+identity provider. If discovery is inconclusive, interactive setup asks you to
+choose instead of guessing.
+
+The credential is stored in Keychain Access on macOS, Credential Manager on
+Windows, or the platform credential service on Linux. The profile's instance,
+username, authentication type, and safety mode are stored in the configuration
+file. Pass `--method basic`, `oauth`, or `bearer` to make scripts deterministic.
 
 ## WSL2 and headless Linux
 
@@ -49,6 +56,14 @@ servicenow auth login work \
 The CLI uses Authorization Code with PKCE, validates the callback state, and
 refreshes expiring access tokens when the instance returns a refresh token.
 Only loopback HTTP redirect URIs are accepted.
+
+For an instance whose web login redirects to `login.microsoftonline.com`, this
+is still normally a **ServiceNow OAuth application**, not a new app registration
+made directly against Microsoft Entra. ServiceNow starts the browser flow,
+redirects the user through the configured enterprise identity provider, and
+then issues the API tokens. If setup detects SSO but no client ID was provided,
+it prints a copy-ready request containing the redirect URI for your ServiceNow
+administrator.
 
 ## Bearer tokens and CI
 

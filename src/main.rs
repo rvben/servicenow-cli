@@ -2,7 +2,7 @@ use std::io::{IsTerminal, Read};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use dialoguer::{Confirm, Editor, Input, Password};
+use dialoguer::{Confirm, Editor, Input, Password, Select};
 use serde_json::{Map, Value};
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::attachment;
@@ -72,9 +72,9 @@ enum Command {
         #[arg(long)]
         instance: Option<String>,
 
-        /// Authentication method
-        #[arg(long, value_enum, default_value = "basic")]
-        method: AuthType,
+        /// Authentication method (auto-detected when omitted)
+        #[arg(long, value_enum)]
+        method: Option<AuthType>,
 
         /// Username for Basic authentication
         #[arg(long)]
@@ -186,9 +186,9 @@ enum AuthCommand {
         #[arg(long)]
         instance: Option<String>,
 
-        /// Authentication method
-        #[arg(long, value_enum, default_value = "basic")]
-        method: AuthType,
+        /// Authentication method (auto-detected when omitted)
+        #[arg(long, value_enum)]
+        method: Option<AuthType>,
 
         /// Username for Basic authentication
         #[arg(long)]
@@ -983,7 +983,7 @@ async fn run_auth_login(
     output: &OutputConfig,
     profile: String,
     instance: Option<String>,
-    method: AuthType,
+    method: Option<AuthType>,
     username: Option<String>,
     client_id: Option<String>,
     scope: String,
@@ -994,27 +994,41 @@ async fn run_auth_login(
     read_only: bool,
 ) -> Result<(), ApiError> {
     servicenow_cli::config::validate_profile_name(&profile)?;
-    let file_storage = choose_credential_storage(insecure_storage)?;
     let instance = required_prompt(instance, "ServiceNow instance")?;
+    let method = resolve_auth_method(output, &instance, method, client_id.as_deref()).await?;
     let mut username = username;
-    let mut configured_client_id = None;
-    let credential = match method {
-        AuthType::Basic => {
-            username = Some(required_prompt(username, "Username")?);
-            StoredCredential::Basic {
-                password: read_login_secret(secret_stdin, "Password", false)?,
-            }
+    if matches!(method, AuthType::Basic) {
+        username = Some(required_prompt(username, "Username")?);
+    }
+    let configured_client_id = if matches!(method, AuthType::OAuth) {
+        if client_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            output.message(&format!(
+                "OAuth requires a ServiceNow OAuth application.\n\nAdmin request (copy/paste):\n  Please create an OAuth API endpoint for external clients for the ServiceNow CLI,\n  register this redirect URI: {redirect_uri}\n  and send me the client ID."
+            ));
         }
+        Some(required_prompt(client_id, "OAuth client ID")?)
+    } else {
+        None
+    };
+    let file_storage = choose_credential_storage(insecure_storage)?;
+    let credential = match method {
+        AuthType::Basic => StoredCredential::Basic {
+            password: read_login_secret(secret_stdin, "Password", false)?,
+        },
         AuthType::Bearer => StoredCredential::Bearer {
             access_token: read_login_secret(secret_stdin, "Access token", false)?,
         },
         AuthType::OAuth => {
-            let id = required_prompt(client_id, "OAuth client ID")?;
-            configured_client_id = Some(id.clone());
+            let id = configured_client_id
+                .as_deref()
+                .expect("OAuth client ID was collected before reading credentials");
             let client_secret = read_login_secret(secret_stdin, "OAuth client secret", true)?;
             servicenow_cli::auth::oauth_login(
                 &instance,
-                &id,
+                id,
                 (!client_secret.is_empty()).then_some(client_secret),
                 Some(&scope),
                 &redirect_uri,
@@ -1108,6 +1122,73 @@ async fn run_auth_login(
         );
     }
     Ok(())
+}
+
+async fn resolve_auth_method(
+    output: &OutputConfig,
+    instance: &str,
+    explicit: Option<AuthType>,
+    client_id: Option<&str>,
+) -> Result<AuthType, ApiError> {
+    if let Some(method) = explicit {
+        return Ok(method);
+    }
+    if client_id.is_some_and(|value| !value.trim().is_empty()) {
+        return Ok(AuthType::OAuth);
+    }
+    output.message("Checking how this instance signs users in…");
+    match servicenow_cli::auth::discover_login_provider(instance).await {
+        Ok(servicenow_cli::auth::LoginProvider::MicrosoftEntra) => {
+            output.success("Microsoft Entra SSO detected");
+            output.message(
+                "This instance needs browser-based OAuth; your Microsoft password is never entered into this CLI.",
+            );
+            Ok(AuthType::OAuth)
+        }
+        Ok(servicenow_cli::auth::LoginProvider::ExternalSso(host)) => {
+            let provider = host
+                .as_deref()
+                .map(|host| format!("External SSO detected ({host})"))
+                .unwrap_or_else(|| "External SSO detected".into());
+            output.success(&provider);
+            output.message(
+                "This instance needs browser-based OAuth; your identity-provider password is never entered into this CLI.",
+            );
+            Ok(AuthType::OAuth)
+        }
+        Ok(servicenow_cli::auth::LoginProvider::Local) => {
+            output.success("ServiceNow username/password login detected");
+            Ok(AuthType::Basic)
+        }
+        Err(error) if std::io::stdin().is_terminal() => {
+            output.message(&format!(
+                "Could not identify the login method automatically ({error})."
+            ));
+            select_auth_method()
+        }
+        Err(error) => Err(ApiError::InvalidInput(format!(
+            "could not auto-detect the authentication method ({error}); pass --method basic, oauth, or bearer"
+        ))),
+    }
+}
+
+fn select_auth_method() -> Result<AuthType, ApiError> {
+    let options = [
+        "Browser sign-in (SSO / OAuth)",
+        "ServiceNow username and password",
+        "Access token",
+    ];
+    let selected = Select::new()
+        .with_prompt("How do you sign in?")
+        .items(options)
+        .default(0)
+        .interact()
+        .map_err(|error| ApiError::Other(format!("failed to choose authentication: {error}")))?;
+    Ok(match selected {
+        0 => AuthType::OAuth,
+        1 => AuthType::Basic,
+        _ => AuthType::Bearer,
+    })
 }
 
 fn choose_credential_storage(insecure_storage: bool) -> Result<bool, ApiError> {

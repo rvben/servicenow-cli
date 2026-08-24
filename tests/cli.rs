@@ -197,6 +197,8 @@ async fn setup_can_fall_back_to_the_protected_config_file() {
             &server.uri(),
             "--username",
             "admin",
+            "--method",
+            "basic",
             "--secret-stdin",
             "--insecure-storage",
         ])
@@ -243,6 +245,35 @@ async fn setup_can_fall_back_to_the_protected_config_file() {
         .success();
     let config = std::fs::read_to_string(config_path).unwrap();
     assert!(!config.contains("password = \"secret\""));
+}
+
+#[tokio::test]
+async fn setup_detects_microsoft_entra_and_explains_the_oauth_prerequisite() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/login.do"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            "https://login.microsoftonline.com/example/oauth2/v2.0/authorize",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command(&config_home)
+        .args([
+            "setup",
+            "work",
+            "--instance",
+            &server.uri(),
+            "--insecure-storage",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Microsoft Entra SSO detected"))
+        .stderr(predicate::str::contains("Admin request (copy/paste)"))
+        .stderr(predicate::str::contains("OAuth client ID is required"));
 }
 
 #[test]

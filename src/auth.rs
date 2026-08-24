@@ -5,6 +5,7 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
     RefreshToken, Scope, TokenResponse, TokenUrl,
 };
+use reqwest::header::LOCATION;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -13,6 +14,110 @@ use crate::config::{AuthType, Config, update_stored_credential};
 use crate::credentials::StoredCredential;
 
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const LOGIN_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LOGIN_REDIRECTS: usize = 6;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoginProvider {
+    MicrosoftEntra,
+    ExternalSso(Option<String>),
+    Local,
+}
+
+/// Inspect the public login route without following a request to an external identity provider.
+pub async fn discover_login_provider(instance: &str) -> Result<LoginProvider, ApiError> {
+    let site_url = normalize_instance(instance)?;
+    let origin = reqwest::Url::parse(&site_url)
+        .map_err(|error| ApiError::InvalidInput(format!("invalid instance URL: {error}")))?;
+    let mut url = origin
+        .join("/login.do")
+        .map_err(|error| ApiError::InvalidInput(format!("invalid login URL: {error}")))?;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(LOGIN_DISCOVERY_TIMEOUT)
+        .build()?;
+
+    for _ in 0..MAX_LOGIN_REDIRECTS {
+        let response = http
+            .get(url.clone())
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(LOCATION)
+                .ok_or_else(|| ApiError::Other("login redirect omitted its location".into()))?
+                .to_str()
+                .map_err(|_| ApiError::Other("login redirect was not valid text".into()))?;
+            let next = url
+                .join(location)
+                .map_err(|error| ApiError::Other(format!("invalid login redirect: {error}")))?;
+            if !same_origin(&origin, &next) {
+                return Ok(external_provider(&next));
+            }
+            url = next;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(ApiError::Other(format!(
+                "login discovery returned HTTP {}",
+                response.status()
+            )));
+        }
+        let body = response.text().await?.to_ascii_lowercase();
+        if contains_microsoft_login(&body) {
+            return Ok(LoginProvider::MicrosoftEntra);
+        }
+        if [
+            "login_with_sso.do",
+            "glide_sso_id",
+            "external_login_complete.do",
+            "multi_sso",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+        {
+            return Ok(LoginProvider::ExternalSso(None));
+        }
+        return Ok(LoginProvider::Local);
+    }
+
+    Err(ApiError::Other(
+        "login discovery exceeded the redirect limit".into(),
+    ))
+}
+
+fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn external_provider(url: &reqwest::Url) -> LoginProvider {
+    let host = url.host_str().map(str::to_ascii_lowercase);
+    if host.as_deref().is_some_and(is_microsoft_login_host) {
+        LoginProvider::MicrosoftEntra
+    } else {
+        LoginProvider::ExternalSso(host)
+    }
+}
+
+fn is_microsoft_login_host(host: &str) -> bool {
+    matches!(host, "login.microsoft.com" | "login.windows.net")
+        || host == "login.microsoftonline.com"
+        || host.ends_with(".microsoftonline.com")
+}
+
+fn contains_microsoft_login(body: &str) -> bool {
+    [
+        "login.microsoftonline.com",
+        "login.microsoft.com",
+        "login.windows.net",
+    ]
+    .iter()
+    .any(|host| body.contains(host))
+}
 
 pub async fn oauth_login(
     instance: &str,
@@ -262,6 +367,85 @@ fn epoch_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn detects_microsoft_entra_redirect_without_following_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/login.do"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                "https://login.microsoftonline.com/example/oauth2/v2.0/authorize",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            discover_login_provider(&server.uri()).await.unwrap(),
+            LoginProvider::MicrosoftEntra
+        );
+    }
+
+    #[tokio::test]
+    async fn follows_only_same_origin_login_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/login.do"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/sso/start"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sso/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "https://id.example.com/sign-in"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            discover_login_provider(&server.uri()).await.unwrap(),
+            LoginProvider::ExternalSso(Some("id.example.com".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn detects_sso_markers_in_the_login_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/login.do"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<a href="login_with_sso.do">Use SSO</a>"#),
+            )
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            discover_login_provider(&server.uri()).await.unwrap(),
+            LoginProvider::ExternalSso(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn detects_a_local_login_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/login.do"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<form>Password</form>"))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            discover_login_provider(&server.uri()).await.unwrap(),
+            LoginProvider::Local
+        );
+    }
 
     #[tokio::test]
     async fn rejects_non_loopback_oauth_redirects() {
