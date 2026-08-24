@@ -2,6 +2,18 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.9 — 2026-08-24
+
+### Fixed
+
+- Browser-session sign-in now discovers ServiceNow's user token in both the
+  top-level page and same-origin UI frames, using either `g_ck` or the classic
+  `sysparm_ck` field. This completes the WSL handoff for framed ServiceNow UI
+  layouts that previously remained open and waited until timeout.
+- The terminal now shows that the secure browser handoff is still in progress,
+  and timeout errors identify whether the CLI was waiting for the authenticated
+  page, session cookies, user token, or REST validation.
+
 ## 0.3.8 — 2026-08-24
 
 ### Fixed

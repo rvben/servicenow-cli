@@ -16,6 +16,27 @@ use crate::credentials::StoredCredential;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const BROWSER_START_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_CHECK_INTERVAL: Duration = Duration::from_millis(750);
+const USER_TOKEN_EXPRESSION: &str = r#"(() => {
+    const seen = new Set();
+    const readToken = (view) => {
+        if (!view || seen.has(view)) return '';
+        seen.add(view);
+        try {
+            if (typeof view.g_ck === 'string' && view.g_ck) return view.g_ck;
+            const document = view.document;
+            const field = document && (document.getElementById('sysparm_ck') || document.querySelector('input[name="sysparm_ck"]'));
+            if (field && typeof field.value === 'string' && field.value) return field.value;
+        } catch (_) {}
+        try {
+            for (let index = 0; index < view.frames.length; index++) {
+                const token = readToken(view.frames[index]);
+                if (token) return token;
+            }
+        } catch (_) {}
+        return '';
+    };
+    return readToken(window);
+})()"#;
 
 /// Sign in through an isolated Chromium profile and retain only cookies scoped
 /// to the requested ServiceNow instance.
@@ -179,6 +200,7 @@ async fn wait_for_session_cookie(
         .build()?;
     let started = Instant::now();
     let mut id = 0_u64;
+    let mut last_stage = "the authenticated ServiceNow page";
 
     loop {
         if let Some(process) = process.as_deref_mut() {
@@ -188,14 +210,12 @@ async fn wait_for_session_cookie(
         let targets = cdp_command(&mut socket, id, "Target.getTargets", json!({}), None).await?;
         let Some(target) = service_now_page_target(&targets, host) else {
             if started.elapsed() >= LOGIN_TIMEOUT {
-                return Err(ApiError::Auth(
-                    "browser sign-in timed out after five minutes; run `servicenow auth login --method browser` to try again"
-                        .into(),
-                ));
+                return Err(ApiError::Auth(browser_timeout_message(last_stage)));
             }
             tokio::time::sleep(SESSION_CHECK_INTERVAL).await;
             continue;
         };
+        last_stage = "ServiceNow session cookies";
         id += 1;
         let attached = cdp_command(
             &mut socket,
@@ -229,15 +249,18 @@ async fn wait_for_session_cookie(
             }
         };
         let completed_session: Result<Option<BrowserSession>, ApiError> = async {
-            if let Some(cookie) = service_now_cookie_header(&response, host, is_https)
-                && let Some(user_token) =
+            if let Some(cookie) = service_now_cookie_header(&response, host, is_https) {
+                last_stage = "the ServiceNow user token (`g_ck` or `sysparm_ck`)";
+                if let Some(user_token) =
                     service_now_user_token(&mut socket, &mut id, &session_id).await?
-            {
-                match validate_session(&http, site_url, &cookie, &user_token).await? {
-                    SessionValidation::Authenticated => {
-                        return Ok(Some(BrowserSession { cookie, user_token }));
+                {
+                    last_stage = "ServiceNow REST session validation";
+                    match validate_session(&http, site_url, &cookie, &user_token).await? {
+                        SessionValidation::Authenticated => {
+                            return Ok(Some(BrowserSession { cookie, user_token }));
+                        }
+                        SessionValidation::Waiting => {}
                     }
-                    SessionValidation::Waiting => {}
                 }
             }
             Ok(None)
@@ -248,13 +271,16 @@ async fn wait_for_session_cookie(
             return Ok(session);
         }
         if started.elapsed() >= LOGIN_TIMEOUT {
-            return Err(ApiError::Auth(
-                "browser sign-in timed out after five minutes; run `servicenow auth login --method browser` to try again"
-                    .into(),
-            ));
+            return Err(ApiError::Auth(browser_timeout_message(last_stage)));
         }
         tokio::time::sleep(SESSION_CHECK_INTERVAL).await;
     }
+}
+
+fn browser_timeout_message(stage: &str) -> String {
+    format!(
+        "browser sign-in timed out after five minutes while waiting for {stage}; no credential was stored"
+    )
 }
 
 struct BrowserTarget {
@@ -335,13 +361,12 @@ async fn service_now_user_token(
     session_id: &str,
 ) -> Result<Option<String>, ApiError> {
     *id += 1;
-    let expression = "typeof window.g_ck === 'string' ? window.g_ck : ''";
     let evaluated = cdp_command(
         socket,
         *id,
         "Runtime.evaluate",
         json!({
-            "expression": expression,
+            "expression": USER_TOKEN_EXPRESSION,
             "returnByValue": true
         }),
         Some(session_id),
@@ -647,6 +672,11 @@ fn render_windows_bridge(site_url: &str, browser: Option<&std::ffi::OsStr>) -> S
                 .unwrap_or_default(),
             1,
         )
+        .replacen(
+            "__USER_TOKEN_EXPRESSION_HEX__",
+            &powershell_hex(USER_TOKEN_EXPRESSION.as_bytes()),
+            1,
+        )
 }
 
 const WINDOWS_BROWSER_BRIDGE: &str = r#"
@@ -665,6 +695,7 @@ $instance = [Uri](ConvertFrom-HexUtf8 '__INSTANCE_HEX__')
 $origin = $instance.GetLeftPart([UriPartial]::Authority)
 $loginUrl = "$origin/nav_to.do?uri=incident_list.do"
 $apiUrl = "$origin/api/now/table/sys_user?sysparm_query=sys_id%3Djavascript%3Ags.getUserID()&sysparm_fields=sys_id%2Cuser_name%2Cname&sysparm_limit=1"
+$userTokenExpression = ConvertFrom-HexUtf8 '__USER_TOKEN_EXPRESSION_HEX__'
 $browser = ConvertFrom-HexUtf8 '__BROWSER_HEX__'
 if (-not $browser) { $browser = $env:SERVICENOW_BROWSER }
 if (-not $browser -or -not (Test-Path -LiteralPath $browser)) {
@@ -732,6 +763,7 @@ try {
     $socket = [Net.WebSockets.ClientWebSocket]::new()
     $socket.ConnectAsync([Uri]$version.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
     $requestId = 0
+    $lastStage = 'the authenticated ServiceNow page'
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($process.HasExited) { throw "Browser closed before sign-in completed ($($process.ExitCode))." }
         $targets = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.getTargets' @{} $null
@@ -742,6 +774,7 @@ try {
             Start-Sleep -Milliseconds 750
             continue
         }
+        $lastStage = 'ServiceNow session cookies'
         $attached = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.attachToTarget' @{ targetId = $target.targetId; flatten = $true } $null
         $sessionId = $attached.result.sessionId
         try {
@@ -759,9 +792,11 @@ try {
             } | Sort-Object { $_.path.Length } -Descending)
             if ($cookies.Count -gt 0) {
                 $cookieHeader = ($cookies | ForEach-Object { "$($_.name)=$($_.value)" }) -join '; '
-                $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = "typeof window.g_ck === 'string' ? window.g_ck : ''"; returnByValue = $true } $sessionId
+                $lastStage = 'the ServiceNow user token (g_ck or sysparm_ck)'
+                $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = $userTokenExpression; returnByValue = $true } $sessionId
                 $userToken = $evaluated.result.result.value
                 if ($userToken -and $userToken -notmatch '[\r\n]') {
+                    $lastStage = 'ServiceNow REST session validation'
                     try {
                         $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -Headers @{ Cookie = $cookieHeader; 'X-UserToken' = $userToken; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
                         if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
@@ -775,6 +810,7 @@ try {
                         if ($_.Exception.Response) {
                             $status = [int]$_.Exception.Response.StatusCode
                             $loggedIn = $_.Exception.Response.Headers['X-Is-Logged-In'] -eq 'true'
+                            $lastStage = "ServiceNow REST session validation (HTTP $status)"
                         }
                         if ($status -eq 403 -and $loggedIn) {
                             Write-Output 'SERVICENOW_FORBIDDEN'
@@ -789,7 +825,7 @@ try {
         }
         Start-Sleep -Milliseconds 750
     }
-    throw 'Browser sign-in timed out after five minutes.'
+    throw "Browser sign-in timed out after five minutes while waiting for $lastStage; no credential was stored."
 } finally {
     if ($socket) { try { $socket.Dispose() } catch {} }
     if ($process -and -not $process.HasExited) { try { Stop-Process -Id $process.Id -Force } catch {} }
@@ -844,6 +880,7 @@ mod tests {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("'X-UserToken' = $userToken"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$instance.Host"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__INSTANCE_HEX__"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("__USER_TOKEN_EXPRESSION_HEX__"));
         assert!(!WINDOWS_BROWSER_BRIDGE.contains("login.microsoftonline.com"));
         assert_eq!(
             powershell_hex(b"https://company.service-now.com"),
@@ -852,6 +889,7 @@ mod tests {
         let rendered = render_windows_bridge("https://company.service-now.com", None);
         assert!(!rendered.contains("__INSTANCE_HEX__"));
         assert!(!rendered.contains("__BROWSER_HEX__"));
+        assert!(!rendered.contains("__USER_TOKEN_EXPRESSION_HEX__"));
     }
 
     #[test]
@@ -1007,10 +1045,13 @@ mod tests {
                         "targetId": "service-now-page"
                     }]}),
                     "Target.attachToTarget" => json!({"sessionId": "attached-page"}),
-                    "Runtime.evaluate" => json!({"result": {
-                        "type": "string",
-                        "value": "synthetic-user-token"
-                    }}),
+                    "Runtime.evaluate" => {
+                        assert_eq!(request["params"]["expression"], USER_TOKEN_EXPRESSION);
+                        json!({"result": {
+                            "type": "string",
+                            "value": "synthetic-user-token"
+                        }})
+                    }
                     "Target.detachFromTarget" => json!({}),
                     method => panic!("unexpected CDP method: {method}"),
                 };
@@ -1048,11 +1089,20 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(
-                        "<script>window.g_ck = 'browser-smoke-user-token'</script>Signed in",
+                        "<iframe src='/classic.do'></iframe>Signed in",
                         "text/html; charset=utf-8",
                     )
                     .insert_header("set-cookie", "JSESSIONID=browser-smoke; Path=/; HttpOnly"),
             )
+            .expect(1)
+            .mount(&instance)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/classic.do"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<input type='hidden' id='sysparm_ck' value='browser-smoke-user-token'>",
+                "text/html; charset=utf-8",
+            ))
             .expect(1)
             .mount(&instance)
             .await;

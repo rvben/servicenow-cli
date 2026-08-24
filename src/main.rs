@@ -1102,7 +1102,13 @@ async fn run_auth_login(
                     "Complete your normal SSO sign-in there. This CLI never receives your identity-provider password.",
                 );
             }
-            servicenow_cli::browser::browser_login(&instance, !no_browser).await?
+            let spinner = OnboardingSpinner::start(
+                output,
+                "Waiting for ServiceNow to complete the secure browser handoff",
+            );
+            let credential = servicenow_cli::browser::browser_login(&instance, !no_browser).await;
+            drop(spinner);
+            credential?
         }
         AuthType::Bearer => StoredCredential::Bearer {
             access_token: read_login_secret(secret_stdin, "Access token", false)?,
