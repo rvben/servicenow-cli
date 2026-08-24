@@ -2,6 +2,29 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.2 — 2026-08-24
+
+### Fixed
+
+- `servicenow setup` no longer exposes a raw D-Bus/zbus failure when WSL2 or a
+  minimal Linux environment has no Secret Service provider.
+
+### Added
+
+- Interactive setup now explains unavailable credential storage and offers a
+  permission-locked config-file fallback before reading or writing a secret.
+- Non-interactive setup can select the fallback explicitly with
+  `--insecure-storage`.
+- `servicenow doctor` reports whether credentials came from the OS keychain,
+  protected config file, environment, or a legacy profile field.
+
+### Safety
+
+- The OS keychain remains the default. Plaintext fallback storage requires
+  confirmation, uses an atomic mode-`0600` config write on Unix, remains
+  overridable by environment variables, and is cleared by logout or profile
+  removal.
+
 ## 0.3.1 — 2026-08-22
 
 ### Added
