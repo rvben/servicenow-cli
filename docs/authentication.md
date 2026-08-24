@@ -32,11 +32,14 @@ instances when no OAuth application is available:
 servicenow setup work --instance company --method browser
 ```
 
-The CLI launches Chrome, Edge, or Chromium with a new temporary profile and a
-localhost-only debugging channel. Complete the normal SSO and MFA flow in that
-window. The CLI retains only cookies valid for the requested ServiceNow hostname
-and API path, validates them against the Table API, closes the private browser,
-and removes its temporary profile. Identity-provider cookies—including
+The CLI launches Edge InPrivate or Chrome/Chromium Incognito with a new
+temporary profile and a localhost-only debugging channel. Complete the normal
+SSO and MFA flow in that window. A managed Windows device can still authenticate
+silently through Entra device SSO, even in a private window, so setup displays
+the resolved ServiceNow name and username for confirmation before storing
+anything. The CLI retains only cookies valid for the requested ServiceNow
+hostname and API path, validates them against the Table API, closes the private
+browser, and removes its temporary profile. Identity-provider cookies—including
 Microsoft Entra cookies—are never retained by the CLI. The resulting ServiceNow
 cookie and anti-CSRF user token are protected like any other credential. This uses
 [ServiceNow's documented support for binding REST requests to an existing

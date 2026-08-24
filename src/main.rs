@@ -1102,9 +1102,7 @@ async fn run_auth_login(
                     "Complete your normal SSO sign-in there. This CLI never receives your identity-provider password.",
                 );
             }
-            let credential = servicenow_cli::browser::browser_login(&instance, !no_browser).await?;
-            output.success("Browser sign-in complete");
-            credential
+            servicenow_cli::browser::browser_login(&instance, !no_browser).await?
         }
         AuthType::Bearer => StoredCredential::Bearer {
             access_token: read_login_secret(secret_stdin, "Access token", false)?,
@@ -1129,11 +1127,6 @@ async fn run_auth_login(
             .await?
         }
     };
-    let file_storage = match file_storage {
-        Some(file_storage) => file_storage,
-        None => choose_credential_storage(insecure_storage)?,
-    };
-
     let browser_user_token = match &credential {
         StoredCredential::Browser { user_token, .. } => Some(user_token.as_str()),
         _ => None,
@@ -1163,9 +1156,46 @@ async fn run_auth_login(
         }
         Err(error) => return Err(error),
     };
+    let mut browser_identity = None;
     if let Some(user) = users.first() {
         username = field_text(user, "user_name").or(username);
+        if matches!(method, AuthType::Browser) {
+            let name = field_text(user, "name");
+            browser_identity = match (name.as_deref(), username.as_deref()) {
+                (Some(name), Some(username)) if name != username => {
+                    Some(format!("{name} ({username})"))
+                }
+                (Some(name), _) => Some(name.into()),
+                (_, Some(username)) => Some(username.into()),
+                _ => None,
+            };
+        }
     }
+    if matches!(method, AuthType::Browser) {
+        let identity = browser_identity.unwrap_or_else(|| "your ServiceNow account".into());
+        if output.format == OutputFormat::Text && std::io::stdin().is_terminal() {
+            let accepted = Confirm::new()
+                .with_prompt(format!("Continue as {identity}?"))
+                .default(true)
+                .interact()
+                .map_err(|error| {
+                    ApiError::Other(format!("failed to confirm browser identity: {error}"))
+                })?;
+            if !accepted {
+                return Err(ApiError::InvalidInput(
+                    "browser sign-in cancelled; no credential was stored. To use another account, set SERVICENOW_BROWSER to a browser without automatic work-account sign-in and retry"
+                        .into(),
+                ));
+            }
+        } else if output.format == OutputFormat::Text {
+            output.success(&format!("Browser sign-in complete as {identity}"));
+        }
+    }
+
+    let file_storage = match file_storage {
+        Some(file_storage) => file_storage,
+        None => choose_credential_storage(insecure_storage)?,
+    };
 
     let mut profile_config = ProfileConfig::default();
     profile_config.instance = Some(instance);

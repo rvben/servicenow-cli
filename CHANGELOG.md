@@ -2,6 +2,15 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- Browser-session authentication now opens a visibly InPrivate or Incognito
+  window in addition to using its disposable profile. Setup displays the
+  resolved ServiceNow identity and asks for confirmation before storing the
+  session, protecting against unintended Entra device-SSO account selection.
+
 ## 0.3.6 — 2026-08-24
 
 ### Fixed

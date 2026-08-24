@@ -54,6 +54,7 @@ struct BrowserSession {
 
 async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiError> {
     let browser = find_native_browser()?;
+    let private_mode = private_browsing_argument(&browser);
     let profile = tempfile::tempdir()
         .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
     let login_url = format!("{site_url}/nav_to.do?uri=incident_list.do");
@@ -65,6 +66,7 @@ async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErro
             "--no-first-run".into(),
             "--no-default-browser-check".into(),
             "--disable-sync".into(),
+            private_mode.into(),
             "--new-window".into(),
             login_url,
         ])
@@ -84,6 +86,19 @@ async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErro
     };
     let websocket_url = wait_for_debugger(&mut process).await?;
     wait_for_session_cookie(&websocket_url, site_url, Some(&mut process)).await
+}
+
+fn private_browsing_argument(browser: &Path) -> &'static str {
+    let executable = browser
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if executable.contains("msedge") || executable.contains("microsoft-edge") {
+        "--inprivate"
+    } else {
+        "--incognito"
+    }
 }
 
 struct NativeBrowser {
@@ -170,18 +185,68 @@ async fn wait_for_session_cookie(
             process.ensure_running()?;
         }
         id += 1;
-        let response = cdp_command(&mut socket, id, "Storage.getCookies", json!({}), None).await?;
-        if let Some(cookie) = service_now_cookie_header(&response, host, is_https) {
-            match validate_session(&http, site_url, &cookie).await? {
-                SessionValidation::Authenticated => {
-                    if let Some(user_token) =
-                        service_now_user_token(&mut socket, &mut id, host).await?
-                    {
-                        return Ok(BrowserSession { cookie, user_token });
-                    }
-                }
-                SessionValidation::Waiting => {}
+        let targets = cdp_command(&mut socket, id, "Target.getTargets", json!({}), None).await?;
+        let Some(target) = service_now_page_target(&targets, host) else {
+            if started.elapsed() >= LOGIN_TIMEOUT {
+                return Err(ApiError::Auth(
+                    "browser sign-in timed out after five minutes; run `servicenow auth login --method browser` to try again"
+                        .into(),
+                ));
             }
+            tokio::time::sleep(SESSION_CHECK_INTERVAL).await;
+            continue;
+        };
+        id += 1;
+        let attached = cdp_command(
+            &mut socket,
+            id,
+            "Target.attachToTarget",
+            json!({"targetId": target.target_id, "flatten": true}),
+            None,
+        )
+        .await?;
+        let session_id = attached
+            .pointer("/result/sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ApiError::Other("browser did not open the private ServiceNow page session".into())
+            })?
+            .to_string();
+        id += 1;
+        let response = cdp_command(
+            &mut socket,
+            id,
+            "Network.getCookies",
+            json!({"urls": [format!("{site_url}/api/now/")]}),
+            Some(&session_id),
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                detach_page_session(&mut socket, &mut id, &session_id).await;
+                return Err(error);
+            }
+        };
+        let completed_session: Result<Option<BrowserSession>, ApiError> = async {
+            if let Some(cookie) = service_now_cookie_header(&response, host, is_https) {
+                match validate_session(&http, site_url, &cookie).await? {
+                    SessionValidation::Authenticated => {
+                        if let Some(user_token) =
+                            service_now_user_token(&mut socket, &mut id, &session_id).await?
+                        {
+                            return Ok(Some(BrowserSession { cookie, user_token }));
+                        }
+                    }
+                    SessionValidation::Waiting => {}
+                }
+            }
+            Ok(None)
+        }
+        .await;
+        detach_page_session(&mut socket, &mut id, &session_id).await;
+        if let Some(session) = completed_session? {
+            return Ok(session);
         }
         if started.elapsed() >= LOGIN_TIMEOUT {
             return Err(ApiError::Auth(
@@ -191,6 +256,30 @@ async fn wait_for_session_cookie(
         }
         tokio::time::sleep(SESSION_CHECK_INTERVAL).await;
     }
+}
+
+struct BrowserTarget {
+    target_id: String,
+}
+
+fn service_now_page_target(document: &Value, host: &str) -> Option<BrowserTarget> {
+    document
+        .pointer("/result/targetInfos")?
+        .as_array()?
+        .iter()
+        .find_map(|target| {
+            let is_page = target.get("type").and_then(Value::as_str) == Some("page");
+            let url = target.get("url").and_then(Value::as_str)?;
+            let target_host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
+            (is_page && target_host.eq_ignore_ascii_case(host)).then(|| BrowserTarget {
+                target_id: target
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .filter(|target| !target.target_id.is_empty())
 }
 
 async fn cdp_command(
@@ -244,47 +333,8 @@ async fn cdp_command(
 async fn service_now_user_token(
     socket: &mut CdpSocket,
     id: &mut u64,
-    host: &str,
+    session_id: &str,
 ) -> Result<Option<String>, ApiError> {
-    *id += 1;
-    let targets = cdp_command(socket, *id, "Target.getTargets", json!({}), None).await?;
-    let Some(target_id) = targets
-        .pointer("/result/targetInfos")
-        .and_then(Value::as_array)
-        .and_then(|targets| {
-            targets.iter().find_map(|target| {
-                let is_page = target.get("type").and_then(Value::as_str) == Some("page");
-                let url = target.get("url").and_then(Value::as_str)?;
-                let target_host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
-                (is_page && target_host.eq_ignore_ascii_case(host))
-                    .then(|| {
-                        target
-                            .get("targetId")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .flatten()
-            })
-        })
-    else {
-        return Ok(None);
-    };
-
-    *id += 1;
-    let attached = cdp_command(
-        socket,
-        *id,
-        "Target.attachToTarget",
-        json!({"targetId": target_id, "flatten": true}),
-        None,
-    )
-    .await?;
-    let session_id = attached
-        .pointer("/result/sessionId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::Other("browser did not open the ServiceNow page session".into()))?
-        .to_string();
-
     *id += 1;
     let expression = "typeof window.g_ck === 'string' ? window.g_ck : ''";
     let evaluated = cdp_command(
@@ -295,16 +345,7 @@ async fn service_now_user_token(
             "expression": expression,
             "returnByValue": true
         }),
-        Some(&session_id),
-    )
-    .await;
-    *id += 1;
-    let _ = cdp_command(
-        socket,
-        *id,
-        "Target.detachFromTarget",
-        json!({"sessionId": session_id}),
-        None,
+        Some(session_id),
     )
     .await;
     let evaluated = evaluated?;
@@ -314,6 +355,18 @@ async fn service_now_user_token(
         .filter(|token| !token.is_empty() && HeaderValue::from_str(token).is_ok())
         .map(str::to_string);
     Ok(token)
+}
+
+async fn detach_page_session(socket: &mut CdpSocket, id: &mut u64, session_id: &str) {
+    *id += 1;
+    let _ = cdp_command(
+        socket,
+        *id,
+        "Target.detachFromTarget",
+        json!({"sessionId": session_id}),
+        None,
+    )
+    .await;
 }
 
 fn service_now_cookie_header(document: &Value, host: &str, is_https: bool) -> Option<String> {
@@ -655,7 +708,8 @@ function Invoke-CdpCommand {
 try {
     $quotedProfile = '"' + $profile + '"'
     $quotedUrl = '"' + $loginUrl + '"'
-    $arguments = "--remote-debugging-port=0 --remote-debugging-address=127.0.0.1 --user-data-dir=$quotedProfile --no-first-run --no-default-browser-check --disable-sync --new-window $quotedUrl"
+    $privateMode = if ((Split-Path -Leaf $browser) -match '(?i)msedge') { '--inprivate' } else { '--incognito' }
+    $arguments = "--remote-debugging-port=0 --remote-debugging-address=127.0.0.1 --user-data-dir=$quotedProfile --no-first-run --no-default-browser-check --disable-sync $privateMode --new-window $quotedUrl"
     $process = Start-Process -FilePath $browser -ArgumentList $arguments -PassThru
     $deadline = [DateTime]::UtcNow.AddMinutes(5)
     $version = $null
@@ -679,57 +733,58 @@ try {
     $requestId = 0
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($process.HasExited) { throw "Browser closed before sign-in completed ($($process.ExitCode))." }
-        $document = Invoke-CdpCommand $socket ([ref]$requestId) 'Storage.getCookies' @{} $null
-
-        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $cookies = @($document.result.cookies | Where-Object {
-            $nameIsSafe = $_.name -and $_.name -notmatch '[;=\r\n]'
-            $valueIsSafe = $_.value -notmatch '[;\r\n]'
-            $domain = $_.domain.TrimStart('.').ToLowerInvariant()
-            $hostMatches = $instance.Host.ToLowerInvariant() -eq $domain -or $instance.Host.ToLowerInvariant().EndsWith('.' + $domain)
-            $cookiePath = if ($_.path) { $_.path } else { '/' }
-            $pathMatches = '/api/now/'.StartsWith($cookiePath)
-            $notExpired = $_.expires -le 0 -or $_.expires -gt $now
-            $nameIsSafe -and $valueIsSafe -and $hostMatches -and $pathMatches -and $notExpired -and (-not $_.secure -or $instance.Scheme -eq 'https')
-        } | Sort-Object { $_.path.Length } -Descending)
-        if ($cookies.Count -gt 0) {
-            $cookieHeader = ($cookies | ForEach-Object { "$($_.name)=$($_.value)" }) -join '; '
-            try {
-                $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -Headers @{ Cookie = $cookieHeader; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
-                if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
-                    $targets = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.getTargets' @{} $null
-                    $target = $targets.result.targetInfos | Where-Object {
-                        $_.type -eq 'page' -and ($_.url -eq $origin -or $_.url.StartsWith($origin + '/'))
-                    } | Select-Object -First 1
-                    if ($target) {
-                        $attached = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.attachToTarget' @{ targetId = $target.targetId; flatten = $true } $null
-                        $sessionId = $attached.result.sessionId
-                        try {
-                            $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = "typeof window.g_ck === 'string' ? window.g_ck : ''"; returnByValue = $true } $sessionId
-                            $userToken = $evaluated.result.result.value
-                        } finally {
-                            if ($sessionId) { try { Invoke-CdpCommand $socket ([ref]$requestId) 'Target.detachFromTarget' @{ sessionId = $sessionId } $null | Out-Null } catch {} }
-                        }
+        $targets = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.getTargets' @{} $null
+        $target = $targets.result.targetInfos | Where-Object {
+            $_.type -eq 'page' -and ($_.url -eq $origin -or $_.url.StartsWith($origin + '/'))
+        } | Select-Object -First 1
+        if (-not $target) {
+            Start-Sleep -Milliseconds 750
+            continue
+        }
+        $attached = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.attachToTarget' @{ targetId = $target.targetId; flatten = $true } $null
+        $sessionId = $attached.result.sessionId
+        try {
+            $document = Invoke-CdpCommand $socket ([ref]$requestId) 'Network.getCookies' @{ urls = @("$origin/api/now/") } $sessionId
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $cookies = @($document.result.cookies | Where-Object {
+                $nameIsSafe = $_.name -and $_.name -notmatch '[;=\r\n]'
+                $valueIsSafe = $_.value -notmatch '[;\r\n]'
+                $domain = $_.domain.TrimStart('.').ToLowerInvariant()
+                $hostMatches = $instance.Host.ToLowerInvariant() -eq $domain -or $instance.Host.ToLowerInvariant().EndsWith('.' + $domain)
+                $cookiePath = if ($_.path) { $_.path } else { '/' }
+                $pathMatches = '/api/now/'.StartsWith($cookiePath)
+                $notExpired = $_.expires -le 0 -or $_.expires -gt $now
+                $nameIsSafe -and $valueIsSafe -and $hostMatches -and $pathMatches -and $notExpired -and (-not $_.secure -or $instance.Scheme -eq 'https')
+            } | Sort-Object { $_.path.Length } -Descending)
+            if ($cookies.Count -gt 0) {
+                $cookieHeader = ($cookies | ForEach-Object { "$($_.name)=$($_.value)" }) -join '; '
+                try {
+                    $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -Headers @{ Cookie = $cookieHeader; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
+                    if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                        $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = "typeof window.g_ck === 'string' ? window.g_ck : ''"; returnByValue = $true } $sessionId
+                        $userToken = $evaluated.result.result.value
                         if ($userToken -and $userToken -notmatch '[\r\n]') {
                             $session = @{ cookie = $cookieHeader; user_token = $userToken }
                             Write-Output ('SERVICENOW_RESULT:' + ($session | ConvertTo-Json -Compress))
                             exit 0
                         }
                     }
+                } catch {
+                    $status = 0
+                    $loggedIn = $false
+                    if ($_.Exception.Response) {
+                        $status = [int]$_.Exception.Response.StatusCode
+                        $loggedIn = $_.Exception.Response.Headers['X-Is-Logged-In'] -eq 'true'
+                    }
+                    if ($status -eq 403 -and $loggedIn) {
+                        Write-Output 'SERVICENOW_FORBIDDEN'
+                        exit 3
+                    }
+                    if ($status -ne 401 -and $status -ne 403 -and ($status -lt 300 -or $status -ge 400)) { throw }
                 }
-            } catch {
-                $status = 0
-                $loggedIn = $false
-                if ($_.Exception.Response) {
-                    $status = [int]$_.Exception.Response.StatusCode
-                    $loggedIn = $_.Exception.Response.Headers['X-Is-Logged-In'] -eq 'true'
-                }
-                if ($status -eq 403 -and $loggedIn) {
-                    Write-Output 'SERVICENOW_FORBIDDEN'
-                    exit 3
-                }
-                if ($status -ne 401 -and $status -ne 403 -and ($status -lt 300 -or $status -ge 400)) { throw }
             }
+        } finally {
+            if ($sessionId) { try { Invoke-CdpCommand $socket ([ref]$requestId) 'Target.detachFromTarget' @{ sessionId = $sessionId } $null | Out-Null } catch {} }
         }
         Start-Sleep -Milliseconds 750
     }
@@ -782,7 +837,9 @@ mod tests {
     #[test]
     fn powershell_bridge_uses_an_isolated_profile_and_service_now_scope() {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--user-data-dir="));
-        assert!(WINDOWS_BROWSER_BRIDGE.contains("Storage.getCookies"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("--inprivate"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("--incognito"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("Network.getCookies"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$instance.Host"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__INSTANCE_HEX__"));
         assert!(!WINDOWS_BROWSER_BRIDGE.contains("login.microsoftonline.com"));
@@ -793,6 +850,24 @@ mod tests {
         let rendered = render_windows_bridge("https://company.service-now.com", None);
         assert!(!rendered.contains("__INSTANCE_HEX__"));
         assert!(!rendered.contains("__BROWSER_HEX__"));
+    }
+
+    #[test]
+    fn private_browsing_flag_matches_the_browser() {
+        assert_eq!(
+            private_browsing_argument(Path::new("/usr/bin/google-chrome")),
+            "--incognito"
+        );
+        assert_eq!(
+            private_browsing_argument(Path::new("/usr/bin/chromium")),
+            "--incognito"
+        );
+        assert_eq!(
+            private_browsing_argument(Path::new(
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+            )),
+            "--inprivate"
+        );
     }
 
     #[test]
@@ -908,14 +983,21 @@ mod tests {
                 let request = request.unwrap();
                 let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
                 let result = match request["method"].as_str().unwrap() {
-                    "Storage.getCookies" => json!({"cookies": [{
-                        "name": "JSESSIONID",
-                        "value": "validated-session",
-                        "domain": "127.0.0.1",
-                        "path": "/",
-                        "secure": false,
-                        "expires": -1
-                    }]}),
+                    "Network.getCookies" => {
+                        assert_eq!(request["sessionId"], "attached-page");
+                        assert_eq!(
+                            request["params"]["urls"][0],
+                            format!("http://127.0.0.1:{instance_port}/api/now/")
+                        );
+                        json!({"cookies": [{
+                            "name": "JSESSIONID",
+                            "value": "validated-session",
+                            "domain": "127.0.0.1",
+                            "path": "/",
+                            "secure": false,
+                            "expires": -1
+                        }]})
+                    }
                     "Target.getTargets" => json!({"targetInfos": [{
                         "type": "page",
                         "url": format!("http://127.0.0.1:{instance_port}/now/nav/ui"),
