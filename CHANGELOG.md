@@ -2,7 +2,7 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
-## Unreleased
+## 0.3.7 — 2026-08-24
 
 ### Fixed
 
