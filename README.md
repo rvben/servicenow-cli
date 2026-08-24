@@ -283,3 +283,8 @@ This project is unofficial and is not affiliated with or supported by
 ServiceNow. ServiceNow is a trademark of ServiceNow, Inc.
 
 Licensed under the [MIT License](LICENSE).
+
+## Releasing
+
+Vership owns versioning, changelog generation, release commits, and tags. See
+[the release runbook](docs/releases.md) for the verified workflow and recovery policy.

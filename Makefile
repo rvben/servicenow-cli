@@ -1,4 +1,4 @@
-.PHONY: build test test-e2e lint fmt check release install clean
+.PHONY: build test test-e2e lint fmt check release install clean release-patch release-minor release-major
 
 build:
 	cargo build
@@ -31,3 +31,12 @@ install: check release
 
 clean:
 	cargo clean
+
+release-patch:
+	vership bump patch
+
+release-minor:
+	vership bump minor
+
+release-major:
+	vership bump major
