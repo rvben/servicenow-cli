@@ -2470,6 +2470,7 @@ name = "servicenow-cli"
 version = "0.3.5"
 dependencies = [
  "assert_cmd",
+ "base64",
  "clap",
  "clap_complete",
  "comfy-table",

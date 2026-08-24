@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
@@ -474,8 +475,6 @@ fn uses_windows_browser_bridge() -> bool {
 }
 
 async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiError> {
-    use tokio::io::AsyncWriteExt;
-
     let powershell = ["powershell.exe", "pwsh.exe"]
         .into_iter()
         .find_map(find_in_path)
@@ -485,37 +484,31 @@ async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErr
                     .into(),
             )
         })?;
-    let mut child = tokio::process::Command::new(powershell)
+    let browser_override = std::env::var_os("SERVICENOW_BROWSER");
+    let bridge = render_windows_bridge(site_url, browser_override.as_deref());
+    let encoded_bridge = powershell_encoded_command(&bridge);
+    let child = tokio::process::Command::new(powershell)
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            "-",
+            "-EncodedCommand",
+            &encoded_bridge,
         ])
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| ApiError::Other(format!("failed to start PowerShell: {error}")))?;
-    let browser_override = std::env::var_os("SERVICENOW_BROWSER");
-    let bridge = render_windows_bridge(site_url, browser_override.as_deref());
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| ApiError::Other("failed to open PowerShell input".into()))?
-        .write_all(bridge.as_bytes())
-        .await
-        .map_err(|error| ApiError::Other(format!("failed to start browser bridge: {error}")))?;
     let output = child
         .wait_with_output()
         .await
         .map_err(|error| ApiError::Other(format!("browser bridge failed: {error}")))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = decode_powershell_output(&output.stdout);
     if let Some(encoded) = stdout
         .lines()
         .find_map(|line| line.strip_prefix("SERVICENOW_RESULT:"))
@@ -530,16 +523,52 @@ async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErr
                 .into(),
         ));
     }
-    let detail = String::from_utf8_lossy(&output.stderr)
+    let detail = decode_powershell_output(&output.stderr)
         .trim()
         .chars()
         .take(500)
         .collect::<String>();
-    Err(ApiError::Other(if detail.is_empty() {
-        format!("browser sign-in bridge exited with {}", output.status)
-    } else {
+    Err(ApiError::Other(if !detail.is_empty() {
         format!("browser sign-in failed: {detail}")
+    } else if stdout.lines().any(|line| line == "SERVICENOW_BRIDGE_READY") {
+        "browser sign-in ended before a ServiceNow session was returned; try again or set SERVICENOW_BROWSER to Windows Edge or Chrome"
+            .into()
+    } else {
+        "Windows PowerShell exited before starting the browser sign-in bridge; ensure WSL Windows interop is enabled and try again"
+            .into()
     }))
+}
+
+fn powershell_encoded_command(script: &str) -> String {
+    let utf16_le = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(utf16_le)
+}
+
+fn decode_powershell_output(bytes: &[u8]) -> String {
+    let has_utf16_le_bom = bytes.starts_with(&[0xff, 0xfe]);
+    let looks_like_utf16_le = bytes.len() >= 4
+        && bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|byte| **byte == 0)
+            .count()
+            * 4
+            >= bytes.len();
+    if has_utf16_le_bom || looks_like_utf16_le {
+        let start = usize::from(has_utf16_le_bom) * 2;
+        let (pairs, _) = bytes[start..].as_chunks::<2>();
+        let units = pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 fn powershell_hex(value: &[u8]) -> String {
@@ -568,6 +597,7 @@ fn render_windows_bridge(site_url: &str, browser: Option<&std::ffi::OsStr>) -> S
 
 const WINDOWS_BROWSER_BRIDGE: &str = r#"
 $ErrorActionPreference = 'Stop'
+Write-Output 'SERVICENOW_BRIDGE_READY'
 function ConvertFrom-HexUtf8 {
     param([string]$Hex)
     if (-not $Hex) { return '' }
@@ -763,6 +793,60 @@ mod tests {
         let rendered = render_windows_bridge("https://company.service-now.com", None);
         assert!(!rendered.contains("__INSTANCE_HEX__"));
         assert!(!rendered.contains("__BROWSER_HEX__"));
+    }
+
+    #[test]
+    fn powershell_bridge_is_encoded_as_one_complete_command() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let script = "Write-Output 'SERVICENOW_BRIDGE_READY'";
+        let decoded = STANDARD.decode(powershell_encoded_command(script)).unwrap();
+        let (pairs, remainder) = decoded.as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let units = pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(String::from_utf16(units.as_slice()).unwrap(), script);
+    }
+
+    #[test]
+    fn powershell_output_accepts_utf8_and_utf16_le() {
+        let output = "SERVICENOW_RESULT:{\"cookie\":\"safe\"}\r\n";
+        let utf16 = output
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(decode_powershell_output(output.as_bytes()), output);
+        assert_eq!(decode_powershell_output(&utf16), output);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn encoded_powershell_command_executes_and_returns_output() {
+        let powershell = find_in_path("powershell.exe").expect("powershell.exe on Windows");
+        let output = std::process::Command::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                &powershell_encoded_command("Write-Output 'SERVICENOW_BRIDGE_READY'"),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            decode_powershell_output(&output.stderr)
+        );
+        assert_eq!(
+            decode_powershell_output(&output.stdout).trim(),
+            "SERVICENOW_BRIDGE_READY"
+        );
     }
 
     #[cfg(target_os = "windows")]

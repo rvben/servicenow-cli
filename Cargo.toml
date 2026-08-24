@@ -17,6 +17,7 @@ name = "servicenow"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 comfy-table = "8"

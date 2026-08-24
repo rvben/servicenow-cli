@@ -2,6 +2,15 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- WSL2 browser sign-in now passes the complete bridge to Windows PowerShell as
+  one encoded command and accepts both UTF-8 and UTF-16 output. This prevents
+  PowerShell from exiting successfully without launching the browser or
+  returning a session.
+
 ## 0.3.5 — 2026-08-24
 
 ### Added
