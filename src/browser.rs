@@ -963,6 +963,7 @@ $profile = Join-Path $env:TEMP ("servicenow-cli-browser-" + [Guid]::NewGuid().To
 $process = $null
 $socket = $null
 $bridgeExitCode = 0
+$requestId = 0
 function Invoke-CdpCommand {
     param($Socket, [ref]$RequestId, [string]$Method, $Params, [string]$SessionId)
     $RequestId.Value++
@@ -987,35 +988,38 @@ function Invoke-CdpCommand {
     }
 }
 try {
+    $portProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+        $portProbe.Start()
+        $debugPort = ([Net.IPEndPoint]$portProbe.LocalEndpoint).Port
+    } finally {
+        $portProbe.Stop()
+    }
     $quotedProfile = '"' + $profile + '"'
     $quotedUrl = '"' + $loginUrl + '"'
     $privateMode = if ((Split-Path -Leaf $browser) -match '(?i)msedge') { '--inprivate' } else { '--incognito' }
-    $arguments = "--remote-debugging-port=0 --remote-debugging-address=127.0.0.1 --user-data-dir=$quotedProfile --no-first-run --no-default-browser-check --disable-sync $privateMode --new-window $quotedUrl"
+    $arguments = "--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1 --user-data-dir=$quotedProfile --no-first-run --no-default-browser-check --disable-sync $privateMode --new-window $quotedUrl"
     Write-Stage 'starting-private-browser'
     $process = Start-Process -FilePath $browser -ArgumentList $arguments -PassThru
     Write-Stage 'private-browser-opened'
     Write-Stage 'waiting-browser-channel'
-    $deadline = [DateTime]::UtcNow.AddMinutes(5)
+    $channelDeadline = [DateTime]::UtcNow.AddSeconds(20)
     $version = $null
-    while (-not $version -and [DateTime]::UtcNow -lt $deadline) {
+    while (-not $version -and [DateTime]::UtcNow -lt $channelDeadline) {
         if ($process.HasExited) { throw "Browser closed before sign-in completed ($($process.ExitCode))." }
         try {
-            $portFile = Join-Path $profile 'DevToolsActivePort'
-            if (Test-Path -LiteralPath $portFile) {
-                $port = (Get-Content -LiteralPath $portFile -TotalCount 1).Trim()
-                if ($port -match '^\d+$') {
-                    $version = Invoke-RestMethod -UseBasicParsing "http://127.0.0.1:$port/json/version" -TimeoutSec 2
-                }
-            }
+            $version = Invoke-RestMethod -UseBasicParsing "http://127.0.0.1:$debugPort/json/version" -TimeoutSec 2
         } catch {}
         if (-not $version) { Start-Sleep -Milliseconds 200 }
     }
-    if (-not $version.webSocketDebuggerUrl) { throw 'The private browser sign-in channel did not become available.' }
+    if (-not $version.webSocketDebuggerUrl) {
+        throw 'The private browser opened, but its localhost sign-in channel did not become available within 20 seconds. Edge or Chrome may have ignored its isolated debugging options, or an enterprise browser policy may block browser automation. Set SERVICENOW_BROWSER to the other Windows browser and retry with --verbose.'
+    }
 
     Write-Stage 'browser-channel-ready'
     $socket = [Net.WebSockets.ClientWebSocket]::new()
     $socket.ConnectAsync([Uri]$version.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
-    $requestId = 0
+    $deadline = [DateTime]::UtcNow.AddMinutes(5)
     $lastStage = 'the authenticated ServiceNow page'
     Write-Stage 'waiting-servicenow-page'
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -1095,7 +1099,10 @@ try {
     Write-Output ('SERVICENOW_ERROR:' + [Convert]::ToBase64String($errorBytes))
     $bridgeExitCode = 1
 } finally {
-    if ($socket) { try { $socket.Dispose() } catch {} }
+    if ($socket) {
+        try { Invoke-CdpCommand $socket ([ref]$requestId) 'Browser.close' @{} $null | Out-Null } catch {}
+        try { $socket.Dispose() } catch {}
+    }
     if ($process -and -not $process.HasExited) { try { Stop-Process -Id $process.Id -Force } catch {} }
     if (Test-Path -LiteralPath $profile) { try { Remove-Item -LiteralPath $profile -Recurse -Force } catch {} }
 }
@@ -1143,12 +1150,18 @@ mod tests {
     #[test]
     fn powershell_bridge_uses_an_isolated_profile_and_service_now_scope() {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--user-data-dir="));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("--remote-debugging-port=$debugPort"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("[Net.IPAddress]::Loopback, 0"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("AddSeconds(20)"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("AddMinutes(5)"));
+        assert!(!WINDOWS_BROWSER_BRIDGE.contains("DevToolsActivePort"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--inprivate"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--incognito"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$ProgressPreference = 'SilentlyContinue'"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("SERVICENOW_STAGE:"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("SERVICENOW_ERROR:"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("Network.getCookies"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("'Browser.close'"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("'X-UserToken' = $userToken"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$instance.Host"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__INSTANCE_HEX__"));

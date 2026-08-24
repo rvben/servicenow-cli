@@ -2,6 +2,19 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.12 — 2026-08-24
+
+### Fixed
+
+- WSL browser sign-in now reserves an explicit Windows loopback port and gives
+  that port directly to Edge or Chrome instead of waiting for Chromium's
+  intermittently missing `DevToolsActivePort` file. The browser-channel startup
+  has its own 20-second deadline and reports an actionable enterprise-policy
+  diagnostic, while users still receive the full five minutes to complete SSO.
+- The isolated browser is asked to close through its private DevTools session
+  when sign-in finishes, preventing successful handoffs from leaving the
+  temporary window open.
+
 ## 0.3.11 — 2026-08-24
 
 ### Added
