@@ -2,6 +2,15 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.10 — 2026-08-24
+
+### Fixed
+
+- WSL browser sign-in no longer reports Windows PowerShell's harmless
+  first-run progress records as raw CLIXML. The bridge suppresses progress
+  output, ignores progress-only diagnostics, and returns real failures through
+  a dedicated UTF-8 protocol so errors stay concise and actionable.
+
 ## 0.3.9 — 2026-08-24
 
 ### Fixed

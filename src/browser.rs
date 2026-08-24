@@ -602,11 +602,10 @@ async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErr
                 .into(),
         ));
     }
-    let detail = decode_powershell_output(&output.stderr)
-        .trim()
-        .chars()
-        .take(500)
-        .collect::<String>();
+    if let Some(detail) = powershell_bridge_error(&stdout) {
+        return Err(ApiError::Other(format!("browser sign-in failed: {detail}")));
+    }
+    let detail = powershell_error_detail(&output.stderr);
     Err(ApiError::Other(if !detail.is_empty() {
         format!("browser sign-in failed: {detail}")
     } else if stdout.lines().any(|line| line == "SERVICENOW_BRIDGE_READY") {
@@ -650,6 +649,82 @@ fn decode_powershell_output(bytes: &[u8]) -> String {
     }
 }
 
+fn bounded_error_detail(detail: &str) -> String {
+    detail.trim().chars().take(500).collect()
+}
+
+fn powershell_bridge_error(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("SERVICENOW_ERROR:"))
+        .map(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(|detail| bounded_error_detail(&detail))
+                .filter(|detail| !detail.is_empty())
+                .unwrap_or_else(|| "the Windows browser bridge returned an unreadable error".into())
+        })
+}
+
+fn powershell_error_detail(bytes: &[u8]) -> String {
+    let output = decode_powershell_output(bytes);
+    if !output.trim_start().starts_with("#< CLIXML") {
+        return bounded_error_detail(&output);
+    }
+
+    let mut errors = Vec::new();
+    let mut remaining = output.as_str();
+    const ERROR_NODE: &str = "<S S=\"Error\"";
+    while let Some(start) = remaining.find(ERROR_NODE) {
+        remaining = &remaining[start + ERROR_NODE.len()..];
+        let Some(content_start) = remaining.find('>') else {
+            break;
+        };
+        remaining = &remaining[content_start + 1..];
+        let Some(content_end) = remaining.find("</S>") else {
+            break;
+        };
+        let error = decode_clixml_text(&remaining[..content_end]);
+        if !error.trim().is_empty() {
+            errors.push(error);
+        }
+        remaining = &remaining[content_end + 4..];
+    }
+    bounded_error_detail(&errors.join("\n"))
+}
+
+fn decode_clixml_text(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut decoded = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < characters.len() {
+        if index + 6 < characters.len()
+            && characters[index] == '_'
+            && characters[index + 1] == 'x'
+            && characters[index + 6] == '_'
+        {
+            let hex = characters[index + 2..index + 6].iter().collect::<String>();
+            if let Ok(codepoint) = u32::from_str_radix(&hex, 16)
+                && let Some(character) = char::from_u32(codepoint)
+            {
+                decoded.push(character);
+                index += 7;
+                continue;
+            }
+        }
+        decoded.push(characters[index]);
+        index += 1;
+    }
+    decoded
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 fn powershell_hex(value: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -681,6 +756,7 @@ fn render_windows_bridge(site_url: &str, browser: Option<&std::ffi::OsStr>) -> S
 
 const WINDOWS_BROWSER_BRIDGE: &str = r#"
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 Write-Output 'SERVICENOW_BRIDGE_READY'
 function ConvertFrom-HexUtf8 {
     param([string]$Hex)
@@ -714,6 +790,7 @@ if (-not $browser) { throw 'Chrome or Edge was not found on Windows. Set SERVICE
 $profile = Join-Path $env:TEMP ("servicenow-cli-browser-" + [Guid]::NewGuid().ToString('N'))
 $process = $null
 $socket = $null
+$bridgeExitCode = 0
 function Invoke-CdpCommand {
     param($Socket, [ref]$RequestId, [string]$Method, $Params, [string]$SessionId)
     $RequestId.Value++
@@ -826,11 +903,18 @@ try {
         Start-Sleep -Milliseconds 750
     }
     throw "Browser sign-in timed out after five minutes while waiting for $lastStage; no credential was stored."
+} catch {
+    $message = $_.Exception.Message
+    if (-not $message) { $message = [string]$_ }
+    $errorBytes = [Text.Encoding]::UTF8.GetBytes($message)
+    Write-Output ('SERVICENOW_ERROR:' + [Convert]::ToBase64String($errorBytes))
+    $bridgeExitCode = 1
 } finally {
     if ($socket) { try { $socket.Dispose() } catch {} }
     if ($process -and -not $process.HasExited) { try { Stop-Process -Id $process.Id -Force } catch {} }
     if (Test-Path -LiteralPath $profile) { try { Remove-Item -LiteralPath $profile -Recurse -Force } catch {} }
 }
+if ($bridgeExitCode -ne 0) { exit $bridgeExitCode }
 "#;
 
 #[cfg(test)]
@@ -876,6 +960,8 @@ mod tests {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--user-data-dir="));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--inprivate"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--incognito"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("$ProgressPreference = 'SilentlyContinue'"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("SERVICENOW_ERROR:"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("Network.getCookies"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("'X-UserToken' = $userToken"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$instance.Host"));
@@ -934,6 +1020,38 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(decode_powershell_output(output.as_bytes()), output);
         assert_eq!(decode_powershell_output(&utf16), output);
+    }
+
+    #[test]
+    fn powershell_progress_clixml_is_not_presented_as_an_error() {
+        let progress = br#"#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><Obj S="progress"><MS><PR N="Record"><AV>Preparing modules for first use.</AV></PR></MS></Obj></Objs>"#;
+        assert_eq!(powershell_error_detail(progress), "");
+    }
+
+    #[test]
+    fn powershell_bridge_error_protocol_preserves_plain_text() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let encoded =
+            STANDARD.encode("Browser sign-in timed out while waiting for the user token.");
+        assert_eq!(
+            powershell_bridge_error(&format!(
+                "SERVICENOW_BRIDGE_READY\r\nSERVICENOW_ERROR:{encoded}\r\n"
+            ))
+            .as_deref(),
+            Some("Browser sign-in timed out while waiting for the user token.")
+        );
+    }
+
+    #[test]
+    fn powershell_clixml_errors_are_rendered_as_plain_text() {
+        let error = br#"#< CLIXML
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04"><S S="Error">Browser rejected &quot;Target.getTargets&quot;._x000D__x000A_</S></Objs>"#;
+        assert_eq!(
+            powershell_error_detail(error),
+            "Browser rejected \"Target.getTargets\"."
+        );
     }
 
     #[cfg(target_os = "windows")]
