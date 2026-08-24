@@ -196,7 +196,16 @@ output intentionally keeps raw values by default for stable automation. Use
 
 Data goes to stdout; status messages and errors go to stderr. `--quiet`
 suppresses status messages. `--no-color` and the `NO_COLOR` environment
-variable disable ANSI color.
+variable disable ANSI color. During browser authentication, `--verbose` streams
+timestamped, secret-free handoff milestones to stderr:
+
+```sh
+servicenow auth login work --method browser --verbose
+```
+
+Verbose browser diagnostics report only stage transitions and HTTP status
+codes. URLs, cookies, tokens, usernames, browser paths, and page content are
+never logged. `SERVICENOW_VERBOSE=true` enables the same behavior.
 
 Machine-readable errors use a stable envelope:
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6,6 +7,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -38,11 +40,76 @@ const USER_TOKEN_EXPRESSION: &str = r#"(() => {
     return readToken(window);
 })()"#;
 
+/// A secret-free milestone reached during browser-session sign-in.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BrowserProgress {
+    StartingPrivateBrowser,
+    PrivateBrowserOpened,
+    WaitingForBrowserChannel,
+    BrowserChannelReady,
+    WaitingForServiceNowPage,
+    ServiceNowPageDetected,
+    ReadingSessionCookies,
+    SessionCookiesDetected,
+    ReadingUserToken,
+    UserTokenDetected,
+    ValidatingSession,
+    ValidationResponse(u16),
+    SessionValidated,
+}
+
+impl BrowserProgress {
+    /// Human-readable text that never contains browser or ServiceNow secrets.
+    pub fn message(self) -> String {
+        match self {
+            Self::StartingPrivateBrowser => "starting a private browser".into(),
+            Self::PrivateBrowserOpened => "private browser opened".into(),
+            Self::WaitingForBrowserChannel => {
+                "waiting for the localhost-only browser sign-in channel".into()
+            }
+            Self::BrowserChannelReady => "browser sign-in channel is ready".into(),
+            Self::WaitingForServiceNowPage => "waiting for an authenticated ServiceNow page".into(),
+            Self::ServiceNowPageDetected => "authenticated ServiceNow page detected".into(),
+            Self::ReadingSessionCookies => "checking ServiceNow-scoped session cookies".into(),
+            Self::SessionCookiesDetected => "ServiceNow session cookies detected".into(),
+            Self::ReadingUserToken => "looking for the ServiceNow user token".into(),
+            Self::UserTokenDetected => "ServiceNow user token detected".into(),
+            Self::ValidatingSession => "validating the session with the Table API".into(),
+            Self::ValidationResponse(status) => {
+                format!("Table API validation returned HTTP {status}; continuing to wait")
+            }
+            Self::SessionValidated => "ServiceNow browser session validated".into(),
+        }
+    }
+}
+
+struct ProgressReporter<'a> {
+    callback: &'a mut dyn FnMut(BrowserProgress),
+    reported: HashSet<BrowserProgress>,
+}
+
+impl ProgressReporter<'_> {
+    fn report(&mut self, progress: BrowserProgress) {
+        if self.reported.insert(progress) {
+            (self.callback)(progress);
+        }
+    }
+}
+
 /// Sign in through an isolated Chromium profile and retain only cookies scoped
 /// to the requested ServiceNow instance.
 pub async fn browser_login(
     instance: &str,
     open_browser: bool,
+) -> Result<StoredCredential, ApiError> {
+    browser_login_with_progress(instance, open_browser, |_| {}).await
+}
+
+/// Sign in through a browser and report allowlisted, secret-free progress.
+pub async fn browser_login_with_progress(
+    instance: &str,
+    open_browser: bool,
+    mut callback: impl FnMut(BrowserProgress),
 ) -> Result<StoredCredential, ApiError> {
     if !open_browser {
         return Err(ApiError::InvalidInput(
@@ -51,11 +118,15 @@ pub async fn browser_login(
         ));
     }
     let site_url = normalize_instance(instance)?;
+    let mut progress = ProgressReporter {
+        callback: &mut callback,
+        reported: HashSet::new(),
+    };
 
     let session = if uses_windows_browser_bridge() {
-        windows_browser_cookie(&site_url).await?
+        windows_browser_cookie(&site_url, &mut progress).await?
     } else {
-        native_browser_cookie(&site_url).await?
+        native_browser_cookie_with_progress(&site_url, &mut progress).await?
     };
     HeaderValue::from_str(&session.cookie)
         .map_err(|_| ApiError::Other("the browser returned an invalid session cookie".into()))?;
@@ -73,12 +144,16 @@ struct BrowserSession {
     user_token: String,
 }
 
-async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiError> {
+async fn native_browser_cookie_with_progress(
+    site_url: &str,
+    progress: &mut ProgressReporter<'_>,
+) -> Result<BrowserSession, ApiError> {
     let browser = find_native_browser()?;
     let private_mode = private_browsing_argument(&browser);
     let profile = tempfile::tempdir()
         .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
     let login_url = format!("{site_url}/nav_to.do?uri=incident_list.do");
+    progress.report(BrowserProgress::StartingPrivateBrowser);
     let child = std::process::Command::new(&browser)
         .args([
             "--remote-debugging-port=0".into(),
@@ -101,12 +176,26 @@ async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErro
                 browser.display()
             ))
         })?;
+    progress.report(BrowserProgress::PrivateBrowserOpened);
     let mut process = NativeBrowser {
         child,
         _profile: profile,
     };
+    progress.report(BrowserProgress::WaitingForBrowserChannel);
     let websocket_url = wait_for_debugger(&mut process).await?;
-    wait_for_session_cookie(&websocket_url, site_url, Some(&mut process)).await
+    progress.report(BrowserProgress::BrowserChannelReady);
+    wait_for_session_cookie_with_progress(&websocket_url, site_url, Some(&mut process), progress)
+        .await
+}
+
+#[cfg(test)]
+async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiError> {
+    let mut callback = |_| {};
+    let mut progress = ProgressReporter {
+        callback: &mut callback,
+        reported: HashSet::new(),
+    };
+    native_browser_cookie_with_progress(site_url, &mut progress).await
 }
 
 fn private_browsing_argument(browser: &Path) -> &'static str {
@@ -180,10 +269,11 @@ async fn wait_for_debugger(process: &mut NativeBrowser) -> Result<String, ApiErr
 
 type CdpSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-async fn wait_for_session_cookie(
+async fn wait_for_session_cookie_with_progress(
     websocket_url: &str,
     site_url: &str,
     mut process: Option<&mut NativeBrowser>,
+    progress: &mut ProgressReporter<'_>,
 ) -> Result<BrowserSession, ApiError> {
     let (mut socket, _) = connect_async(websocket_url)
         .await
@@ -201,6 +291,7 @@ async fn wait_for_session_cookie(
     let started = Instant::now();
     let mut id = 0_u64;
     let mut last_stage = "the authenticated ServiceNow page";
+    progress.report(BrowserProgress::WaitingForServiceNowPage);
 
     loop {
         if let Some(process) = process.as_deref_mut() {
@@ -215,7 +306,9 @@ async fn wait_for_session_cookie(
             tokio::time::sleep(SESSION_CHECK_INTERVAL).await;
             continue;
         };
+        progress.report(BrowserProgress::ServiceNowPageDetected);
         last_stage = "ServiceNow session cookies";
+        progress.report(BrowserProgress::ReadingSessionCookies);
         id += 1;
         let attached = cdp_command(
             &mut socket,
@@ -250,16 +343,23 @@ async fn wait_for_session_cookie(
         };
         let completed_session: Result<Option<BrowserSession>, ApiError> = async {
             if let Some(cookie) = service_now_cookie_header(&response, host, is_https) {
+                progress.report(BrowserProgress::SessionCookiesDetected);
                 last_stage = "the ServiceNow user token (`g_ck` or `sysparm_ck`)";
+                progress.report(BrowserProgress::ReadingUserToken);
                 if let Some(user_token) =
                     service_now_user_token(&mut socket, &mut id, &session_id).await?
                 {
+                    progress.report(BrowserProgress::UserTokenDetected);
                     last_stage = "ServiceNow REST session validation";
+                    progress.report(BrowserProgress::ValidatingSession);
                     match validate_session(&http, site_url, &cookie, &user_token).await? {
                         SessionValidation::Authenticated => {
+                            progress.report(BrowserProgress::SessionValidated);
                             return Ok(Some(BrowserSession { cookie, user_token }));
                         }
-                        SessionValidation::Waiting => {}
+                        SessionValidation::Waiting(status) => {
+                            progress.report(BrowserProgress::ValidationResponse(status));
+                        }
                     }
                 }
             }
@@ -445,7 +545,7 @@ fn service_now_cookie_header(document: &Value, host: &str, is_https: bool) -> Op
 
 enum SessionValidation {
     Authenticated,
-    Waiting,
+    Waiting(u16),
 }
 
 async fn validate_session(
@@ -475,9 +575,9 @@ async fn validate_session(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     match response.status().as_u16() {
-        401 => Ok(SessionValidation::Waiting),
-        403 if !logged_in => Ok(SessionValidation::Waiting),
-        300..=399 => Ok(SessionValidation::Waiting),
+        status @ 401 => Ok(SessionValidation::Waiting(status)),
+        status @ 403 if !logged_in => Ok(SessionValidation::Waiting(status)),
+        status @ 300..=399 => Ok(SessionValidation::Waiting(status)),
         403 => Err(ApiError::Auth(
             "browser sign-in succeeded, but this account is not allowed to use the ServiceNow Table API"
                 .into(),
@@ -553,7 +653,10 @@ fn uses_windows_browser_bridge() -> bool {
                     .is_ok_and(|value| value.to_ascii_lowercase().contains("microsoft"))))
 }
 
-async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiError> {
+async fn windows_browser_cookie(
+    site_url: &str,
+    progress: &mut ProgressReporter<'_>,
+) -> Result<BrowserSession, ApiError> {
     let powershell = ["powershell.exe", "pwsh.exe"]
         .into_iter()
         .find_map(find_in_path)
@@ -566,7 +669,8 @@ async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErr
     let browser_override = std::env::var_os("SERVICENOW_BROWSER");
     let bridge = render_windows_bridge(site_url, browser_override.as_deref());
     let encoded_bridge = powershell_encoded_command(&bridge);
-    let child = tokio::process::Command::new(powershell)
+    progress.report(BrowserProgress::StartingPrivateBrowser);
+    let mut child = tokio::process::Command::new(powershell)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -582,12 +686,47 @@ async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErr
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| ApiError::Other(format!("failed to start PowerShell: {error}")))?;
-    let output = child
-        .wait_with_output()
+    let stdout = child
+        .stdout
+        .take()
+        .expect("PowerShell stdout was configured as piped");
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("PowerShell stderr was configured as piped");
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut stdout = stdout;
+    let mut stdout_bytes = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 4096];
+        let read = stdout
+            .read(&mut chunk)
+            .await
+            .map_err(|error| ApiError::Other(format!("browser bridge failed: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        stdout_bytes.extend_from_slice(&chunk[..read]);
+        let decoded = decode_powershell_output(&stdout_bytes);
+        for output_line in decoded.lines() {
+            if let Some(stage) = powershell_progress(output_line) {
+                progress.report(stage);
+            }
+        }
+    }
+    child
+        .wait()
         .await
         .map_err(|error| ApiError::Other(format!("browser bridge failed: {error}")))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| ApiError::Other(format!("browser bridge failed: {error}")))?
+        .map_err(|error| ApiError::Other(format!("browser bridge failed: {error}")))?;
 
-    let stdout = decode_powershell_output(&output.stdout);
+    let stdout = decode_powershell_output(&stdout_bytes);
     if let Some(encoded) = stdout
         .lines()
         .find_map(|line| line.strip_prefix("SERVICENOW_RESULT:"))
@@ -605,7 +744,7 @@ async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErr
     if let Some(detail) = powershell_bridge_error(&stdout) {
         return Err(ApiError::Other(format!("browser sign-in failed: {detail}")));
     }
-    let detail = powershell_error_detail(&output.stderr);
+    let detail = powershell_error_detail(&stderr);
     Err(ApiError::Other(if !detail.is_empty() {
         format!("browser sign-in failed: {detail}")
     } else if stdout.lines().any(|line| line == "SERVICENOW_BRIDGE_READY") {
@@ -615,6 +754,29 @@ async fn windows_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErr
         "Windows PowerShell exited before starting the browser sign-in bridge; ensure WSL Windows interop is enabled and try again"
             .into()
     }))
+}
+
+fn powershell_progress(line: &str) -> Option<BrowserProgress> {
+    let stage = line.trim().strip_prefix("SERVICENOW_STAGE:")?;
+    match stage {
+        "starting-private-browser" => Some(BrowserProgress::StartingPrivateBrowser),
+        "private-browser-opened" => Some(BrowserProgress::PrivateBrowserOpened),
+        "waiting-browser-channel" => Some(BrowserProgress::WaitingForBrowserChannel),
+        "browser-channel-ready" => Some(BrowserProgress::BrowserChannelReady),
+        "waiting-servicenow-page" => Some(BrowserProgress::WaitingForServiceNowPage),
+        "servicenow-page-detected" => Some(BrowserProgress::ServiceNowPageDetected),
+        "reading-session-cookies" => Some(BrowserProgress::ReadingSessionCookies),
+        "session-cookies-detected" => Some(BrowserProgress::SessionCookiesDetected),
+        "reading-user-token" => Some(BrowserProgress::ReadingUserToken),
+        "user-token-detected" => Some(BrowserProgress::UserTokenDetected),
+        "validating-session" => Some(BrowserProgress::ValidatingSession),
+        "session-validated" => Some(BrowserProgress::SessionValidated),
+        value => value
+            .strip_prefix("validation-http-")
+            .and_then(|status| status.parse::<u16>().ok())
+            .filter(|status| (100..=599).contains(status))
+            .map(BrowserProgress::ValidationResponse),
+    }
 }
 
 fn powershell_encoded_command(script: &str) -> String {
@@ -757,7 +919,17 @@ fn render_windows_bridge(site_url: &str, browser: Option<&std::ffi::OsStr>) -> S
 const WINDOWS_BROWSER_BRIDGE: &str = r#"
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
 Write-Output 'SERVICENOW_BRIDGE_READY'
+$script:reportedStages = @{}
+function Write-Stage {
+    param([string]$Stage)
+    if (-not $script:reportedStages.ContainsKey($Stage)) {
+        $script:reportedStages[$Stage] = $true
+        Write-Output ('SERVICENOW_STAGE:' + $Stage)
+    }
+}
 function ConvertFrom-HexUtf8 {
     param([string]$Hex)
     if (-not $Hex) { return '' }
@@ -819,7 +991,10 @@ try {
     $quotedUrl = '"' + $loginUrl + '"'
     $privateMode = if ((Split-Path -Leaf $browser) -match '(?i)msedge') { '--inprivate' } else { '--incognito' }
     $arguments = "--remote-debugging-port=0 --remote-debugging-address=127.0.0.1 --user-data-dir=$quotedProfile --no-first-run --no-default-browser-check --disable-sync $privateMode --new-window $quotedUrl"
+    Write-Stage 'starting-private-browser'
     $process = Start-Process -FilePath $browser -ArgumentList $arguments -PassThru
+    Write-Stage 'private-browser-opened'
+    Write-Stage 'waiting-browser-channel'
     $deadline = [DateTime]::UtcNow.AddMinutes(5)
     $version = $null
     while (-not $version -and [DateTime]::UtcNow -lt $deadline) {
@@ -837,10 +1012,12 @@ try {
     }
     if (-not $version.webSocketDebuggerUrl) { throw 'The private browser sign-in channel did not become available.' }
 
+    Write-Stage 'browser-channel-ready'
     $socket = [Net.WebSockets.ClientWebSocket]::new()
     $socket.ConnectAsync([Uri]$version.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
     $requestId = 0
     $lastStage = 'the authenticated ServiceNow page'
+    Write-Stage 'waiting-servicenow-page'
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($process.HasExited) { throw "Browser closed before sign-in completed ($($process.ExitCode))." }
         $targets = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.getTargets' @{} $null
@@ -851,7 +1028,9 @@ try {
             Start-Sleep -Milliseconds 750
             continue
         }
+        Write-Stage 'servicenow-page-detected'
         $lastStage = 'ServiceNow session cookies'
+        Write-Stage 'reading-session-cookies'
         $attached = Invoke-CdpCommand $socket ([ref]$requestId) 'Target.attachToTarget' @{ targetId = $target.targetId; flatten = $true } $null
         $sessionId = $attached.result.sessionId
         try {
@@ -868,15 +1047,20 @@ try {
                 $nameIsSafe -and $valueIsSafe -and $hostMatches -and $pathMatches -and $notExpired -and (-not $_.secure -or $instance.Scheme -eq 'https')
             } | Sort-Object { $_.path.Length } -Descending)
             if ($cookies.Count -gt 0) {
+                Write-Stage 'session-cookies-detected'
                 $cookieHeader = ($cookies | ForEach-Object { "$($_.name)=$($_.value)" }) -join '; '
                 $lastStage = 'the ServiceNow user token (g_ck or sysparm_ck)'
+                Write-Stage 'reading-user-token'
                 $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = $userTokenExpression; returnByValue = $true } $sessionId
                 $userToken = $evaluated.result.result.value
                 if ($userToken -and $userToken -notmatch '[\r\n]') {
+                    Write-Stage 'user-token-detected'
                     $lastStage = 'ServiceNow REST session validation'
+                    Write-Stage 'validating-session'
                     try {
                         $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -Headers @{ Cookie = $cookieHeader; 'X-UserToken' = $userToken; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
                         if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                            Write-Stage 'session-validated'
                             $session = @{ cookie = $cookieHeader; user_token = $userToken }
                             Write-Output ('SERVICENOW_RESULT:' + ($session | ConvertTo-Json -Compress))
                             exit 0
@@ -888,6 +1072,7 @@ try {
                             $status = [int]$_.Exception.Response.StatusCode
                             $loggedIn = $_.Exception.Response.Headers['X-Is-Logged-In'] -eq 'true'
                             $lastStage = "ServiceNow REST session validation (HTTP $status)"
+                            Write-Stage ("validation-http-" + $status)
                         }
                         if ($status -eq 403 -and $loggedIn) {
                             Write-Output 'SERVICENOW_FORBIDDEN'
@@ -961,6 +1146,7 @@ mod tests {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--inprivate"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("--incognito"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$ProgressPreference = 'SilentlyContinue'"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("SERVICENOW_STAGE:"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("SERVICENOW_ERROR:"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("Network.getCookies"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("'X-UserToken' = $userToken"));
@@ -1020,6 +1206,54 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(decode_powershell_output(output.as_bytes()), output);
         assert_eq!(decode_powershell_output(&utf16), output);
+    }
+
+    #[test]
+    fn powershell_progress_accepts_only_allowlisted_secret_free_stages() {
+        assert_eq!(
+            powershell_progress("SERVICENOW_STAGE:waiting-servicenow-page"),
+            Some(BrowserProgress::WaitingForServiceNowPage)
+        );
+        assert_eq!(
+            powershell_progress("SERVICENOW_STAGE:validation-http-401"),
+            Some(BrowserProgress::ValidationResponse(401))
+        );
+        assert_eq!(
+            powershell_progress("SERVICENOW_STAGE:validation-http-999"),
+            None
+        );
+        assert_eq!(
+            powershell_progress("SERVICENOW_STAGE:user-token-secret-value"),
+            None
+        );
+        assert_eq!(
+            powershell_progress(
+                "SERVICENOW_RESULT:{\"cookie\":\"JSESSIONID=secret\",\"user_token\":\"secret\"}"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn progress_reporter_emits_each_milestone_once() {
+        let mut events = Vec::new();
+        let mut callback = |progress| events.push(progress);
+        let mut reporter = ProgressReporter {
+            callback: &mut callback,
+            reported: HashSet::new(),
+        };
+        reporter.report(BrowserProgress::ReadingUserToken);
+        reporter.report(BrowserProgress::ReadingUserToken);
+        reporter.report(BrowserProgress::ValidationResponse(401));
+        reporter.report(BrowserProgress::ValidationResponse(401));
+        drop(reporter);
+        assert_eq!(
+            events,
+            vec![
+                BrowserProgress::ReadingUserToken,
+                BrowserProgress::ValidationResponse(401)
+            ]
+        );
     }
 
     #[test]
@@ -1187,11 +1421,36 @@ mod tests {
             }
         });
 
-        let session = wait_for_session_cookie(&format!("ws://{address}"), &instance.uri(), None)
-            .await
-            .unwrap();
+        let mut events = Vec::new();
+        let mut callback = |progress| events.push(progress);
+        let mut progress = ProgressReporter {
+            callback: &mut callback,
+            reported: HashSet::new(),
+        };
+        let session = wait_for_session_cookie_with_progress(
+            &format!("ws://{address}"),
+            &instance.uri(),
+            None,
+            &mut progress,
+        )
+        .await
+        .unwrap();
+        drop(progress);
         assert_eq!(session.cookie, "JSESSIONID=validated-session");
         assert_eq!(session.user_token, "synthetic-user-token");
+        assert_eq!(
+            events,
+            vec![
+                BrowserProgress::WaitingForServiceNowPage,
+                BrowserProgress::ServiceNowPageDetected,
+                BrowserProgress::ReadingSessionCookies,
+                BrowserProgress::SessionCookiesDetected,
+                BrowserProgress::ReadingUserToken,
+                BrowserProgress::UserTokenDetected,
+                BrowserProgress::ValidatingSession,
+                BrowserProgress::SessionValidated,
+            ]
+        );
         cdp.await.unwrap();
     }
 

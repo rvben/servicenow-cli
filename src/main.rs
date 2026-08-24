@@ -52,6 +52,16 @@ struct Cli {
     #[arg(long, global = true)]
     quiet: bool,
 
+    /// Show secret-free browser sign-in progress on stderr
+    #[arg(
+        short,
+        long,
+        global = true,
+        env = "SERVICENOW_VERBOSE",
+        conflicts_with = "quiet"
+    )]
+    verbose: bool,
+
     /// Disable ANSI color even when stdout is a terminal
     #[arg(long, global = true)]
     no_color: bool,
@@ -647,6 +657,7 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), ApiError> {
     let output = OutputConfig::new(&cli.output, cli.json, cli.quiet, cli.no_color)?;
+    let verbose = cli.verbose;
 
     match cli.command {
         Command::Setup {
@@ -675,6 +686,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 insecure_storage,
                 no_browser,
                 read_only,
+                verbose,
             )
             .await?;
             if authenticated && !output.json {
@@ -708,6 +720,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 insecure_storage,
                 no_browser,
                 read_only,
+                verbose,
             )
             .await?;
             return Ok(());
@@ -997,6 +1010,7 @@ async fn run_auth_login(
     insecure_storage: bool,
     no_browser: bool,
     read_only: bool,
+    verbose: bool,
 ) -> Result<bool, ApiError> {
     servicenow_cli::config::validate_profile_name(&profile)?;
     if output.format == OutputFormat::Text && std::io::stdin().is_terminal() {
@@ -1102,11 +1116,34 @@ async fn run_auth_login(
                     "Complete your normal SSO sign-in there. This CLI never receives your identity-provider password.",
                 );
             }
-            let spinner = OnboardingSpinner::start(
-                output,
-                "Waiting for ServiceNow to complete the secure browser handoff",
-            );
-            let credential = servicenow_cli::browser::browser_login(&instance, !no_browser).await;
+            let spinner = if verbose {
+                output.message(
+                    "Verbose browser diagnostics enabled; secrets, URLs, and page content are redacted.",
+                );
+                None
+            } else {
+                OnboardingSpinner::start(
+                    output,
+                    "Waiting for ServiceNow to complete the secure browser handoff",
+                )
+            };
+            let credential = if verbose {
+                let started = std::time::Instant::now();
+                servicenow_cli::browser::browser_login_with_progress(
+                    &instance,
+                    !no_browser,
+                    |progress| {
+                        eprintln!(
+                            "[+{:>6.1}s] browser: {}",
+                            started.elapsed().as_secs_f64(),
+                            progress.message()
+                        );
+                    },
+                )
+                .await
+            } else {
+                servicenow_cli::browser::browser_login(&instance, !no_browser).await
+            };
             drop(spinner);
             credential?
         }

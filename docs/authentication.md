@@ -67,6 +67,16 @@ interface. It works with both NAT and mirrored WSL networking and does not open
 a debugging port to the LAN. Set `SERVICENOW_BROWSER` to a Windows executable
 path if automatic discovery is blocked by corporate browser installation rules.
 
+To see where an in-progress handoff is waiting, enable safe verbose diagnostics:
+
+```sh
+servicenow auth login work --method browser --verbose
+```
+
+The timestamped stderr log includes only allowlisted stage transitions and HTTP
+status codes. It never includes URLs, cookies, tokens, usernames, executable
+paths, PowerShell output, or browser page content.
+
 WSL2 and minimal Linux installations often have no Secret Service provider.
 After browser authentication succeeds, setup explains the problem and offers to
 store the credential in the CLI config file instead. The file is created with

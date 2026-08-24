@@ -2,6 +2,21 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.11 — 2026-08-24
+
+### Added
+
+- `--verbose` and `SERVICENOW_VERBOSE=true` now stream timestamped browser
+  sign-in milestones while the CLI waits for an SSO handoff. The WSL
+  PowerShell bridge emits progress as it happens instead of buffering until the
+  browser closes or times out.
+
+### Safety
+
+- Verbose browser diagnostics accept only allowlisted stage identifiers and
+  HTTP status codes. URLs, cookies, tokens, usernames, executable paths, raw
+  PowerShell output, and page content are never logged.
+
 ## 0.3.10 — 2026-08-24
 
 ### Fixed

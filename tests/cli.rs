@@ -27,8 +27,21 @@ fn command(config_home: &TempDir) -> Command {
         .env_remove("SERVICENOW_TOKEN")
         .env_remove("SERVICENOW_AUTH_TYPE")
         .env_remove("SERVICENOW_PROFILE")
-        .env_remove("SERVICENOW_READ_ONLY");
+        .env_remove("SERVICENOW_READ_ONLY")
+        .env_remove("SERVICENOW_VERBOSE");
     command
+}
+
+#[test]
+fn auth_login_help_advertises_secret_free_verbose_progress() {
+    let config_home = TempDir::new().unwrap();
+    command(&config_home)
+        .args(["auth", "login", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Show secret-free browser sign-in progress on stderr",
+        ));
 }
 
 fn authenticated_command(config_home: &TempDir, server: &MockServer) -> Command {
