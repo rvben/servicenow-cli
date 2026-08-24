@@ -7,7 +7,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::HeaderValue;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -668,24 +668,25 @@ async fn windows_browser_cookie(
         })?;
     let browser_override = std::env::var_os("SERVICENOW_BROWSER");
     let bridge = render_windows_bridge(site_url, browser_override.as_deref());
-    let encoded_bridge = powershell_encoded_command(&bridge);
     progress.report(BrowserProgress::StartingPrivateBrowser);
     let mut child = tokio::process::Command::new(powershell)
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            &encoded_bridge,
-        ])
-        .stdin(Stdio::null())
+        .args(POWERSHELL_ARGS)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| ApiError::Other(format!("failed to start PowerShell: {error}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .expect("PowerShell stdin was configured as piped");
+    stdin.write_all(bridge.as_bytes()).await.map_err(|error| {
+        ApiError::Other(format!(
+            "failed to send browser bridge to PowerShell: {error}"
+        ))
+    })?;
+    drop(stdin);
     let stdout = child
         .stdout
         .take()
@@ -779,13 +780,17 @@ fn powershell_progress(line: &str) -> Option<BrowserProgress> {
     }
 }
 
-fn powershell_encoded_command(script: &str) -> String {
-    let utf16_le = script
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>();
-    base64::engine::general_purpose::STANDARD.encode(utf16_le)
-}
+const POWERSHELL_STDIN_BOOTSTRAP: &str =
+    "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))";
+const POWERSHELL_ARGS: [&str; 7] = [
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    POWERSHELL_STDIN_BOOTSTRAP,
+];
 
 fn decode_powershell_output(bytes: &[u8]) -> String {
     let has_utf16_le_bom = bytes.starts_with(&[0xff, 0xfe]);
@@ -1196,18 +1201,20 @@ mod tests {
     }
 
     #[test]
-    fn powershell_bridge_is_encoded_as_one_complete_command() {
-        use base64::engine::general_purpose::STANDARD;
-
-        let script = "Write-Output 'SERVICENOW_BRIDGE_READY'";
-        let decoded = STANDARD.decode(powershell_encoded_command(script)).unwrap();
-        let (pairs, remainder) = decoded.as_chunks::<2>();
-        assert!(remainder.is_empty());
-        let units = pairs
-            .iter()
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect::<Vec<_>>();
-        assert_eq!(String::from_utf16(units.as_slice()).unwrap(), script);
+    fn powershell_bridge_is_sent_over_stdin_instead_of_the_command_line() {
+        assert_eq!(
+            POWERSHELL_STDIN_BOOTSTRAP,
+            "$script = [Console]::In.ReadToEnd(); & ([ScriptBlock]::Create($script))"
+        );
+        assert!(!POWERSHELL_STDIN_BOOTSTRAP.contains("WINDOWS_BROWSER_BRIDGE"));
+        assert!(!POWERSHELL_STDIN_BOOTSTRAP.contains("EncodedCommand"));
+        assert!(POWERSHELL_ARGS.iter().all(|argument| argument.len() < 256));
+        let bridge = render_windows_bridge("https://company.service-now.com", None);
+        assert!(
+            POWERSHELL_ARGS
+                .iter()
+                .all(|argument| !argument.contains(&bridge))
+        );
     }
 
     #[test]
@@ -1303,21 +1310,24 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn encoded_powershell_command_executes_and_returns_output() {
+    fn stdin_powershell_command_executes_and_returns_output() {
+        use std::io::Write as _;
+
         let powershell = find_in_path("powershell.exe").expect("powershell.exe on Windows");
-        let output = std::process::Command::new(powershell)
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-EncodedCommand",
-                &powershell_encoded_command("Write-Output 'SERVICENOW_BRIDGE_READY'"),
-            ])
-            .stdin(Stdio::null())
-            .output()
+        let mut child = std::process::Command::new(powershell)
+            .args(POWERSHELL_ARGS)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"Write-Output 'SERVICENOW_BRIDGE_READY'")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "{}",

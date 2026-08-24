@@ -2,6 +2,15 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.13 — 2026-08-24
+
+### Fixed
+
+- WSL browser sign-in now streams its PowerShell bridge over standard input
+  instead of embedding the entire script in a process argument. This avoids
+  Windows interop's command-line size boundary, which could make PowerShell
+  exit immediately with `Invalid argument` before opening the browser.
+
 ## 0.3.12 — 2026-08-24
 
 ### Fixed
