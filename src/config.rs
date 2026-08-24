@@ -60,6 +60,8 @@ pub struct ProfileConfig {
     pub oauth_scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<StoredCredential>,
 
     // Read legacy 0.1 files, but never write secrets back to disk.
     #[serde(default, skip_serializing)]
@@ -97,7 +99,7 @@ pub struct Config {
     pub oauth_scope: Option<String>,
     pub redirect_uri: Option<String>,
     pub oauth: Option<OAuthSession>,
-    credential_store: bool,
+    credential_store: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,18 +152,30 @@ impl Config {
             AuthType::Basic => normalize(file_profile.password.clone()),
             AuthType::Bearer | AuthType::OAuth => normalize(file_profile.token.clone()),
         };
-        let keychain_credential = if env_secret.is_none()
-            && legacy_secret.is_none()
-            && file_profile.credential_store.as_deref() == Some("keyring")
-        {
-            Some(credentials::load(&profile_name)?)
+        let credential_store = if env_secret.is_some() {
+            "environment"
+        } else if legacy_secret.is_some() {
+            "legacy-config"
+        } else {
+            match file_profile.credential_store.as_deref() {
+                Some("keyring") => "os-keychain",
+                Some("file") => "config-file",
+                _ => "none",
+            }
+        };
+        let stored_credential = if env_secret.is_none() && legacy_secret.is_none() {
+            match file_profile.credential_store.as_deref() {
+                Some("keyring") => Some(credentials::load(&profile_name)?),
+                Some("file") => file_profile.credential.clone(),
+                _ => None,
+            }
         } else {
             None
         };
         let secret = env_secret
             .or(legacy_secret)
             .or_else(|| {
-                keychain_credential
+                stored_credential
                     .as_ref()
                     .map(|value| value.secret().into())
             })
@@ -182,7 +196,7 @@ impl Config {
             .map(|value| parse_bool(&value))
             .transpose()?
             .unwrap_or(file_profile.read_only.unwrap_or(false));
-        let oauth = match keychain_credential {
+        let oauth = match stored_credential {
             Some(StoredCredential::OAuth {
                 refresh_token,
                 expires_at,
@@ -207,7 +221,7 @@ impl Config {
             oauth_scope: normalize(file_profile.oauth_scope),
             redirect_uri: normalize(file_profile.redirect_uri),
             oauth,
-            credential_store: file_profile.credential_store.as_deref() == Some("keyring"),
+            credential_store: credential_store.into(),
         })
     }
 
@@ -222,8 +236,15 @@ impl Config {
         }
     }
 
-    pub fn uses_keychain(&self) -> bool {
-        self.credential_store
+    pub fn uses_persistent_store(&self) -> bool {
+        matches!(
+            self.credential_store.as_str(),
+            "os-keychain" | "config-file"
+        )
+    }
+
+    pub fn credential_store(&self) -> &str {
+        &self.credential_store
     }
 }
 
@@ -276,6 +297,38 @@ pub fn save_profile(name: &str, profile: ProfileConfig, make_active: bool) -> Re
         file.active_profile = Some(name.into());
     }
     save_file(&file)
+}
+
+pub fn update_stored_credential(name: &str, credential: StoredCredential) -> Result<(), ApiError> {
+    let mut file = load_file()?;
+    let profile = profile_from_mut(&mut file, name)?;
+    match profile.credential_store.as_deref() {
+        Some("keyring") => credentials::store(name, &credential),
+        Some("file") => {
+            profile.credential = Some(credential);
+            save_file(&file)
+        }
+        _ => Err(ApiError::InvalidInput(format!(
+            "profile '{name}' has no persistent credential store"
+        ))),
+    }
+}
+
+pub fn delete_stored_credential(name: &str) -> Result<bool, ApiError> {
+    let mut file = load_file()?;
+    let profile = profile_from_mut(&mut file, name)?;
+    match profile.credential_store.as_deref() {
+        Some("keyring") => credentials::delete(name),
+        Some("file") => {
+            let removed = profile.credential.take().is_some();
+            if removed {
+                profile.credential_store = None;
+                save_file(&file)?;
+            }
+            Ok(removed)
+        }
+        _ => Ok(false),
+    }
 }
 
 pub fn profile_summaries() -> Result<Vec<ProfileSummary>, ApiError> {
@@ -362,6 +415,25 @@ fn profile_from<'a>(file: &'a RawConfig, name: &str) -> Result<&'a ProfileConfig
             }
         ))
     })
+}
+
+fn profile_from_mut<'a>(
+    file: &'a mut RawConfig,
+    name: &str,
+) -> Result<&'a mut ProfileConfig, ApiError> {
+    if name == "default" {
+        return file
+            .default
+            .instance
+            .is_some()
+            .then_some(&mut file.default)
+            .ok_or_else(|| {
+                ApiError::NotFound("config profile 'default'. Available: none defined".into())
+            });
+    }
+    file.profiles
+        .get_mut(name)
+        .ok_or_else(|| ApiError::NotFound(format!("config profile '{name}'")))
 }
 
 fn summary(name: &str, active: &str, profile: &ProfileConfig) -> ProfileSummary {

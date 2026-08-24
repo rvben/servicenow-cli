@@ -13,6 +13,26 @@ macOS, Credential Manager on Windows, or the platform credential service on
 Linux. The profile's instance, username, authentication type, and safety mode
 are stored in the configuration file.
 
+## WSL2 and headless Linux
+
+WSL2 and minimal Linux installations often have no Secret Service provider. If
+the OS credential store is unavailable, interactive setup explains the problem
+and offers to store the credential in the CLI config file instead. The file is
+created with mode `0600` on Unix, but the credential is plaintext, so setup asks
+before writing it.
+
+For non-interactive setup, opt in explicitly:
+
+```sh
+servicenow setup work --insecure-storage \
+  --instance company --method basic --username api-user \
+  --secret-stdin
+```
+
+To avoid persistent credential storage entirely, set `SERVICENOW_PASSWORD` for
+Basic authentication or `SERVICENOW_TOKEN` for bearer/OAuth authentication.
+Environment variables take precedence over credentials stored by a profile.
+
 ## OAuth
 
 Register an OAuth application in ServiceNow with a loopback redirect URI, then

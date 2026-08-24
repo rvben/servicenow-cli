@@ -11,8 +11,8 @@ use servicenow_cli::commands::{
     print_records, print_records_or, record_sys_id,
 };
 use servicenow_cli::config::{
-    AuthType, Config, ProfileConfig, active_profile_name, config_path, init_document,
-    profile_summaries, remove_profile, save_profile, use_profile,
+    AuthType, Config, ProfileConfig, active_profile_name, config_path, delete_stored_credential,
+    init_document, profile_summaries, remove_profile, save_profile, use_profile,
 };
 use servicenow_cli::credentials::{self, StoredCredential};
 use servicenow_cli::incident;
@@ -96,6 +96,10 @@ enum Command {
         #[arg(long)]
         secret_stdin: bool,
 
+        /// Store the credential in the protected config file instead of the OS keychain
+        #[arg(long)]
+        insecure_storage: bool,
+
         /// Print the OAuth URL without opening a browser
         #[arg(long)]
         no_browser: bool,
@@ -172,7 +176,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AuthCommand {
-    /// Sign in and store the credential in the operating-system keychain
+    /// Sign in and store the credential securely when possible
     Login {
         /// Profile name to create or replace
         #[arg(default_value = "default")]
@@ -206,6 +210,10 @@ enum AuthCommand {
         #[arg(long)]
         secret_stdin: bool,
 
+        /// Store the credential in the protected config file instead of the OS keychain
+        #[arg(long)]
+        insecure_storage: bool,
+
         /// Print the OAuth URL without opening a browser
         #[arg(long)]
         no_browser: bool,
@@ -233,7 +241,7 @@ enum ProfileCommand {
     /// Select the default profile for future commands
     Use { name: String },
 
-    /// Remove a profile and its keychain credential
+    /// Remove a profile and its stored credential
     Remove {
         name: String,
 
@@ -650,6 +658,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             scope,
             redirect_uri,
             secret_stdin,
+            insecure_storage,
             no_browser,
             read_only,
         } => {
@@ -663,6 +672,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 scope,
                 redirect_uri,
                 secret_stdin,
+                insecure_storage,
                 no_browser,
                 read_only,
             )
@@ -681,6 +691,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             scope,
             redirect_uri,
             secret_stdin,
+            insecure_storage,
             no_browser,
             read_only,
         }) => {
@@ -694,6 +705,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 scope,
                 redirect_uri,
                 secret_stdin,
+                insecure_storage,
                 no_browser,
                 read_only,
             )
@@ -702,7 +714,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         }
         Command::Auth(AuthCommand::Logout { profile }) => {
             let profile = profile.unwrap_or(active_profile_name()?);
-            let removed = credentials::delete(&profile)?;
+            let removed = delete_stored_credential(&profile)?;
             let value = serde_json::json!({
                 "profile": profile,
                 "loggedOut": removed,
@@ -759,8 +771,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                     "profile removal cancelled; use --yes for non-interactive removal".into(),
                 ));
             }
+            let credential_removed = delete_stored_credential(&name)?;
             let removed = remove_profile(&name)?;
-            let credential_removed = credentials::delete(&name)?;
             if !removed && !credential_removed {
                 return Err(ApiError::NotFound(format!("config profile '{name}'")));
             }
@@ -977,11 +989,12 @@ async fn run_auth_login(
     scope: String,
     redirect_uri: String,
     secret_stdin: bool,
+    insecure_storage: bool,
     no_browser: bool,
     read_only: bool,
 ) -> Result<(), ApiError> {
     servicenow_cli::config::validate_profile_name(&profile)?;
-    credentials::available()?;
+    let file_storage = choose_credential_storage(insecure_storage)?;
     let instance = required_prompt(instance, "ServiceNow instance")?;
     let mut username = username;
     let mut configured_client_id = None;
@@ -1028,18 +1041,23 @@ async fn run_auth_login(
         username = field_text(user, "user_name").or(username);
     }
 
-    credentials::store(&profile, &credential)?;
     let mut profile_config = ProfileConfig::default();
     profile_config.instance = Some(instance);
     profile_config.username = username.clone();
     profile_config.auth_type = Some(method.as_str().into());
     profile_config.read_only = Some(read_only);
-    profile_config.credential_store = Some("keyring".into());
+    profile_config.credential_store = Some(if file_storage { "file" } else { "keyring" }.into());
+    profile_config.credential = file_storage.then_some(credential.clone());
     profile_config.client_id = configured_client_id;
     profile_config.oauth_scope = matches!(method, AuthType::OAuth).then_some(scope);
     profile_config.redirect_uri = matches!(method, AuthType::OAuth).then_some(redirect_uri);
+    if !file_storage {
+        credentials::store(&profile, &credential)?;
+    }
     if let Err(error) = save_profile(&profile, profile_config, true) {
-        let _ = credentials::delete(&profile);
+        if !file_storage {
+            let _ = credentials::delete(&profile);
+        }
         return Err(error);
     }
 
@@ -1049,7 +1067,7 @@ async fn run_auth_login(
         "username": username,
         "authType": method.as_str(),
         "readOnly": read_only,
-        "credentialStore": "os-keychain",
+        "credentialStore": if file_storage { "config-file" } else { "os-keychain" },
         "authenticated": true,
     });
     if output.json {
@@ -1080,9 +1098,55 @@ async fn run_auth_login(
                 "writes enabled"
             }
         );
-        println!("  Credentials  OS keychain");
+        println!(
+            "  Credentials  {}",
+            if file_storage {
+                "config file (plaintext, mode 0600)"
+            } else {
+                "OS keychain"
+            }
+        );
     }
     Ok(())
+}
+
+fn choose_credential_storage(insecure_storage: bool) -> Result<bool, ApiError> {
+    if insecure_storage {
+        eprintln!(
+            "warning: the credential will be stored in plaintext in {} (protected with mode 0600 on Unix)",
+            config_path().display()
+        );
+        return Ok(true);
+    }
+    match credentials::available() {
+        Ok(()) => Ok(false),
+        Err(error) if std::io::stdin().is_terminal() => {
+            eprintln!("warning: {error}");
+            let confirmed = Confirm::new()
+                .with_prompt(format!(
+                    "Store the credential in plaintext in {} (mode 0600) instead?",
+                    config_path().display()
+                ))
+                .default(false)
+                .interact()
+                .map_err(|prompt_error| {
+                    ApiError::Other(format!(
+                        "failed to choose credential storage: {prompt_error}"
+                    ))
+                })?;
+            if confirmed {
+                Ok(true)
+            } else {
+                Err(ApiError::InvalidInput(
+                    "credential storage was cancelled; start a Secret Service provider or use environment variables"
+                        .into(),
+                ))
+            }
+        }
+        Err(error) => Err(ApiError::InvalidInput(format!(
+            "{error}; rerun with --insecure-storage to use the protected config file, or use environment variables"
+        ))),
+    }
 }
 
 fn required_prompt(value: Option<String>, prompt: &str) -> Result<String, ApiError> {
@@ -1172,9 +1236,17 @@ async fn run_doctor(
         )
         .await?;
 
+    let credential_detail = match config.credential_store() {
+        "config-file" => "config file (plaintext, mode 0600)",
+        "os-keychain" => "OS keychain",
+        "environment" => "environment variable",
+        "legacy-config" => "legacy plaintext config field",
+        _ => "unknown",
+    };
     let checks = serde_json::json!([
         {"name": "configuration", "ok": true, "detail": config.instance},
         {"name": "authentication", "ok": true, "detail": username},
+        {"name": "credentials", "ok": true, "detail": credential_detail},
         {"name": "table_api", "ok": true, "detail": "incident table is readable"},
         {
             "name": "write_safety",

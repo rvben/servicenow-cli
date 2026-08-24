@@ -167,6 +167,84 @@ fn config_init_does_not_require_credentials() {
         .stdout(predicate::str::contains("configPath"));
 }
 
+#[tokio::test]
+async fn setup_can_fall_back_to_the_protected_config_file() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_user"))
+        .and(query_param(
+            "sysparm_query",
+            "sys_id=javascript:gs.getUserID()",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": "0123456789abcdef0123456789abcdef",
+                "user_name": "admin",
+                "name": "Admin User"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut setup = assert_cmd::Command::from_std(command(&config_home));
+    let output = setup
+        .args([
+            "setup",
+            "work",
+            "--instance",
+            &server.uri(),
+            "--username",
+            "admin",
+            "--secret-stdin",
+            "--insecure-storage",
+        ])
+        .write_stdin("secret\n")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["credentialStore"], "config-file");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("stored in plaintext")
+    );
+
+    let config_path = config_home.path().join("servicenow/config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("credential_store = \"file\""));
+    assert!(config.contains("password = \"secret\""));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let shown = command(&config_home)
+        .args(["--profile", "work", "config", "show"])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["secretMasked"], "***cret");
+
+    command(&config_home)
+        .args(["auth", "logout", "work"])
+        .assert()
+        .success();
+    let config = std::fs::read_to_string(config_path).unwrap();
+    assert!(!config.contains("password = \"secret\""));
+}
+
 #[test]
 fn missing_config_has_structured_error_and_input_exit_code() {
     let config_home = TempDir::new().unwrap();
@@ -277,7 +355,9 @@ async fn doctor_verifies_authentication_and_table_access() {
     assert_eq!(result["ok"], true);
     assert_eq!(result["checks"][1]["name"], "authentication");
     assert_eq!(result["checks"][1]["detail"], "admin");
-    assert_eq!(result["checks"][2]["name"], "table_api");
+    assert_eq!(result["checks"][2]["name"], "credentials");
+    assert_eq!(result["checks"][2]["detail"], "environment variable");
+    assert_eq!(result["checks"][3]["name"], "table_api");
 }
 
 #[tokio::test]

@@ -9,8 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::api::{ApiError, normalize_instance};
-use crate::config::{AuthType, Config};
-use crate::credentials::{self, StoredCredential};
+use crate::config::{AuthType, Config, update_stored_credential};
+use crate::credentials::StoredCredential;
 
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -90,7 +90,7 @@ pub async fn oauth_login(
 }
 
 pub async fn refresh_if_needed(config: &mut Config) -> Result<bool, ApiError> {
-    if !matches!(config.auth_type, AuthType::OAuth) || !config.uses_keychain() {
+    if !matches!(config.auth_type, AuthType::OAuth) || !config.uses_persistent_store() {
         return Ok(false);
     }
     let Some(session) = config.oauth.clone() else {
@@ -137,9 +137,9 @@ pub async fn refresh_if_needed(config: &mut Config) -> Result<bool, ApiError> {
         .map(|value| value.secret().to_string())
         .or(Some(refresh_token));
     let new_expiry = token.expires_in().map(expires_at);
-    credentials::store(
+    update_stored_credential(
         &config.profile,
-        &StoredCredential::OAuth {
+        StoredCredential::OAuth {
             access_token: access_token.clone(),
             refresh_token: new_refresh.clone(),
             expires_at: new_expiry,

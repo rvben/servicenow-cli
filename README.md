@@ -26,7 +26,8 @@ $ servicenow incidents mine
 - Human inputs such as incident numbers, user names, emails, group names, and
   `@me`; no routine `sys_id` hunting.
 - Secure interactive login with Basic, bearer, or OAuth + PKCE authentication.
-- Credentials in the operating-system keychain, not plaintext profile files.
+- Credentials in the operating-system keychain, with a permission-locked file fallback for
+  environments such as WSL2 that do not provide a credential service.
 - Beautiful responsive tables for humans; deterministic JSON, JSONL, YAML, and
   CSV for automation.
 - Read-only profiles, semantic editor patches, dry runs, and explicit dangerous
@@ -53,11 +54,15 @@ cargo install --path .
 ## Two-minute start
 
 ```sh
-# Prompts securely; the password is stored in your OS keychain.
+# Prompts securely; the password is stored in your OS keychain when available.
 servicenow setup work \
   --instance company \
   --method basic \
   --username api-user
+
+# On headless Linux/WSL2, choose the permission-locked file fallback directly:
+servicenow setup work --insecure-storage \
+  --instance company --method basic --username api-user
 
 servicenow doctor
 servicenow incidents mine

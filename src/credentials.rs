@@ -58,8 +58,18 @@ pub fn delete(profile: &str) -> Result<bool, ApiError> {
 pub fn available() -> Result<(), ApiError> {
     keyring::Entry::store_status()
         .as_ref()
-        .map_err(|error| ApiError::Other(format!("OS credential store is unavailable: {error}")))
+        .map_err(|error| unavailable_error(&error.to_string()))
         .map(|_| ())
+}
+
+fn unavailable_error(detail: &str) -> ApiError {
+    if detail.contains("org.freedesktop.secrets") && detail.contains("ServiceUnknown") {
+        ApiError::InvalidInput(
+            "OS credential store is unavailable: no Secret Service provider is running".into(),
+        )
+    } else {
+        ApiError::InvalidInput(format!("OS credential store is unavailable: {detail}"))
+    }
 }
 
 fn entry(profile: &str) -> Result<keyring::Entry, ApiError> {
@@ -93,5 +103,18 @@ mod tests {
         assert_eq!(encoded["kind"], "oauth");
         assert!(encoded.get("secret").is_none());
         assert_eq!(credential.secret(), "access");
+    }
+
+    #[test]
+    fn missing_linux_secret_service_has_a_human_error() {
+        let error = unavailable_error(
+            "Platform failure: zbus error: org.freedesktop.DBus.Error.ServiceUnknown: \
+             The name org.freedesktop.secrets was not provided by any .service files",
+        );
+        assert_eq!(
+            error.to_string(),
+            "OS credential store is unavailable: no Secret Service provider is running"
+        );
+        assert!(!error.to_string().contains("zbus"));
     }
 }
