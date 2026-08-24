@@ -13,6 +13,11 @@ All notable changes are documented here. Versions follow Semantic Versioning.
   non-interactive setup asks for an explicit `--method` instead of guessing.
 - SSO onboarding explains the required ServiceNow OAuth registration and prints
   a copy-ready administrator request containing the loopback redirect URI.
+- Interactive discovery has a terminal progress indicator, optional OAuth
+  secrets are labeled explicitly, and successful setup ends with a compact
+  connection summary and next steps.
+- When an OAuth client ID is not ready, setup can save a credential-free draft;
+  `servicenow auth login PROFILE` resumes the saved instance and OAuth settings.
 
 ### Safety
 

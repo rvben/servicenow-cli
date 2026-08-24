@@ -113,6 +113,17 @@ pub struct ProfileSummary {
     pub credential_store: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProfileDefaults {
+    pub instance: String,
+    pub username: Option<String>,
+    pub auth_type: Option<String>,
+    pub read_only: Option<bool>,
+    pub client_id: Option<String>,
+    pub oauth_scope: Option<String>,
+    pub redirect_uri: Option<String>,
+}
+
 impl Config {
     pub fn load(
         instance_arg: Option<String>,
@@ -297,6 +308,27 @@ pub fn save_profile(name: &str, profile: ProfileConfig, make_active: bool) -> Re
         file.active_profile = Some(name.into());
     }
     save_file(&file)
+}
+
+pub fn profile_defaults(name: &str) -> Result<Option<ProfileDefaults>, ApiError> {
+    validate_profile_name(name)?;
+    let file = load_file()?;
+    let profile = if name == "default" {
+        &file.default
+    } else if let Some(profile) = file.profiles.get(name) {
+        profile
+    } else {
+        return Ok(None);
+    };
+    Ok(profile.instance.as_ref().map(|instance| ProfileDefaults {
+        instance: instance.clone(),
+        username: profile.username.clone(),
+        auth_type: profile.auth_type.clone(),
+        read_only: profile.read_only,
+        client_id: profile.client_id.clone(),
+        oauth_scope: profile.oauth_scope.clone(),
+        redirect_uri: profile.redirect_uri.clone(),
+    }))
 }
 
 pub fn update_stored_credential(name: &str, credential: StoredCredential) -> Result<(), ApiError> {
@@ -558,5 +590,20 @@ mod tests {
         assert!(!encoded.contains("password"));
         assert!(!encoded.contains("token"));
         assert!(encoded.contains("credential_store"));
+    }
+
+    #[test]
+    fn oauth_drafts_contain_no_credential() {
+        let profile = ProfileConfig {
+            instance: Some("company".into()),
+            auth_type: Some("oauth".into()),
+            oauth_scope: Some("useraccount".into()),
+            redirect_uri: Some("http://127.0.0.1:8484/callback".into()),
+            ..ProfileConfig::default()
+        };
+        let encoded = toml::to_string(&profile).unwrap();
+        assert!(!encoded.contains("credential"));
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("token"));
     }
 }

@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -12,7 +12,7 @@ use servicenow_cli::commands::{
 };
 use servicenow_cli::config::{
     AuthType, Config, ProfileConfig, active_profile_name, config_path, delete_stored_credential,
-    init_document, profile_summaries, remove_profile, save_profile, use_profile,
+    init_document, profile_defaults, profile_summaries, remove_profile, save_profile, use_profile,
 };
 use servicenow_cli::credentials::{self, StoredCredential};
 use servicenow_cli::incident;
@@ -85,12 +85,12 @@ enum Command {
         client_id: Option<String>,
 
         /// Space-separated OAuth scopes
-        #[arg(long, default_value = "useraccount")]
-        scope: String,
+        #[arg(long)]
+        scope: Option<String>,
 
         /// Registered loopback OAuth redirect URI
-        #[arg(long, default_value = "http://127.0.0.1:8484/callback")]
-        redirect_uri: String,
+        #[arg(long)]
+        redirect_uri: Option<String>,
 
         /// Read the password/token/client secret from stdin
         #[arg(long)]
@@ -199,12 +199,12 @@ enum AuthCommand {
         client_id: Option<String>,
 
         /// Space-separated OAuth scopes
-        #[arg(long, default_value = "useraccount")]
-        scope: String,
+        #[arg(long)]
+        scope: Option<String>,
 
         /// Registered loopback OAuth redirect URI
-        #[arg(long, default_value = "http://127.0.0.1:8484/callback")]
-        redirect_uri: String,
+        #[arg(long)]
+        redirect_uri: Option<String>,
 
         /// Read the password/token/client secret from stdin
         #[arg(long)]
@@ -662,7 +662,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             no_browser,
             read_only,
         } => {
-            run_auth_login(
+            let authenticated = run_auth_login(
                 &output,
                 profile,
                 instance,
@@ -677,7 +677,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 read_only,
             )
             .await?;
-            if !output.json {
+            if authenticated && !output.json {
                 println!("\nNext\n  servicenow doctor\n  servicenow incidents mine");
             }
             return Ok(());
@@ -986,15 +986,51 @@ async fn run_auth_login(
     method: Option<AuthType>,
     username: Option<String>,
     client_id: Option<String>,
-    scope: String,
-    redirect_uri: String,
+    scope: Option<String>,
+    redirect_uri: Option<String>,
     secret_stdin: bool,
     insecure_storage: bool,
     no_browser: bool,
     read_only: bool,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     servicenow_cli::config::validate_profile_name(&profile)?;
-    let instance = required_prompt(instance, "ServiceNow instance")?;
+    if output.format == OutputFormat::Text && std::io::stdin().is_terminal() {
+        output.message(&format!(
+            "{}\n  Secure sign-in, tailored to your instance.",
+            output.heading("Connect to ServiceNow")
+        ));
+    }
+    let saved = if instance.is_none() {
+        profile_defaults(&profile)?
+    } else {
+        None
+    };
+    let resumed = saved.is_some();
+    let instance = required_prompt(
+        instance.or_else(|| saved.as_ref().map(|value| value.instance.clone())),
+        "ServiceNow instance",
+    )?;
+    let method = method.or(saved
+        .as_ref()
+        .and_then(|value| value.auth_type.as_deref())
+        .map(str::parse)
+        .transpose()?);
+    let username = username.or_else(|| saved.as_ref().and_then(|value| value.username.clone()));
+    let client_id = client_id.or_else(|| saved.as_ref().and_then(|value| value.client_id.clone()));
+    let scope = scope
+        .or_else(|| saved.as_ref().and_then(|value| value.oauth_scope.clone()))
+        .unwrap_or_else(|| "useraccount".into());
+    let redirect_uri = redirect_uri
+        .or_else(|| saved.as_ref().and_then(|value| value.redirect_uri.clone()))
+        .unwrap_or_else(|| "http://127.0.0.1:8484/callback".into());
+    let read_only = read_only
+        || saved
+            .as_ref()
+            .and_then(|value| value.read_only)
+            .unwrap_or(false);
+    if resumed {
+        output.success(&format!("Resuming profile '{profile}'"));
+    }
     let method = resolve_auth_method(output, &instance, method, client_id.as_deref()).await?;
     let mut username = username;
     if matches!(method, AuthType::Basic) {
@@ -1005,9 +1041,36 @@ async fn run_auth_login(
             .as_deref()
             .is_none_or(|value| value.trim().is_empty())
         {
-            output.message(&format!(
-                "OAuth requires a ServiceNow OAuth application.\n\nAdmin request (copy/paste):\n  Please create an OAuth API endpoint for external clients for the ServiceNow CLI,\n  register this redirect URI: {redirect_uri}\n  and send me the client ID."
-            ));
+            print_oauth_admin_request(output, &redirect_uri);
+            if std::io::stdin().is_terminal() {
+                let ready = Confirm::new()
+                    .with_prompt("Do you have the client ID ready?")
+                    .default(true)
+                    .interact()
+                    .map_err(|error| {
+                        ApiError::Other(format!("failed to confirm OAuth readiness: {error}"))
+                    })?;
+                if !ready {
+                    save_oauth_draft(&profile, &instance, &scope, &redirect_uri, read_only)?;
+                    let resume_command = format!("servicenow auth login {profile}");
+                    if output.json {
+                        output.value(&serde_json::json!({
+                            "profile": profile,
+                            "instance": instance,
+                            "authType": "oauth",
+                            "authenticated": false,
+                            "status": "awaiting-client-id",
+                            "resumeCommand": resume_command,
+                        }));
+                    } else {
+                        output.success("Setup saved—no credential was stored");
+                        println!(
+                            "\nWhen your administrator sends the client ID, continue with:\n  {resume_command} --client-id YOUR_CLIENT_ID"
+                        );
+                    }
+                    return Ok(false);
+                }
+            }
         }
         Some(required_prompt(client_id, "OAuth client ID")?)
     } else {
@@ -1025,7 +1088,11 @@ async fn run_auth_login(
             let id = configured_client_id
                 .as_deref()
                 .expect("OAuth client ID was collected before reading credentials");
-            let client_secret = read_login_secret(secret_stdin, "OAuth client secret", true)?;
+            let client_secret = read_login_secret(
+                secret_stdin,
+                "OAuth client secret (optional; press Enter to skip)",
+                true,
+            )?;
             servicenow_cli::auth::oauth_login(
                 &instance,
                 id,
@@ -1087,7 +1154,8 @@ async fn run_auth_login(
     if output.json {
         output.value(&result);
     } else {
-        println!("Signed in successfully.\n");
+        output.success("Connected to ServiceNow");
+        println!("\n{}", output.heading("Connection"));
         println!(
             "  Profile      {}",
             result["profile"].as_str().unwrap_or("")
@@ -1121,7 +1189,30 @@ async fn run_auth_login(
             }
         );
     }
-    Ok(())
+    Ok(true)
+}
+
+fn print_oauth_admin_request(output: &OutputConfig, redirect_uri: &str) {
+    let heading = output.heading("ServiceNow OAuth app required");
+    output.message(&format!(
+        "\n{heading}\n\nAsk your ServiceNow administrator:\n\n  Please create an OAuth API endpoint for external clients for the\n  ServiceNow CLI, register this redirect URI:\n\n    {redirect_uri}\n\n  Then send me the client ID.\n\nMicrosoft Entra remains the browser sign-in; the OAuth app itself is\nconfigured in ServiceNow."
+    ));
+}
+
+fn save_oauth_draft(
+    profile: &str,
+    instance: &str,
+    scope: &str,
+    redirect_uri: &str,
+    read_only: bool,
+) -> Result<(), ApiError> {
+    let mut draft = ProfileConfig::default();
+    draft.instance = Some(instance.into());
+    draft.auth_type = Some("oauth".into());
+    draft.read_only = Some(read_only);
+    draft.oauth_scope = Some(scope.into());
+    draft.redirect_uri = Some(redirect_uri.into());
+    save_profile(profile, draft, true)
 }
 
 async fn resolve_auth_method(
@@ -1136,8 +1227,13 @@ async fn resolve_auth_method(
     if client_id.is_some_and(|value| !value.trim().is_empty()) {
         return Ok(AuthType::OAuth);
     }
-    output.message("Checking how this instance signs users in…");
-    match servicenow_cli::auth::discover_login_provider(instance).await {
+    let spinner = OnboardingSpinner::start(output, "Checking how this instance signs users in");
+    if spinner.is_none() {
+        output.message("Checking how this instance signs users in…");
+    }
+    let discovery = servicenow_cli::auth::discover_login_provider(instance).await;
+    drop(spinner);
+    match discovery {
         Ok(servicenow_cli::auth::LoginProvider::MicrosoftEntra) => {
             output.success("Microsoft Entra SSO detected");
             output.message(
@@ -1169,6 +1265,48 @@ async fn resolve_auth_method(
         Err(error) => Err(ApiError::InvalidInput(format!(
             "could not auto-detect the authentication method ({error}); pass --method basic, oauth, or bearer"
         ))),
+    }
+}
+
+struct OnboardingSpinner {
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OnboardingSpinner {
+    fn start(output: &OutputConfig, message: &str) -> Option<Self> {
+        if output.quiet || output.format != OutputFormat::Text || !std::io::stderr().is_terminal() {
+            return None;
+        }
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let thread_running = running.clone();
+        let message = message.to_string();
+        let handle = std::thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut frame = 0;
+            while thread_running.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!("\r{} {message}", frames[frame % frames.len()]);
+                let _ = std::io::stderr().flush();
+                frame += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+        });
+        Some(Self {
+            running,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for OnboardingSpinner {
+    fn drop(&mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        eprint!("\r{:width$}\r", "", width = 72);
+        let _ = std::io::stderr().flush();
     }
 }
 
@@ -2436,7 +2574,7 @@ fn command_schema(command: &clap::Command, path: &str) -> Value {
                 "global": arg.is_global_set(),
                 "environment": arg.get_env().map(|value| value.to_string_lossy().into_owned()),
                 "valueHint": format!("{:?}", arg.get_value_hint()).to_lowercase(),
-                "dynamicDefault": (arg.get_id() == "display_value").then_some("display values for text output; raw values for machine output"),
+                "dynamicDefault": argument_dynamic_default(path, arg.get_id().as_str()),
             })
         })
         .collect();
@@ -2455,6 +2593,26 @@ fn command_schema(command: &clap::Command, path: &str) -> Value {
         "commands": commands,
         "behavior": command_behavior(path),
     })
+}
+
+fn argument_dynamic_default(path: &str, argument: &str) -> Option<&'static str> {
+    if argument == "display_value" {
+        return Some("display values for text output; raw values for machine output");
+    }
+    if path.ends_with("setup") || path.ends_with("auth login") {
+        return match argument {
+            "instance" => Some("saved profile value when resuming; otherwise prompted"),
+            "method" => Some(
+                "saved profile value when resuming; otherwise detected from the instance login route",
+            ),
+            "scope" => Some("saved profile value when resuming; otherwise useraccount"),
+            "redirect_uri" => {
+                Some("saved profile value when resuming; otherwise http://127.0.0.1:8484/callback")
+            }
+            _ => None,
+        };
+    }
+    None
 }
 
 fn argument_type(arg: &clap::Arg, possible_values: &[String]) -> &'static str {

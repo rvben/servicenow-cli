@@ -13,7 +13,8 @@ recognizes Microsoft Entra and other external SSO redirects and chooses
 browser-based OAuth; a local ServiceNow login selects Basic authentication. The
 probe never sends credentials and never follows a redirect to the external
 identity provider. If discovery is inconclusive, interactive setup asks you to
-choose instead of guessing.
+choose instead of guessing. Interactive terminals show progress during the
+probe and a compact connection summary when setup succeeds.
 
 The credential is stored in Keychain Access on macOS, Credential Manager on
 Windows, or the platform credential service on Linux. The profile's instance,
@@ -64,6 +65,17 @@ redirects the user through the configured enterprise identity provider, and
 then issues the API tokens. If setup detects SSO but no client ID was provided,
 it prints a copy-ready request containing the redirect URI for your ServiceNow
 administrator.
+
+If the client ID is not ready yet, choose not to continue. Setup saves only the
+instance and OAuth settings—no credential or secret—and prints the resume
+command. Once the administrator responds, continue without repeating discovery:
+
+```sh
+servicenow auth login work --client-id YOUR_CLIENT_ID
+```
+
+The client secret prompt is explicitly marked optional; press Enter when the
+ServiceNow OAuth application is configured as a public client.
 
 ## Bearer tokens and CI
 

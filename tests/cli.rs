@@ -78,6 +78,29 @@ fn schema_can_describe_one_command_compactly() {
 }
 
 #[test]
+fn setup_schema_describes_adaptive_onboarding_defaults() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .args(["schema", "--command", "setup"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let arguments = schema["arguments"].as_array().unwrap();
+    let dynamic_default = |id: &str| {
+        arguments
+            .iter()
+            .find(|argument| argument["id"] == id)
+            .unwrap()["dynamicDefault"]
+            .as_str()
+            .unwrap()
+    };
+    assert!(dynamic_default("method").contains("detected"));
+    assert!(dynamic_default("scope").contains("useraccount"));
+    assert!(dynamic_default("redirect_uri").contains("8484"));
+}
+
+#[test]
 fn schema_marks_destructive_and_dry_run_commands() {
     let config_home = TempDir::new().unwrap();
     let deletion = command(&config_home)
@@ -272,8 +295,56 @@ async fn setup_detects_microsoft_entra_and_explains_the_oauth_prerequisite() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Microsoft Entra SSO detected"))
-        .stderr(predicate::str::contains("Admin request (copy/paste)"))
+        .stderr(predicate::str::contains(
+            "Ask your ServiceNow administrator",
+        ))
         .stderr(predicate::str::contains("OAuth client ID is required"));
+}
+
+#[tokio::test]
+async fn auth_login_resumes_a_saved_profile_without_reasking_for_the_instance() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let config_dir = config_home.path().join("servicenow");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "active_profile = \"work\"\n\n[profiles.work]\ninstance = \"{}\"\nauth_type = \"basic\"\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": "0123456789abcdef0123456789abcdef",
+                "user_name": "admin",
+                "name": "Admin User"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut login = assert_cmd::Command::from_std(command(&config_home));
+    login
+        .args([
+            "auth",
+            "login",
+            "work",
+            "--username",
+            "admin",
+            "--method",
+            "basic",
+            "--secret-stdin",
+            "--insecure-storage",
+        ])
+        .write_stdin("secret\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Resuming profile 'work'"));
 }
 
 #[test]

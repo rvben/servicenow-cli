@@ -57,6 +57,10 @@ cargo install --path .
 # Detects local login or SSO, then asks only for what that method needs.
 servicenow setup work --instance company
 
+# If an administrator must create the OAuth app, setup saves your progress.
+# Resume later without repeating the instance and sign-in discovery:
+servicenow auth login work --client-id YOUR_CLIENT_ID
+
 # On headless Linux/WSL2, choose the permission-locked file fallback directly:
 servicenow setup work --instance company --insecure-storage
 
