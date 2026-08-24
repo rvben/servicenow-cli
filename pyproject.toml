@@ -10,6 +10,7 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
 ]
 description = "Fast, safe, human-friendly ServiceNow operations from the terminal"
+readme = "README.md"
 dynamic = ["version"]
 
 [project.urls]
