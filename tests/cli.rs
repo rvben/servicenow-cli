@@ -275,10 +275,10 @@ async fn setup_detects_microsoft_entra_and_explains_the_oauth_prerequisite() {
     let config_home = TempDir::new().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/login.do"))
+        .and(path("/nav_to.do"))
         .respond_with(ResponseTemplate::new(302).insert_header(
             "location",
-            "https://login.microsoftonline.com/example/oauth2/v2.0/authorize",
+            "/auth_redirect.do?sysparm_url=https%3A%2F%2Flogin.microsoftonline.com%2Fexample%2Fsaml2",
         ))
         .expect(1)
         .mount(&server)
@@ -299,6 +299,83 @@ async fn setup_detects_microsoft_entra_and_explains_the_oauth_prerequisite() {
             "Ask your ServiceNow administrator",
         ))
         .stderr(predicate::str::contains("OAuth client ID is required"));
+}
+
+#[tokio::test]
+async fn setup_does_not_treat_a_local_login_form_as_basic_authentication() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nav_to.do"))
+        .and(query_param("uri", "incident_list.do"))
+        .respond_with(ResponseTemplate::new(302).insert_header("location", "/login.do"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/login.do"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<form>Password</form>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command(&config_home)
+        .args(["setup", "work", "--instance", &server.uri()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "did not expose a definitive login method",
+        ))
+        .stderr(predicate::str::contains("username/password login detected").not());
+}
+
+#[tokio::test]
+async fn rejected_basic_auth_on_federated_instance_recommends_oauth() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_user"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {
+                "message": "User is not authenticated",
+                "detail": "Required to provide Auth information"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/nav_to.do"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            "/auth_redirect.do?sysparm_url=https%3A%2F%2Flogin.microsoftonline.com%2Ftenant-guid%2Fsaml2",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut setup = assert_cmd::Command::from_std(command(&config_home));
+    setup
+        .args([
+            "setup",
+            "work",
+            "--instance",
+            &server.uri(),
+            "--username",
+            "federated-user",
+            "--method",
+            "basic",
+            "--secret-stdin",
+            "--insecure-storage",
+        ])
+        .write_stdin("not-a-servicenow-password\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Microsoft Entra SSO"))
+        .stderr(predicate::str::contains("Federated accounts"))
+        .stderr(predicate::str::contains("--method oauth"))
+        .stderr(predicate::str::contains("OAuth Application Registry"))
+        .stderr(predicate::str::contains("servicenow auth login").not());
 }
 
 #[tokio::test]

@@ -8,13 +8,15 @@ servicenow auth status
 servicenow profile list
 ```
 
-When `--method` is omitted, setup inspects the instance's public login route. It
-recognizes Microsoft Entra and other external SSO redirects and chooses
-browser-based OAuth; a local ServiceNow login selects Basic authentication. The
-probe never sends credentials and never follows a redirect to the external
-identity provider. If discovery is inconclusive, interactive setup asks you to
-choose instead of guessing. Interactive terminals show progress during the
-probe and a compact connection summary when setup succeeds.
+When `--method` is omitted, setup requests an authenticated UI route without
+credentials. It recognizes Microsoft Entra and other external SSO redirects and
+chooses browser-based OAuth. A classic `/login.do` form is not treated as proof
+that your account has a usable ServiceNow password: that side door can exist on
+fully federated instances. In that ambiguous case, interactive setup asks you to
+choose browser sign-in, a local/service-account password, or an access token.
+The probe never sends credentials and never follows a redirect to the external
+identity provider. Interactive terminals show progress during the probe and a
+compact connection summary when setup succeeds.
 
 The credential is stored in Keychain Access on macOS, Credential Manager on
 Windows, or the platform credential service on Linux. The profile's instance,
@@ -43,8 +45,9 @@ Environment variables take precedence over credentials stored by a profile.
 
 ## OAuth
 
-Register an OAuth application in ServiceNow with a loopback redirect URI, then
-run:
+Under **System OAuth → Application Registry**, a ServiceNow administrator must
+create an **OAuth API endpoint for external clients** and register the loopback
+redirect URI. Then run:
 
 ```sh
 servicenow auth login work \

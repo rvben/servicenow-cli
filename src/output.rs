@@ -223,6 +223,13 @@ fn error_remediation(error: &ApiError) -> Option<&'static str> {
         || message.contains("No access token configured")
     {
         Some("run `servicenow setup` to connect an instance securely")
+    } else if matches!(error, ApiError::Auth(_))
+        && message.contains("appears to use")
+        && message.contains("SSO")
+    {
+        Some(
+            "retry with `servicenow setup --method oauth --client-id YOUR_CLIENT_ID`; ask your ServiceNow administrator for an OAuth Application Registry client ID if needed",
+        )
     } else {
         match error {
             ApiError::Auth(_) => Some("run `servicenow auth login` to refresh your credentials"),

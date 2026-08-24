@@ -1107,7 +1107,7 @@ async fn run_auth_login(
 
     let client =
         ServiceNowClient::new(&instance, username.as_deref(), credential.secret(), method)?;
-    let users = client
+    let users = match client
         .list_records(
             "sys_user",
             &ListOptions {
@@ -1117,7 +1117,14 @@ async fn run_auth_login(
                 ..ListOptions::default()
             },
         )
-        .await?;
+        .await
+    {
+        Ok(users) => users,
+        Err(error) if matches!(method, AuthType::Basic) && matches!(error, ApiError::Auth(_)) => {
+            return Err(enrich_basic_auth_error(&instance, error).await);
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(user) = users.first() {
         username = field_text(user, "user_name").or(username);
     }
@@ -1195,8 +1202,28 @@ async fn run_auth_login(
 fn print_oauth_admin_request(output: &OutputConfig, redirect_uri: &str) {
     let heading = output.heading("ServiceNow OAuth app required");
     output.message(&format!(
-        "\n{heading}\n\nAsk your ServiceNow administrator:\n\n  Please create an OAuth API endpoint for external clients for the\n  ServiceNow CLI, register this redirect URI:\n\n    {redirect_uri}\n\n  Then send me the client ID.\n\nMicrosoft Entra remains the browser sign-in; the OAuth app itself is\nconfigured in ServiceNow."
+        "\n{heading}\n\nAsk your ServiceNow administrator:\n\n  Please create an OAuth API endpoint for external clients under\n  System OAuth → Application Registry for the ServiceNow CLI, and\n  register this redirect URI:\n\n    {redirect_uri}\n\n  Then send me the client ID.\n\nMicrosoft Entra remains the browser sign-in; the OAuth app itself is\nconfigured in ServiceNow."
     ));
+}
+
+async fn enrich_basic_auth_error(instance: &str, error: ApiError) -> ApiError {
+    let ApiError::Auth(message) = error else {
+        return error;
+    };
+    match servicenow_cli::auth::discover_login_provider(instance).await {
+        Ok(servicenow_cli::auth::LoginProvider::MicrosoftEntra) => ApiError::Auth(format!(
+            "Basic authentication was rejected, and this instance appears to use Microsoft Entra SSO. Federated accounts usually do not have a usable ServiceNow password. Use browser-based OAuth instead; a ServiceNow administrator may need to create an OAuth Application Registry entry. ServiceNow response: {message}"
+        )),
+        Ok(servicenow_cli::auth::LoginProvider::ExternalSso(host)) => {
+            let provider = host
+                .map(|host| format!(" through {host}"))
+                .unwrap_or_default();
+            ApiError::Auth(format!(
+                "Basic authentication was rejected, and this instance appears to use external SSO{provider}. Federated accounts usually do not have a usable ServiceNow password. Use browser-based OAuth instead; a ServiceNow administrator may need to create an OAuth Application Registry entry. ServiceNow response: {message}"
+            ))
+        }
+        _ => ApiError::Auth(message),
+    }
 }
 
 fn save_oauth_draft(
@@ -1252,10 +1279,18 @@ async fn resolve_auth_method(
             );
             Ok(AuthType::OAuth)
         }
-        Ok(servicenow_cli::auth::LoginProvider::Local) => {
-            output.success("ServiceNow username/password login detected");
-            Ok(AuthType::Basic)
+        Ok(servicenow_cli::auth::LoginProvider::Undetermined)
+            if std::io::stdin().is_terminal() =>
+        {
+            output.message(
+                "No SSO redirect was detected. A ServiceNow login page does not prove that your account has a local password.",
+            );
+            select_auth_method()
         }
+        Ok(servicenow_cli::auth::LoginProvider::Undetermined) => Err(ApiError::InvalidInput(
+            "the instance did not expose a definitive login method; pass --method basic, oauth, or bearer"
+                .into(),
+        )),
         Err(error) if std::io::stdin().is_terminal() => {
             output.message(&format!(
                 "Could not identify the login method automatically ({error})."

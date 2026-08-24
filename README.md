@@ -25,7 +25,7 @@ $ servicenow incidents mine
 - Workflow-first commands for incidents and attachments, with every table still available.
 - Human inputs such as incident numbers, user names, emails, group names, and
   `@me`; no routine `sys_id` hunting.
-- Login-route detection that selects local credentials or browser-based OAuth + PKCE.
+- Authenticated-route detection that recognizes SSO and lets you choose when the result is ambiguous.
 - Credentials in the operating-system keychain, with a permission-locked file fallback for
   environments such as WSL2 that do not provide a credential service.
 - Beautiful responsive tables for humans; deterministic JSON, JSONL, YAML, and
@@ -54,7 +54,7 @@ cargo install --path .
 ## Two-minute start
 
 ```sh
-# Detects local login or SSO, then asks only for what that method needs.
+# Detects SSO; if the result is ambiguous, choose browser, local, or token sign-in.
 servicenow setup work --instance company
 
 # If an administrator must create the OAuth app, setup saves your progress.

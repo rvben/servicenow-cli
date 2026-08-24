@@ -2,6 +2,17 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## Unreleased
+
+### Fixed
+
+- SAML/Entra-federated instances are detected through an authenticated UI route
+  instead of incorrectly treating the always-available `/login.do` form as
+  evidence that the current user can authenticate with a ServiceNow password.
+- Ambiguous discovery now asks interactive users to choose a login method, and
+  a Basic 401 on a detected SSO instance points to OAuth and its ServiceNow
+  Application Registry prerequisite instead of suggesting another Basic login.
+
 ## 0.3.3 — 2026-08-24
 
 ### Added
