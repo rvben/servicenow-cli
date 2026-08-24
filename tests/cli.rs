@@ -22,6 +22,8 @@ fn command(config_home: &TempDir) -> Command {
         .env_remove("SERVICENOW_INSTANCE")
         .env_remove("SERVICENOW_USERNAME")
         .env_remove("SERVICENOW_PASSWORD")
+        .env_remove("SERVICENOW_COOKIE")
+        .env_remove("SERVICENOW_USER_TOKEN")
         .env_remove("SERVICENOW_TOKEN")
         .env_remove("SERVICENOW_AUTH_TYPE")
         .env_remove("SERVICENOW_PROFILE")
@@ -86,6 +88,30 @@ fn setup_schema_describes_adaptive_onboarding_defaults() {
         .unwrap();
     assert!(output.status.success());
     let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let method = schema["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|argument| argument["id"] == "method")
+        .unwrap();
+    assert!(
+        method["possibleValues"]
+            .as_array()
+            .unwrap()
+            .contains(&"browser".into())
+    );
+    assert!(
+        method["possibleValues"]
+            .as_array()
+            .unwrap()
+            .contains(&"oauth".into())
+    );
+    assert!(
+        !method["possibleValues"]
+            .as_array()
+            .unwrap()
+            .contains(&"o-auth".into())
+    );
     let arguments = schema["arguments"].as_array().unwrap();
     let dynamic_default = |id: &str| {
         arguments
@@ -271,7 +297,7 @@ async fn setup_can_fall_back_to_the_protected_config_file() {
 }
 
 #[tokio::test]
-async fn setup_detects_microsoft_entra_and_explains_the_oauth_prerequisite() {
+async fn setup_detects_microsoft_entra_and_selects_zero_admin_browser_sign_in() {
     let config_home = TempDir::new().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -291,14 +317,15 @@ async fn setup_detects_microsoft_entra_and_explains_the_oauth_prerequisite() {
             "--instance",
             &server.uri(),
             "--insecure-storage",
+            "--no-browser",
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("Microsoft Entra SSO detected"))
         .stderr(predicate::str::contains(
-            "Ask your ServiceNow administrator",
+            "no ServiceNow password or OAuth application is required",
         ))
-        .stderr(predicate::str::contains("OAuth client ID is required"));
+        .stderr(predicate::str::contains("remove --no-browser"));
 }
 
 #[tokio::test]
@@ -330,7 +357,7 @@ async fn setup_does_not_treat_a_local_login_form_as_basic_authentication() {
 }
 
 #[tokio::test]
-async fn rejected_basic_auth_on_federated_instance_recommends_oauth() {
+async fn rejected_basic_auth_on_federated_instance_recommends_browser_sign_in() {
     let config_home = TempDir::new().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -373,8 +400,9 @@ async fn rejected_basic_auth_on_federated_instance_recommends_oauth() {
         .failure()
         .stderr(predicate::str::contains("Microsoft Entra SSO"))
         .stderr(predicate::str::contains("Federated accounts"))
-        .stderr(predicate::str::contains("--method oauth"))
-        .stderr(predicate::str::contains("OAuth Application Registry"))
+        .stderr(predicate::str::contains("--method browser"))
+        .stderr(predicate::str::contains("no OAuth application"))
+        .stderr(predicate::str::contains("Application Registry").not())
         .stderr(predicate::str::contains("servicenow auth login").not());
 }
 

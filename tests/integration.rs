@@ -91,6 +91,86 @@ async fn bearer_auth_and_display_values_are_supported() {
 }
 
 #[tokio::test]
+async fn browser_sessions_send_only_the_service_now_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(header(
+            "cookie",
+            "JSESSIONID=synthetic-session; route=synthetic-route",
+        ))
+        .and(header("x-usertoken", "synthetic-user-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ServiceNowClient::new_with_user_token(
+        &server.uri(),
+        None,
+        "JSESSIONID=synthetic-session; route=synthetic-route",
+        AuthType::Browser,
+        Some("synthetic-user-token"),
+    )
+    .unwrap();
+    assert!(
+        client
+            .list_records("incident", &ListOptions::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn browser_sessions_never_follow_an_auth_redirect() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .respond_with(ResponseTemplate::new(302).insert_header(
+            "location",
+            "https://login.microsoftonline.com/example/saml2",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client =
+        ServiceNowClient::new(&server.uri(), None, "JSESSIONID=expired", AuthType::Browser)
+            .unwrap();
+    let error = client
+        .list_records("incident", &ListOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::Auth(_)));
+    assert!(error.to_string().contains("browser session expired"));
+}
+
+#[tokio::test]
+async fn rejected_browser_session_has_a_relogin_specific_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": {"message": "User is not authenticated", "detail": "Session expired"}
+        })))
+        .mount(&server)
+        .await;
+
+    let client =
+        ServiceNowClient::new(&server.uri(), None, "JSESSIONID=expired", AuthType::Browser)
+            .unwrap();
+    let error = client
+        .list_records("incident", &ListOptions::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::Auth(_)));
+    assert!(error.to_string().contains("browser session expired"));
+}
+
+#[tokio::test]
 async fn create_update_and_delete_use_expected_methods() {
     let server = MockServer::start().await;
     let sys_id = "0123456789abcdef0123456789abcdef";

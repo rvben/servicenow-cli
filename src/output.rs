@@ -220,6 +220,7 @@ fn error_remediation(error: &ApiError) -> Option<&'static str> {
         || message.contains("No username configured")
         || message.contains("No credential configured")
         || message.contains("No password configured")
+        || message.contains("No browser session configured")
         || message.contains("No access token configured")
     {
         Some("run `servicenow setup` to connect an instance securely")
@@ -227,11 +228,12 @@ fn error_remediation(error: &ApiError) -> Option<&'static str> {
         && message.contains("appears to use")
         && message.contains("SSO")
     {
-        Some(
-            "retry with `servicenow setup --method oauth --client-id YOUR_CLIENT_ID`; ask your ServiceNow administrator for an OAuth Application Registry client ID if needed",
-        )
+        Some("retry with `servicenow setup --method browser`; no OAuth application is required")
     } else {
         match error {
+            ApiError::Auth(_) if message.contains("browser session") => {
+                Some("run `servicenow auth login --method browser` to sign in again")
+            }
             ApiError::Auth(_) => Some("run `servicenow auth login` to refresh your credentials"),
             ApiError::RateLimit => Some("wait briefly, then retry the command"),
             _ => None,
@@ -258,5 +260,16 @@ mod tests {
             OutputFormat::JsonLines
         );
         assert!(OutputConfig::new("xml", false, false, true).is_err());
+    }
+
+    #[test]
+    fn expired_browser_sessions_have_a_specific_safe_recovery() {
+        let error = ApiError::Auth(
+            "browser session expired or was rejected: User is not authenticated".into(),
+        );
+        assert_eq!(
+            error_remediation(&error),
+            Some("run `servicenow auth login --method browser` to sign in again")
+        );
     }
 }

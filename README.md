@@ -25,7 +25,7 @@ $ servicenow incidents mine
 - Workflow-first commands for incidents and attachments, with every table still available.
 - Human inputs such as incident numbers, user names, emails, group names, and
   `@me`; no routine `sys_id` hunting.
-- Authenticated-route detection that recognizes SSO and lets you choose when the result is ambiguous.
+- Zero-admin browser sign-in for SSO instances, with managed OAuth available when administrators provide it.
 - Credentials in the operating-system keychain, with a permission-locked file fallback for
   environments such as WSL2 that do not provide a credential service.
 - Beautiful responsive tables for humans; deterministic JSON, JSONL, YAML, and
@@ -54,12 +54,12 @@ cargo install --path .
 ## Two-minute start
 
 ```sh
-# Detects SSO; if the result is ambiguous, choose browser, local, or token sign-in.
+# Detects SSO and opens a private browser window; no OAuth app is required.
 servicenow setup work --instance company
 
-# If an administrator must create the OAuth app, setup saves your progress.
-# Resume later without repeating the instance and sign-in discovery:
-servicenow auth login work --client-id YOUR_CLIENT_ID
+# Managed OAuth remains available when your organization provides a client ID:
+servicenow auth login work --instance company --method oauth \
+  --client-id YOUR_CLIENT_ID
 
 # On headless Linux/WSL2, choose the permission-locked file fallback directly:
 servicenow setup work --instance company --insecure-storage
@@ -69,7 +69,7 @@ servicenow incidents mine
 servicenow incidents show INC0010042
 ```
 
-For OAuth, bearer-token, CI, migration, and production-profile guidance, see
+For browser SSO, OAuth, bearer-token, CI, migration, and production-profile guidance, see
 [Authentication and profiles](docs/authentication.md).
 
 ## Incident workflows
@@ -235,8 +235,10 @@ profile. Environment variables are useful for ephemeral automation:
 | `SERVICENOW_INSTANCE` | Instance name, hostname, or full base URL |
 | `SERVICENOW_USERNAME` | Basic-auth username |
 | `SERVICENOW_PASSWORD` | Basic-auth password |
+| `SERVICENOW_COOKIE` | Ephemeral ServiceNow browser-session cookie |
+| `SERVICENOW_USER_TOKEN` | Matching browser anti-CSRF token for write requests |
 | `SERVICENOW_TOKEN` | Bearer/OAuth access token |
-| `SERVICENOW_AUTH_TYPE` | `basic`, `bearer`, or `oauth` |
+| `SERVICENOW_AUTH_TYPE` | `browser`, `basic`, `bearer`, or `oauth` |
 | `SERVICENOW_PROFILE` | Named profile |
 | `SERVICENOW_READ_ONLY` | Block all actual mutations when true |
 | `SERVICENOW_CACHE_DIR` | Override the metadata cache root |

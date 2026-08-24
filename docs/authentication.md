@@ -10,26 +10,66 @@ servicenow profile list
 
 When `--method` is omitted, setup requests an authenticated UI route without
 credentials. It recognizes Microsoft Entra and other external SSO redirects and
-chooses browser-based OAuth. A classic `/login.do` form is not treated as proof
-that your account has a usable ServiceNow password: that side door can exist on
-fully federated instances. In that ambiguous case, interactive setup asks you to
-choose browser sign-in, a local/service-account password, or an access token.
-The probe never sends credentials and never follows a redirect to the external
-identity provider. Interactive terminals show progress during the probe and a
-compact connection summary when setup succeeds.
+chooses zero-admin browser-session authentication. A classic `/login.do` form
+is not treated as proof that your account has a usable ServiceNow password: that
+side door can exist on fully federated instances. In an ambiguous case,
+interactive setup asks you to choose browser sign-in, managed OAuth, a
+local/service-account password, or an access token. The probe never sends
+credentials and never follows a redirect to the external identity provider.
 
 The credential is stored in Keychain Access on macOS, Credential Manager on
 Windows, or the platform credential service on Linux. The profile's instance,
 username, authentication type, and safety mode are stored in the configuration
-file. Pass `--method basic`, `oauth`, or `bearer` to make scripts deterministic.
+file. Pass `--method browser`, `basic`, `oauth`, or `bearer` to select a method
+explicitly.
+
+## Browser sign-in for SSO
+
+Browser sign-in is the recommended employee experience for SAML/Entra-federated
+instances when no OAuth application is available:
+
+```sh
+servicenow setup work --instance company --method browser
+```
+
+The CLI launches Chrome, Edge, or Chromium with a new temporary profile and a
+localhost-only debugging channel. Complete the normal SSO and MFA flow in that
+window. The CLI retains only cookies valid for the requested ServiceNow hostname
+and API path, validates them against the Table API, closes the private browser,
+and removes its temporary profile. Identity-provider cookies—including
+Microsoft Entra cookies—are never retained by the CLI. The resulting ServiceNow
+cookie and anti-CSRF user token are protected like any other credential. This uses
+[ServiceNow's documented support for binding REST requests to an existing
+session with cookies](https://www.servicenow.com/docs/r/api-reference/rest-api-explorer/c_RESTAPI.html).
+The matching `X-UserToken` is included for operations protected by
+[ServiceNow's anti-CSRF validation](https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-prevent-users-from-accepting-warning-to-bypass-csrf-validation.html).
+
+No ServiceNow Application Registry entry or administrator action is required.
+The user's normal ServiceNow ACLs and REST access policies still apply. Browser
+sessions do not have OAuth refresh tokens, so when ServiceNow expires the
+session, sign in again without repeating setup:
+
+```sh
+servicenow auth login work --method browser
+```
+
+The CLI never retries a failed command automatically after session expiry. This
+avoids accidentally repeating a write whose outcome is uncertain.
 
 ## WSL2 and headless Linux
 
-WSL2 and minimal Linux installations often have no Secret Service provider. If
-the OS credential store is unavailable, interactive setup explains the problem
-and offers to store the credential in the CLI config file instead. The file is
-created with mode `0600` on Unix, but the credential is plaintext, so setup asks
-before writing it.
+On WSL2, browser sign-in launches Windows Edge or Chrome through PowerShell
+interop and performs the cookie handoff entirely on the Windows loopback
+interface. It works with both NAT and mirrored WSL networking and does not open
+a debugging port to the LAN. Set `SERVICENOW_BROWSER` to a Windows executable
+path if automatic discovery is blocked by corporate browser installation rules.
+
+WSL2 and minimal Linux installations often have no Secret Service provider.
+After browser authentication succeeds, setup explains the problem and offers to
+store the credential in the CLI config file instead. The file is created with
+mode `0600` on Unix, but the credential is plaintext, so setup asks before
+writing it. Cancelling or failing browser sign-in writes nothing and does not
+show the storage prompt.
 
 For non-interactive setup, opt in explicitly:
 
@@ -40,10 +80,13 @@ servicenow setup work --insecure-storage \
 ```
 
 To avoid persistent credential storage entirely, set `SERVICENOW_PASSWORD` for
-Basic authentication or `SERVICENOW_TOKEN` for bearer/OAuth authentication.
-Environment variables take precedence over credentials stored by a profile.
+Basic authentication, `SERVICENOW_COOKIE` for an existing ServiceNow session,
+`SERVICENOW_USER_TOKEN` for its matching anti-CSRF token, or `SERVICENOW_TOKEN`
+for bearer/OAuth authentication. Environment variables take precedence over
+credentials stored by a profile. Treat session values as passwords and never
+put them in command arguments, shell history, or logs.
 
-## OAuth
+## Managed OAuth
 
 Under **System OAuth → Application Registry**, a ServiceNow administrator must
 create an **OAuth API endpoint for external clients** and register the loopback
@@ -65,9 +108,9 @@ For an instance whose web login redirects to `login.microsoftonline.com`, this
 is still normally a **ServiceNow OAuth application**, not a new app registration
 made directly against Microsoft Entra. ServiceNow starts the browser flow,
 redirects the user through the configured enterprise identity provider, and
-then issues the API tokens. If setup detects SSO but no client ID was provided,
-it prints a copy-ready request containing the redirect URI for your ServiceNow
-administrator.
+then issues the API tokens. Managed OAuth is durable because refresh tokens can
+renew access without capturing a new browser session, but it requires an
+instance administrator to register the client and redirect URI.
 
 If the client ID is not ready yet, choose not to continue. Setup saves only the
 instance and OAuth settings—no credential or secret—and prints the resume

@@ -2,6 +2,29 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## Unreleased
+
+### Added
+
+- SSO discovery now selects zero-admin browser-session authentication instead
+  of requiring a ServiceNow OAuth Application Registry entry. Chrome, Edge, or
+  Chromium opens with an isolated temporary profile and the session is
+  validated before anything is stored.
+- WSL2 can use Windows Edge or Chrome through a loopback-only PowerShell bridge,
+  without depending on WSL mirrored networking or exposing browser debugging to
+  the LAN.
+- `--method browser` and `SERVICENOW_COOKIE` provide explicit browser-session
+  selection and ephemeral automation support.
+
+### Safety
+
+- Browser sign-in retains only cookies scoped to the requested ServiceNow host
+  and API root; identity-provider cookies are discarded. It also supplies the
+  session's anti-CSRF user token for writes and never follows an API redirect to
+  an identity provider. The isolated browser profile is removed after login,
+  session values remain masked, and expired sessions require an explicit
+  re-login instead of automatically retrying a possibly mutating command.
+
 ## 0.3.4 — 2026-08-24
 
 ### Fixed

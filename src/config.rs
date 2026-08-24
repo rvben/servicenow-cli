@@ -13,7 +13,10 @@ use crate::credentials::{self, StoredCredential};
 pub enum AuthType {
     #[default]
     Basic,
+    #[value(alias = "session", alias = "sso")]
+    Browser,
     Bearer,
+    #[value(name = "oauth", alias = "o-auth")]
     OAuth,
 }
 
@@ -21,6 +24,7 @@ impl AuthType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Basic => "basic",
+            Self::Browser => "browser",
             Self::Bearer => "bearer",
             Self::OAuth => "oauth",
         }
@@ -33,10 +37,11 @@ impl FromStr for AuthType {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "basic" => Ok(Self::Basic),
+            "browser" | "session" | "sso" => Ok(Self::Browser),
             "bearer" | "token" => Ok(Self::Bearer),
             "oauth" => Ok(Self::OAuth),
             _ => Err(ApiError::InvalidInput(format!(
-                "invalid auth type '{value}'; expected basic, bearer, or oauth"
+                "invalid auth type '{value}'; expected browser, basic, bearer, or oauth"
             ))),
         }
     }
@@ -99,6 +104,7 @@ pub struct Config {
     pub oauth_scope: Option<String>,
     pub redirect_uri: Option<String>,
     pub oauth: Option<OAuthSession>,
+    pub browser_user_token: Option<String>,
     credential_store: String,
 }
 
@@ -157,10 +163,13 @@ impl Config {
 
         let env_secret = match auth_type {
             AuthType::Basic => env("SERVICENOW_PASSWORD"),
+            AuthType::Browser => env("SERVICENOW_COOKIE"),
             AuthType::Bearer | AuthType::OAuth => env("SERVICENOW_TOKEN"),
         };
+        let uses_env_secret = env_secret.is_some();
         let legacy_secret = match auth_type {
             AuthType::Basic => normalize(file_profile.password.clone()),
+            AuthType::Browser => None,
             AuthType::Bearer | AuthType::OAuth => normalize(file_profile.token.clone()),
         };
         let credential_store = if env_secret.is_some() {
@@ -193,6 +202,9 @@ impl Config {
             .ok_or_else(|| {
                 ApiError::InvalidInput(match auth_type {
                     AuthType::Basic => "No password configured. Run `servicenow setup`.".into(),
+                    AuthType::Browser => {
+                        "No browser session configured. Run `servicenow auth login`.".into()
+                    }
                     AuthType::Bearer | AuthType::OAuth => {
                         "No access token configured. Run `servicenow setup`.".into()
                     }
@@ -207,6 +219,14 @@ impl Config {
             .map(|value| parse_bool(&value))
             .transpose()?
             .unwrap_or(file_profile.read_only.unwrap_or(false));
+        let browser_user_token = if uses_env_secret {
+            env("SERVICENOW_USER_TOKEN")
+        } else {
+            match stored_credential.as_ref() {
+                Some(StoredCredential::Browser { user_token, .. }) => Some(user_token.clone()),
+                _ => None,
+            }
+        };
         let oauth = match stored_credential {
             Some(StoredCredential::OAuth {
                 refresh_token,
@@ -232,6 +252,7 @@ impl Config {
             oauth_scope: normalize(file_profile.oauth_scope),
             redirect_uri: normalize(file_profile.redirect_uri),
             oauth,
+            browser_user_token,
             credential_store: credential_store.into(),
         })
     }
@@ -575,6 +596,14 @@ mod tests {
         assert!(validate_profile_name("production-eu").is_ok());
         assert!(validate_profile_name("team_alpha").is_ok());
         assert!(validate_profile_name("bad/profile").is_err());
+    }
+
+    #[test]
+    fn browser_auth_has_friendly_explicit_aliases() {
+        assert!(matches!("browser".parse(), Ok(AuthType::Browser)));
+        assert!(matches!("session".parse(), Ok(AuthType::Browser)));
+        assert!(matches!("sso".parse(), Ok(AuthType::Browser)));
+        assert_eq!(AuthType::Browser.as_str(), "browser");
     }
 
     #[test]

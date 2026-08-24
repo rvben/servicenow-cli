@@ -10,6 +10,10 @@ pub enum StoredCredential {
     Basic {
         password: String,
     },
+    Browser {
+        cookie: String,
+        user_token: String,
+    },
     Bearer {
         access_token: String,
     },
@@ -26,6 +30,7 @@ impl StoredCredential {
     pub fn secret(&self) -> &str {
         match self {
             Self::Basic { password } => password,
+            Self::Browser { cookie, .. } => cookie,
             Self::Bearer { access_token } | Self::OAuth { access_token, .. } => access_token,
         }
     }
@@ -103,6 +108,15 @@ mod tests {
         assert_eq!(encoded["kind"], "oauth");
         assert!(encoded.get("secret").is_none());
         assert_eq!(credential.secret(), "access");
+
+        let browser = StoredCredential::Browser {
+            cookie: "JSESSIONID=synthetic".into(),
+            user_token: "synthetic-user-token".into(),
+        };
+        let encoded = serde_json::to_value(&browser).unwrap();
+        assert_eq!(encoded["kind"], "browser");
+        assert!(encoded.get("secret").is_none());
+        assert_eq!(browser.secret(), "JSESSIONID=synthetic");
     }
 
     #[test]

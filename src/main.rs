@@ -100,7 +100,7 @@ enum Command {
         #[arg(long)]
         insecure_storage: bool,
 
-        /// Print the OAuth URL without opening a browser
+        /// Do not open a browser automatically (OAuth only)
         #[arg(long)]
         no_browser: bool,
 
@@ -214,7 +214,7 @@ enum AuthCommand {
         #[arg(long)]
         insecure_storage: bool,
 
-        /// Print the OAuth URL without opening a browser
+        /// Do not open a browser automatically (OAuth only)
         #[arg(long)]
         no_browser: bool,
 
@@ -837,7 +837,11 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         output.message("OAuth access token refreshed.");
     }
     if matches!(cli.command, Command::Config(ConfigCommand::Show)) {
-        let masked = mask_secret(&config.secret);
+        let masked = if matches!(config.auth_type, AuthType::Browser) {
+            "****".into()
+        } else {
+            mask_secret(&config.secret)
+        };
         let value = serde_json::json!({
             "configPath": config_path(),
             "profile": config.profile,
@@ -855,11 +859,12 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         return Ok(());
     }
 
-    let client = ServiceNowClient::new(
+    let client = ServiceNowClient::new_with_user_token(
         &config.instance,
         config.username.as_deref(),
         &config.secret,
         config.auth_type,
+        config.browser_user_token.as_deref(),
     )?;
 
     match cli.command {
@@ -1076,11 +1081,31 @@ async fn run_auth_login(
     } else {
         None
     };
-    let file_storage = choose_credential_storage(insecure_storage)?;
+    let file_storage = if matches!(method, AuthType::Browser) {
+        None
+    } else {
+        Some(choose_credential_storage(insecure_storage)?)
+    };
     let credential = match method {
         AuthType::Basic => StoredCredential::Basic {
             password: read_login_secret(secret_stdin, "Password", false)?,
         },
+        AuthType::Browser => {
+            if secret_stdin {
+                return Err(ApiError::InvalidInput(
+                    "browser sign-in cannot be read from stdin; remove --secret-stdin".into(),
+                ));
+            }
+            if !no_browser {
+                output.message("\nOpening a private browser window for ServiceNow…");
+                output.message(
+                    "Complete your normal SSO sign-in there. This CLI never receives your identity-provider password.",
+                );
+            }
+            let credential = servicenow_cli::browser::browser_login(&instance, !no_browser).await?;
+            output.success("Browser sign-in complete");
+            credential
+        }
         AuthType::Bearer => StoredCredential::Bearer {
             access_token: read_login_secret(secret_stdin, "Access token", false)?,
         },
@@ -1104,9 +1129,22 @@ async fn run_auth_login(
             .await?
         }
     };
+    let file_storage = match file_storage {
+        Some(file_storage) => file_storage,
+        None => choose_credential_storage(insecure_storage)?,
+    };
 
-    let client =
-        ServiceNowClient::new(&instance, username.as_deref(), credential.secret(), method)?;
+    let browser_user_token = match &credential {
+        StoredCredential::Browser { user_token, .. } => Some(user_token.as_str()),
+        _ => None,
+    };
+    let client = ServiceNowClient::new_with_user_token(
+        &instance,
+        username.as_deref(),
+        credential.secret(),
+        method,
+        browser_user_token,
+    )?;
     let users = match client
         .list_records(
             "sys_user",
@@ -1212,14 +1250,14 @@ async fn enrich_basic_auth_error(instance: &str, error: ApiError) -> ApiError {
     };
     match servicenow_cli::auth::discover_login_provider(instance).await {
         Ok(servicenow_cli::auth::LoginProvider::MicrosoftEntra) => ApiError::Auth(format!(
-            "Basic authentication was rejected, and this instance appears to use Microsoft Entra SSO. Federated accounts usually do not have a usable ServiceNow password. Use browser-based OAuth instead; a ServiceNow administrator may need to create an OAuth Application Registry entry. ServiceNow response: {message}"
+            "Basic authentication was rejected, and this instance appears to use Microsoft Entra SSO. Federated accounts usually do not have a usable ServiceNow password. Use browser sign-in instead; it needs no OAuth application or administrator setup. ServiceNow response: {message}"
         )),
         Ok(servicenow_cli::auth::LoginProvider::ExternalSso(host)) => {
             let provider = host
                 .map(|host| format!(" through {host}"))
                 .unwrap_or_default();
             ApiError::Auth(format!(
-                "Basic authentication was rejected, and this instance appears to use external SSO{provider}. Federated accounts usually do not have a usable ServiceNow password. Use browser-based OAuth instead; a ServiceNow administrator may need to create an OAuth Application Registry entry. ServiceNow response: {message}"
+                "Basic authentication was rejected, and this instance appears to use external SSO{provider}. Federated accounts usually do not have a usable ServiceNow password. Use browser sign-in instead; it needs no OAuth application or administrator setup. ServiceNow response: {message}"
             ))
         }
         _ => ApiError::Auth(message),
@@ -1264,9 +1302,9 @@ async fn resolve_auth_method(
         Ok(servicenow_cli::auth::LoginProvider::MicrosoftEntra) => {
             output.success("Microsoft Entra SSO detected");
             output.message(
-                "This instance needs browser-based OAuth; your Microsoft password is never entered into this CLI.",
+                "Sign in through your browser—no ServiceNow password or OAuth application is required.",
             );
-            Ok(AuthType::OAuth)
+            Ok(AuthType::Browser)
         }
         Ok(servicenow_cli::auth::LoginProvider::ExternalSso(host)) => {
             let provider = host
@@ -1275,9 +1313,9 @@ async fn resolve_auth_method(
                 .unwrap_or_else(|| "External SSO detected".into());
             output.success(&provider);
             output.message(
-                "This instance needs browser-based OAuth; your identity-provider password is never entered into this CLI.",
+                "Sign in through your browser—no identity-provider password is entered into this CLI.",
             );
-            Ok(AuthType::OAuth)
+            Ok(AuthType::Browser)
         }
         Ok(servicenow_cli::auth::LoginProvider::Undetermined)
             if std::io::stdin().is_terminal() =>
@@ -1288,7 +1326,7 @@ async fn resolve_auth_method(
             select_auth_method()
         }
         Ok(servicenow_cli::auth::LoginProvider::Undetermined) => Err(ApiError::InvalidInput(
-            "the instance did not expose a definitive login method; pass --method basic, oauth, or bearer"
+            "the instance did not expose a definitive login method; pass --method browser, basic, oauth, or bearer"
                 .into(),
         )),
         Err(error) if std::io::stdin().is_terminal() => {
@@ -1298,7 +1336,7 @@ async fn resolve_auth_method(
             select_auth_method()
         }
         Err(error) => Err(ApiError::InvalidInput(format!(
-            "could not auto-detect the authentication method ({error}); pass --method basic, oauth, or bearer"
+            "could not auto-detect the authentication method ({error}); pass --method browser, basic, oauth, or bearer"
         ))),
     }
 }
@@ -1347,7 +1385,8 @@ impl Drop for OnboardingSpinner {
 
 fn select_auth_method() -> Result<AuthType, ApiError> {
     let options = [
-        "Browser sign-in (SSO / OAuth)",
+        "Browser sign-in (SSO, no administrator setup)",
+        "Managed OAuth application",
         "ServiceNow username and password",
         "Access token",
     ];
@@ -1358,8 +1397,9 @@ fn select_auth_method() -> Result<AuthType, ApiError> {
         .interact()
         .map_err(|error| ApiError::Other(format!("failed to choose authentication: {error}")))?;
     Ok(match selected {
-        0 => AuthType::OAuth,
-        1 => AuthType::Basic,
+        0 => AuthType::Browser,
+        1 => AuthType::OAuth,
+        2 => AuthType::Basic,
         _ => AuthType::Bearer,
     })
 }

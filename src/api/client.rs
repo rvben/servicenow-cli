@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue,
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, HeaderValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -83,6 +83,7 @@ pub struct AttachmentMetadata {
 
 pub struct ServiceNowClient {
     http: reqwest::Client,
+    auth_type: AuthType,
     site_url: String,
     table_url: String,
     attachment_url: String,
@@ -94,6 +95,16 @@ impl ServiceNowClient {
         username: Option<&str>,
         secret: &str,
         auth_type: AuthType,
+    ) -> Result<Self, ApiError> {
+        Self::new_with_user_token(instance, username, secret, auth_type, None)
+    }
+
+    pub fn new_with_user_token(
+        instance: &str,
+        username: Option<&str>,
+        secret: &str,
+        auth_type: AuthType,
+        browser_user_token: Option<&str>,
     ) -> Result<Self, ApiError> {
         let site_url = normalize_instance(instance)?;
         let authorization = match auth_type {
@@ -107,28 +118,48 @@ impl ServiceNowClient {
                         )
                     })?;
                 let credentials = basic_auth(username, secret);
-                format!("Basic {credentials}")
+                Some(format!("Basic {credentials}"))
             }
-            AuthType::Bearer | AuthType::OAuth => format!("Bearer {secret}"),
+            AuthType::Browser => None,
+            AuthType::Bearer | AuthType::OAuth => Some(format!("Bearer {secret}")),
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&authorization)
-                .map_err(|error| ApiError::Other(error.to_string()))?,
-        );
+        if let Some(authorization) = authorization {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&authorization)
+                    .map_err(|error| ApiError::Other(error.to_string()))?,
+            );
+        } else {
+            let mut cookie = HeaderValue::from_str(secret).map_err(|_| {
+                ApiError::InvalidInput("stored browser session cookie is invalid".into())
+            })?;
+            cookie.set_sensitive(true);
+            headers.insert(COOKIE, cookie);
+            if let Some(user_token) = browser_user_token {
+                let mut user_token = HeaderValue::from_str(user_token).map_err(|_| {
+                    ApiError::InvalidInput("stored browser user token is invalid".into())
+                })?;
+                user_token.set_sensitive(true);
+                headers.insert(HeaderName::from_static("x-usertoken"), user_token);
+            }
+        }
         headers.insert("accept", HeaderValue::from_static("application/json"));
 
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+            .timeout(std::time::Duration::from_secs(30));
+        if matches!(auth_type, AuthType::Browser) {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder.build()?;
         let table_url = format!("{site_url}/api/now/table");
         let attachment_url = format!("{site_url}/api/now/attachment");
 
         Ok(Self {
             http,
+            auth_type,
             site_url,
             table_url,
             attachment_url,
@@ -324,7 +355,7 @@ impl ServiceNowClient {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(map_response_error(response).await);
+            return Err(self.response_error(response).await);
         }
         let mut written = 0u64;
         while let Some(chunk) = response.chunk().await? {
@@ -349,7 +380,7 @@ impl ServiceNowClient {
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(map_response_error(response).await)
+            Err(self.response_error(response).await)
         }
     }
 
@@ -525,7 +556,7 @@ impl ServiceNowClient {
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(map_response_error(response).await)
+            Err(self.response_error(response).await)
         }
     }
 
@@ -534,9 +565,27 @@ impl ServiceNowClient {
         response: reqwest::Response,
     ) -> Result<T, ApiError> {
         if !response.status().is_success() {
-            return Err(map_response_error(response).await);
+            return Err(self.response_error(response).await);
         }
         response.json().await.map_err(ApiError::Http)
+    }
+
+    async fn response_error(&self, response: reqwest::Response) -> ApiError {
+        let browser_session_rejected = matches!(self.auth_type, AuthType::Browser)
+            && (response.status() == reqwest::StatusCode::UNAUTHORIZED
+                || response.status().is_redirection());
+        let error = map_response_error(response).await;
+        if browser_session_rejected {
+            ApiError::Auth(format!("browser session expired or was rejected: {error}"))
+        } else if matches!(self.auth_type, AuthType::Browser)
+            && let ApiError::Auth(message) = error
+        {
+            ApiError::Auth(format!(
+                "browser session expired or was rejected: {message}"
+            ))
+        } else {
+            error
+        }
     }
 }
 
