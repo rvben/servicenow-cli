@@ -2,6 +2,23 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.3.14 — 2026-08-24
+
+### Changed
+
+- WSL browser sign-in now prefers an installed Linux Chrome, Edge, or Chromium
+  browser and uses the Windows PowerShell bridge only as a fallback.
+- `SERVICENOW_BROWSER` accepts friendly `chrome`, `edge`, `chromium`, and
+  `auto` names. `windows-edge`, `windows-chrome`, and `windows-chromium`
+  explicitly select the WSL Windows bridge.
+
+### Fixed
+
+- The Windows browser bridge checks the managed `RemoteDebuggingAllowed`
+  policy before launching Edge, Chrome, or Chromium. When an administrator has
+  disabled remote debugging, sign-in now fails immediately with a specific
+  remediation instead of waiting for the browser-channel timeout.
+
 ## 0.3.13 — 2026-08-24
 
 ### Fixed

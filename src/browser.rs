@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -123,10 +124,13 @@ pub async fn browser_login_with_progress(
         reported: HashSet::new(),
     };
 
-    let session = if uses_windows_browser_bridge() {
-        windows_browser_cookie(&site_url, &mut progress).await?
-    } else {
-        native_browser_cookie_with_progress(&site_url, &mut progress).await?
+    let session = match select_browser_backend()? {
+        BrowserBackend::Native(browser) => {
+            native_browser_cookie_with_progress(&site_url, browser, &mut progress).await?
+        }
+        BrowserBackend::WindowsBridge(browser) => {
+            windows_browser_cookie(&site_url, browser.as_deref(), &mut progress).await?
+        }
     };
     HeaderValue::from_str(&session.cookie)
         .map_err(|_| ApiError::Other("the browser returned an invalid session cookie".into()))?;
@@ -146,9 +150,9 @@ struct BrowserSession {
 
 async fn native_browser_cookie_with_progress(
     site_url: &str,
+    browser: PathBuf,
     progress: &mut ProgressReporter<'_>,
 ) -> Result<BrowserSession, ApiError> {
-    let browser = find_native_browser()?;
     let private_mode = private_browsing_argument(&browser);
     let profile = tempfile::tempdir()
         .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
@@ -195,7 +199,8 @@ async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErro
         callback: &mut callback,
         reported: HashSet::new(),
     };
-    native_browser_cookie_with_progress(site_url, &mut progress).await
+    let browser = find_native_browser(std::env::var_os("SERVICENOW_BROWSER").as_deref())?;
+    native_browser_cookie_with_progress(site_url, browser, &mut progress).await
 }
 
 fn private_browsing_argument(browser: &Path) -> &'static str {
@@ -588,45 +593,159 @@ async fn validate_session(
     }
 }
 
-fn find_native_browser() -> Result<PathBuf, ApiError> {
-    if let Some(browser) = std::env::var_os("SERVICENOW_BROWSER") {
-        return resolve_program(Path::new(&browser)).ok_or_else(|| {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserAlias {
+    Auto,
+    Chrome,
+    Edge,
+    Chromium,
+    WindowsChrome,
+    WindowsEdge,
+    WindowsChromium,
+}
+
+impl BrowserAlias {
+    fn parse(value: &OsStr) -> Option<Self> {
+        match value.to_str()?.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "chrome" => Some(Self::Chrome),
+            "edge" => Some(Self::Edge),
+            "chromium" => Some(Self::Chromium),
+            "windows-chrome" => Some(Self::WindowsChrome),
+            "windows-edge" => Some(Self::WindowsEdge),
+            "windows-chromium" => Some(Self::WindowsChromium),
+            _ => None,
+        }
+    }
+
+    fn native_variant(self) -> Option<Self> {
+        match self {
+            Self::Auto | Self::Chrome | Self::Edge | Self::Chromium => Some(self),
+            Self::WindowsChrome | Self::WindowsEdge | Self::WindowsChromium => None,
+        }
+    }
+}
+
+enum BrowserBackend {
+    Native(PathBuf),
+    WindowsBridge(Option<OsString>),
+}
+
+fn select_browser_backend() -> Result<BrowserBackend, ApiError> {
+    let preference = std::env::var_os("SERVICENOW_BROWSER");
+    if cfg!(target_os = "windows") {
+        return Ok(BrowserBackend::WindowsBridge(preference));
+    }
+    if !is_wsl() {
+        return find_native_browser(preference.as_deref()).map(BrowserBackend::Native);
+    }
+    select_wsl_browser_backend(preference)
+}
+
+fn select_wsl_browser_backend(preference: Option<OsString>) -> Result<BrowserBackend, ApiError> {
+    select_wsl_browser_backend_with(preference, find_native_browser)
+}
+
+fn select_wsl_browser_backend_with(
+    preference: Option<OsString>,
+    find_native: impl FnOnce(Option<&OsStr>) -> Result<PathBuf, ApiError>,
+) -> Result<BrowserBackend, ApiError> {
+    if preference
+        .as_deref()
+        .is_some_and(looks_like_windows_browser_preference)
+    {
+        return Ok(BrowserBackend::WindowsBridge(preference));
+    }
+    match find_native(preference.as_deref()) {
+        Ok(browser) => Ok(BrowserBackend::Native(browser)),
+        Err(_error)
+            if preference.is_none()
+                || preference
+                    .as_deref()
+                    .and_then(BrowserAlias::parse)
+                    .is_some() =>
+        {
+            Ok(BrowserBackend::WindowsBridge(preference))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn find_native_browser(preference: Option<&OsStr>) -> Result<PathBuf, ApiError> {
+    if let Some(preference) = preference {
+        if let Some(alias) = BrowserAlias::parse(preference) {
+            let Some(alias) = alias.native_variant() else {
+                return Err(ApiError::InvalidInput(format!(
+                    "SERVICENOW_BROWSER={} selects a Windows browser and can only be used on Windows or WSL",
+                    preference.to_string_lossy()
+                )));
+            };
+            return find_native_browser_alias(alias).ok_or_else(|| {
+                ApiError::InvalidInput(format!(
+                    "SERVICENOW_BROWSER={} was requested, but no matching browser is installed; use chrome, edge, chromium, windows-chrome, windows-edge, or an executable path",
+                    preference.to_string_lossy()
+                ))
+            });
+        }
+        return resolve_program(Path::new(preference)).ok_or_else(|| {
             ApiError::InvalidInput(format!(
-                "SERVICENOW_BROWSER does not identify an executable: {}",
-                Path::new(&browser).display()
+                "SERVICENOW_BROWSER does not identify an executable or friendly browser name: {}",
+                Path::new(preference).display()
             ))
         });
     }
 
+    find_native_browser_alias(BrowserAlias::Auto).ok_or_else(|| {
+        ApiError::InvalidInput(
+            "browser sign-in needs Chrome, Edge, or Chromium; install one or set SERVICENOW_BROWSER to chrome, edge, chromium, or an executable path"
+                .into(),
+        )
+    })
+}
+
+fn find_native_browser_alias(alias: BrowserAlias) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     let absolute = [
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        (
+            BrowserAlias::Chrome,
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ),
+        (
+            BrowserAlias::Edge,
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ),
+        (
+            BrowserAlias::Chromium,
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ),
     ];
     #[cfg(not(target_os = "macos"))]
-    let absolute: [&str; 0] = [];
-    for candidate in absolute {
-        if let Some(path) = resolve_program(Path::new(candidate)) {
-            return Ok(path);
+    let absolute: [(BrowserAlias, &str); 0] = [];
+    for (kind, candidate) in absolute {
+        if (matches!(alias, BrowserAlias::Auto) || alias == kind)
+            && let Some(path) = resolve_program(Path::new(candidate))
+        {
+            return Some(path);
         }
     }
-    for candidate in [
-        "google-chrome",
-        "google-chrome-stable",
-        "microsoft-edge",
-        "microsoft-edge-stable",
-        "chromium",
-        "chromium-browser",
-    ] {
-        if let Some(path) = find_in_path(candidate) {
-            return Ok(path);
+
+    let candidates: &[&str] = match alias {
+        BrowserAlias::Auto => &[
+            "google-chrome",
+            "google-chrome-stable",
+            "microsoft-edge",
+            "microsoft-edge-stable",
+            "chromium",
+            "chromium-browser",
+        ],
+        BrowserAlias::Chrome => &["google-chrome", "google-chrome-stable", "chrome"],
+        BrowserAlias::Edge => &["microsoft-edge", "microsoft-edge-stable", "msedge"],
+        BrowserAlias::Chromium => &["chromium", "chromium-browser"],
+        BrowserAlias::WindowsChrome | BrowserAlias::WindowsEdge | BrowserAlias::WindowsChromium => {
+            return None;
         }
-    }
-    Err(ApiError::InvalidInput(
-        "browser sign-in needs Chrome, Edge, or Chromium; install one or set SERVICENOW_BROWSER to its executable"
-            .into(),
-    ))
+    };
+    candidates.iter().find_map(find_in_path)
 }
 
 fn resolve_program(candidate: &Path) -> Option<PathBuf> {
@@ -637,7 +756,7 @@ fn resolve_program(candidate: &Path) -> Option<PathBuf> {
     }
 }
 
-fn find_in_path(candidate: impl AsRef<std::ffi::OsStr>) -> Option<PathBuf> {
+fn find_in_path(candidate: impl AsRef<OsStr>) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|path| path.join(candidate.as_ref()))
@@ -645,16 +764,35 @@ fn find_in_path(candidate: impl AsRef<std::ffi::OsStr>) -> Option<PathBuf> {
     })
 }
 
-fn uses_windows_browser_bridge() -> bool {
-    cfg!(target_os = "windows")
-        || (cfg!(target_os = "linux")
-            && (std::env::var_os("WSL_INTEROP").is_some()
-                || std::fs::read_to_string("/proc/sys/kernel/osrelease")
-                    .is_ok_and(|value| value.to_ascii_lowercase().contains("microsoft"))))
+fn is_wsl() -> bool {
+    cfg!(target_os = "linux")
+        && (std::env::var_os("WSL_INTEROP").is_some()
+            || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .is_ok_and(|value| value.to_ascii_lowercase().contains("microsoft")))
+}
+
+fn looks_like_windows_browser_preference(preference: &OsStr) -> bool {
+    if matches!(
+        BrowserAlias::parse(preference),
+        Some(
+            BrowserAlias::WindowsChrome | BrowserAlias::WindowsEdge | BrowserAlias::WindowsChromium
+        )
+    ) {
+        return true;
+    }
+    let value = preference.to_string_lossy();
+    let bytes = value.as_bytes();
+    value.to_ascii_lowercase().ends_with(".exe")
+        || value.starts_with(r"\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
 }
 
 async fn windows_browser_cookie(
     site_url: &str,
+    browser_override: Option<&OsStr>,
     progress: &mut ProgressReporter<'_>,
 ) -> Result<BrowserSession, ApiError> {
     let powershell = ["powershell.exe", "pwsh.exe"]
@@ -666,9 +804,7 @@ async fn windows_browser_cookie(
                     .into(),
             )
         })?;
-    let browser_override = std::env::var_os("SERVICENOW_BROWSER");
-    let bridge = render_windows_bridge(site_url, browser_override.as_deref());
-    progress.report(BrowserProgress::StartingPrivateBrowser);
+    let bridge = render_windows_bridge(site_url, browser_override);
     let mut child = tokio::process::Command::new(powershell)
         .args(POWERSHELL_ARGS)
         .stdin(Stdio::piped())
@@ -949,20 +1085,75 @@ $origin = $instance.GetLeftPart([UriPartial]::Authority)
 $loginUrl = "$origin/nav_to.do?uri=incident_list.do"
 $apiUrl = "$origin/api/now/table/sys_user?sysparm_query=sys_id%3Djavascript%3Ags.getUserID()&sysparm_fields=sys_id%2Cuser_name%2Cname&sysparm_limit=1"
 $userTokenExpression = ConvertFrom-HexUtf8 '__USER_TOKEN_EXPRESSION_HEX__'
-$browser = ConvertFrom-HexUtf8 '__BROWSER_HEX__'
-if (-not $browser) { $browser = $env:SERVICENOW_BROWSER }
-if (-not $browser -or -not (Test-Path -LiteralPath $browser)) {
-    $candidates = @(
-        "$env:PROGRAMFILES\Microsoft\Edge\Application\msedge.exe",
-        "${env:PROGRAMFILES(X86)}\Microsoft\Edge\Application\msedge.exe",
-        "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
-        "$env:PROGRAMFILES\Google\Chrome\Application\chrome.exe",
-        "${env:PROGRAMFILES(X86)}\Google\Chrome\Application\chrome.exe",
-        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-    )
-    $browser = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+$browserPreference = ConvertFrom-HexUtf8 '__BROWSER_HEX__'
+if (-not $browserPreference) { $browserPreference = $env:SERVICENOW_BROWSER }
+$browser = $null
+$browserKind = $null
+$browserName = $null
+if ($browserPreference -and (Test-Path -LiteralPath $browserPreference)) {
+    $browser = $browserPreference
+    if ($browser -match '(?i)edge') {
+        $browserKind = 'edge'
+        $browserName = 'Microsoft Edge'
+    } elseif ($browser -match '(?i)chromium') {
+        $browserKind = 'chromium'
+        $browserName = 'Chromium'
+    } else {
+        $browserKind = 'chrome'
+        $browserName = 'Google Chrome'
+    }
 }
-if (-not $browser) { throw 'Chrome or Edge was not found on Windows. Set SERVICENOW_BROWSER to its Windows executable path.' }
+if (-not $browser) {
+    $requestedBrowser = if ($browserPreference) { $browserPreference.Trim().ToLowerInvariant() } else { 'auto' }
+    switch -Regex ($requestedBrowser) {
+        '^(auto)?$' { $candidateKinds = @('edge', 'chrome', 'chromium'); break }
+        '^(edge|msedge|microsoft-edge|windows-edge)$' { $candidateKinds = @('edge'); break }
+        '^(chrome|google-chrome|windows-chrome)$' { $candidateKinds = @('chrome'); break }
+        '^(chromium|windows-chromium)$' { $candidateKinds = @('chromium'); break }
+        default { throw "SERVICENOW_BROWSER '$browserPreference' is not a Windows browser path or friendly name. Use chrome, edge, chromium, windows-chrome, or windows-edge." }
+    }
+    $candidates = foreach ($kind in $candidateKinds) {
+        if ($kind -eq 'edge') {
+            [PSCustomObject]@{ Path = "$env:PROGRAMFILES\Microsoft\Edge\Application\msedge.exe"; Kind = 'edge'; Name = 'Microsoft Edge' }
+            [PSCustomObject]@{ Path = "${env:PROGRAMFILES(X86)}\Microsoft\Edge\Application\msedge.exe"; Kind = 'edge'; Name = 'Microsoft Edge' }
+            [PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"; Kind = 'edge'; Name = 'Microsoft Edge' }
+        } elseif ($kind -eq 'chrome') {
+            [PSCustomObject]@{ Path = "$env:PROGRAMFILES\Google\Chrome\Application\chrome.exe"; Kind = 'chrome'; Name = 'Google Chrome' }
+            [PSCustomObject]@{ Path = "${env:PROGRAMFILES(X86)}\Google\Chrome\Application\chrome.exe"; Kind = 'chrome'; Name = 'Google Chrome' }
+            [PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"; Kind = 'chrome'; Name = 'Google Chrome' }
+        } else {
+            [PSCustomObject]@{ Path = "$env:PROGRAMFILES\Chromium\Application\chrome.exe"; Kind = 'chromium'; Name = 'Chromium' }
+            [PSCustomObject]@{ Path = "${env:PROGRAMFILES(X86)}\Chromium\Application\chrome.exe"; Kind = 'chromium'; Name = 'Chromium' }
+            [PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Chromium\Application\chrome.exe"; Kind = 'chromium'; Name = 'Chromium' }
+        }
+    }
+    $selection = $candidates | Where-Object { $_.Path -and (Test-Path -LiteralPath $_.Path) } | Select-Object -First 1
+    if ($selection) {
+        $browser = $selection.Path
+        $browserKind = $selection.Kind
+        $browserName = $selection.Name
+    }
+}
+if (-not $browser) { throw 'Chrome, Edge, or Chromium was not found on Windows. Set SERVICENOW_BROWSER to chrome, edge, chromium, or a Windows executable path.' }
+
+$policySubkey = if ($browserKind -eq 'edge') {
+    'SOFTWARE\Policies\Microsoft\Edge'
+} elseif ($browserKind -eq 'chromium') {
+    'SOFTWARE\Policies\Chromium'
+} else {
+    'SOFTWARE\Policies\Google\Chrome'
+}
+$remoteDebuggingBlocked = $false
+foreach ($registryRoot in @('HKLM:', 'HKCU:')) {
+    $policy = Get-ItemProperty -LiteralPath ($registryRoot + '\' + $policySubkey) -Name 'RemoteDebuggingAllowed' -ErrorAction SilentlyContinue
+    if ($policy -and $policy.PSObject.Properties['RemoteDebuggingAllowed'] -and [int]$policy.RemoteDebuggingAllowed -eq 0) {
+        $remoteDebuggingBlocked = $true
+        break
+    }
+}
+if ($remoteDebuggingBlocked) {
+    throw "$browserName browser sign-in is blocked by the managed RemoteDebuggingAllowed policy. Install Chrome, Edge, or Chromium inside WSL, or set SERVICENOW_BROWSER to another installed browser."
+}
 
 $profile = Join-Path $env:TEMP ("servicenow-cli-browser-" + [Guid]::NewGuid().ToString('N'))
 $process = $null
@@ -1002,7 +1193,7 @@ try {
     }
     $quotedProfile = '"' + $profile + '"'
     $quotedUrl = '"' + $loginUrl + '"'
-    $privateMode = if ((Split-Path -Leaf $browser) -match '(?i)msedge') { '--inprivate' } else { '--incognito' }
+    $privateMode = if ($browserKind -eq 'edge') { '--inprivate' } else { '--incognito' }
     $arguments = "--remote-debugging-port=$debugPort --remote-debugging-address=127.0.0.1 --user-data-dir=$quotedProfile --no-first-run --no-default-browser-check --disable-sync $privateMode --new-window $quotedUrl"
     Write-Stage 'starting-private-browser'
     $process = Start-Process -FilePath $browser -ArgumentList $arguments -PassThru
@@ -1172,6 +1363,15 @@ mod tests {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__INSTANCE_HEX__"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__USER_TOKEN_EXPRESSION_HEX__"));
         assert!(!WINDOWS_BROWSER_BRIDGE.contains("login.microsoftonline.com"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("SOFTWARE\\Policies\\Microsoft\\Edge"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("SOFTWARE\\Policies\\Google\\Chrome"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("RemoteDebuggingAllowed"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("managed RemoteDebuggingAllowed policy"));
+        let policy_check = WINDOWS_BROWSER_BRIDGE
+            .find("$remoteDebuggingBlocked")
+            .unwrap();
+        let browser_start = WINDOWS_BROWSER_BRIDGE.find("Start-Process").unwrap();
+        assert!(policy_check < browser_start);
         assert_eq!(
             powershell_hex(b"https://company.service-now.com"),
             "68747470733a2f2f636f6d70616e792e736572766963652d6e6f772e636f6d"
@@ -1198,6 +1398,65 @@ mod tests {
             )),
             "--inprivate"
         );
+    }
+
+    #[test]
+    fn friendly_browser_names_are_case_insensitive_and_platform_aware() {
+        assert_eq!(
+            BrowserAlias::parse(OsStr::new("chrome")),
+            Some(BrowserAlias::Chrome)
+        );
+        assert_eq!(
+            BrowserAlias::parse(OsStr::new("EDGE")),
+            Some(BrowserAlias::Edge)
+        );
+        assert_eq!(
+            BrowserAlias::parse(OsStr::new(" Chromium ")),
+            Some(BrowserAlias::Chromium)
+        );
+        assert_eq!(
+            BrowserAlias::parse(OsStr::new("windows-edge")),
+            Some(BrowserAlias::WindowsEdge)
+        );
+        assert_eq!(BrowserAlias::parse(OsStr::new("firefox")), None);
+        assert!(looks_like_windows_browser_preference(OsStr::new(
+            "windows-chrome"
+        )));
+        assert!(looks_like_windows_browser_preference(OsStr::new(
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        )));
+        assert!(!looks_like_windows_browser_preference(OsStr::new(
+            "/usr/bin/google-chrome"
+        )));
+    }
+
+    #[test]
+    fn wsl_prefers_a_native_linux_browser_and_falls_back_to_windows() {
+        let native =
+            select_wsl_browser_backend_with(None, |_| Ok(PathBuf::from("/usr/bin/chromium")))
+                .unwrap();
+        assert!(
+            matches!(native, BrowserBackend::Native(path) if path == Path::new("/usr/bin/chromium"))
+        );
+
+        let fallback = select_wsl_browser_backend_with(Some(OsString::from("chrome")), |_| {
+            Err(ApiError::InvalidInput("not installed in WSL".into()))
+        })
+        .unwrap();
+        assert!(matches!(
+            fallback,
+            BrowserBackend::WindowsBridge(Some(value)) if value == OsStr::new("chrome")
+        ));
+
+        let forced_windows =
+            select_wsl_browser_backend_with(Some(OsString::from("windows-edge")), |_| {
+                panic!("a forced Windows alias must not probe Linux browsers")
+            })
+            .unwrap();
+        assert!(matches!(
+            forced_windows,
+            BrowserBackend::WindowsBridge(Some(value)) if value == OsStr::new("windows-edge")
+        ));
     }
 
     #[test]
@@ -1480,7 +1739,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens an installed Chromium browser"]
     async fn installed_browser_completes_a_local_session_handoff() {
-        if find_native_browser().is_err() {
+        if find_native_browser(std::env::var_os("SERVICENOW_BROWSER").as_deref()).is_err() {
             return;
         }
         let instance = MockServer::start().await;

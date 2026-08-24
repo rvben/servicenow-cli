@@ -248,6 +248,7 @@ profile. Environment variables are useful for ephemeral automation:
 | `SERVICENOW_USER_TOKEN` | Matching browser anti-CSRF token for write requests |
 | `SERVICENOW_TOKEN` | Bearer/OAuth access token |
 | `SERVICENOW_AUTH_TYPE` | `browser`, `basic`, `bearer`, or `oauth` |
+| `SERVICENOW_BROWSER` | `chrome`, `edge`, `chromium`, a platform executable path, or a `windows-*` WSL override |
 | `SERVICENOW_PROFILE` | Named profile |
 | `SERVICENOW_READ_ONLY` | Block all actual mutations when true |
 | `SERVICENOW_CACHE_DIR` | Override the metadata cache root |

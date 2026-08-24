@@ -61,11 +61,31 @@ avoids accidentally repeating a write whose outcome is uncertain.
 
 ## WSL2 and headless Linux
 
-On WSL2, browser sign-in launches Windows Edge or Chrome through PowerShell
-interop and performs the cookie handoff entirely on the Windows loopback
-interface. It works with both NAT and mirrored WSL networking and does not open
-a debugging port to the LAN. Set `SERVICENOW_BROWSER` to a Windows executable
-path if automatic discovery is blocked by corporate browser installation rules.
+On WSL2, browser sign-in prefers Chrome, Edge, or Chromium installed inside the
+Linux distribution. With WSLg this avoids Windows interop entirely. If no Linux
+browser is installed, the CLI falls back to Windows Edge or Chrome through
+PowerShell and performs the cookie handoff entirely on the Windows loopback
+interface. The fallback works with both NAT and mirrored WSL networking and does
+not open a debugging port to the LAN.
+
+`SERVICENOW_BROWSER` accepts an executable path or a friendly name:
+
+```sh
+# Prefer the matching Linux browser on WSL, then use its Windows counterpart.
+SERVICENOW_BROWSER=chrome servicenow auth login work --method browser
+SERVICENOW_BROWSER=edge servicenow auth login work --method browser
+SERVICENOW_BROWSER=chromium servicenow auth login work --method browser
+
+# Explicitly use the Windows bridge.
+SERVICENOW_BROWSER=windows-edge servicenow auth login work --method browser
+SERVICENOW_BROWSER=windows-chrome servicenow auth login work --method browser
+```
+
+For the Windows fallback, the CLI checks the managed
+[`RemoteDebuggingAllowed` Edge policy](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies/remotedebuggingallowed)
+or [Chrome policy](https://chromeenterprise.google/policies/remote-debugging-allowed/)
+before opening the browser. A disabled policy produces an immediate actionable
+error instead of waiting for the browser channel to time out.
 
 To see where an in-progress handoff is waiting, enable safe verbose diagnostics:
 
