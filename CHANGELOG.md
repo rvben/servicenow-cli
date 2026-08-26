@@ -2,6 +2,28 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## 0.4.0 — 2026-08-26
+
+### Added
+
+- A read-only Ratatui interface, launched with `servicenow tui`, now browses
+  incidents and arbitrary ServiceNow tables with keyboard navigation, encoded
+  queries, pagination, responsive layouts, and complete record inspection.
+- Incident inspection now provides Overview, Activity, Attachments, and SLA
+  views. Related data loads on demand, reports ACL failures independently, and
+  discloses when a view contains the latest 100 of additional records.
+
+### Changed
+
+- The guided onboarding entry point is now consistently named `servicenow init`
+  across help, schema output, documentation, tests, and recovery guidance.
+
+### Safety
+
+- The TUI requires an interactive terminal, performs no ServiceNow writes,
+  redacts secret-bearing field names, sanitizes server-provided control
+  characters, and preserves structural focus cues when color is disabled.
+
 ## 0.3.14 — 2026-08-24
 
 ### Changed
