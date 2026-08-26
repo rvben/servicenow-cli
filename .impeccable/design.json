@@ -1,0 +1,213 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-26T07:12:33Z",
+  "title": "Design System: ServiceNow CLI TUI",
+  "extensions": {
+    "colorMeta": {
+      "primary-mint": {
+        "role": "primary",
+        "displayName": "Index Mint",
+        "canonical": "#65f0ca",
+        "tonalRamp": ["oklch(15% 0.1331 172.2)", "oklch(25% 0.1331 172.2)", "oklch(35% 0.1331 172.2)", "oklch(45% 0.1331 172.2)", "oklch(55% 0.1331 172.2)", "oklch(65% 0.1331 172.2)", "oklch(80% 0.1331 172.2)", "oklch(95% 0.1331 172.2)"]
+      },
+      "secondary-amber": {
+        "role": "secondary",
+        "displayName": "Key Amber",
+        "canonical": "#f6b752",
+        "tonalRamp": ["oklch(15% 0.1370 76.4)", "oklch(25% 0.1370 76.4)", "oklch(35% 0.1370 76.4)", "oklch(45% 0.1370 76.4)", "oklch(55% 0.1370 76.4)", "oklch(65% 0.1370 76.4)", "oklch(80% 0.1370 76.4)", "oklch(95% 0.1370 76.4)"]
+      },
+      "tertiary-coral": {
+        "role": "tertiary",
+        "displayName": "Failure Coral",
+        "canonical": "#ff7e77",
+        "tonalRamp": ["oklch(15% 0.1585 24.8)", "oklch(25% 0.1585 24.8)", "oklch(35% 0.1585 24.8)", "oklch(45% 0.1585 24.8)", "oklch(55% 0.1585 24.8)", "oklch(65% 0.1585 24.8)", "oklch(80% 0.1585 24.8)", "oklch(95% 0.1585 24.8)"]
+      },
+      "midnight-canvas": {
+        "role": "neutral",
+        "displayName": "Midnight Canvas",
+        "canonical": "#080e12",
+        "tonalRamp": ["oklch(15% 0.0129 237.2)", "oklch(25% 0.0129 237.2)", "oklch(35% 0.0129 237.2)", "oklch(45% 0.0129 237.2)", "oklch(55% 0.0129 237.2)", "oklch(65% 0.0129 237.2)", "oklch(80% 0.0129 237.2)", "oklch(95% 0.0129 237.2)"]
+      },
+      "selection-ink": {
+        "role": "neutral",
+        "displayName": "Selection Ink",
+        "canonical": "#04181b",
+        "tonalRamp": ["oklch(15% 0.0274 208.0)", "oklch(25% 0.0274 208.0)", "oklch(35% 0.0274 208.0)", "oklch(45% 0.0274 208.0)", "oklch(55% 0.0274 208.0)", "oklch(65% 0.0274 208.0)", "oklch(80% 0.0274 208.0)", "oklch(95% 0.0274 208.0)"]
+      },
+      "header-surface": {
+        "role": "neutral",
+        "displayName": "Header Surface",
+        "canonical": "#0f1b20",
+        "tonalRamp": ["oklch(15% 0.0197 226.0)", "oklch(25% 0.0197 226.0)", "oklch(35% 0.0197 226.0)", "oklch(45% 0.0197 226.0)", "oklch(55% 0.0197 226.0)", "oklch(65% 0.0197 226.0)", "oklch(80% 0.0197 226.0)", "oklch(95% 0.0197 226.0)"]
+      },
+      "hairline-slate": {
+        "role": "neutral",
+        "displayName": "Hairline Slate",
+        "canonical": "#354a4d",
+        "tonalRamp": ["oklch(15% 0.0266 207.1)", "oklch(25% 0.0266 207.1)", "oklch(35% 0.0266 207.1)", "oklch(45% 0.0266 207.1)", "oklch(55% 0.0266 207.1)", "oklch(65% 0.0266 207.1)", "oklch(80% 0.0266 207.1)", "oklch(95% 0.0266 207.1)"]
+      },
+      "muted-slate": {
+        "role": "neutral",
+        "displayName": "Muted Slate",
+        "canonical": "#7b9191",
+        "tonalRamp": ["oklch(15% 0.0251 196.5)", "oklch(25% 0.0251 196.5)", "oklch(35% 0.0251 196.5)", "oklch(45% 0.0251 196.5)", "oklch(55% 0.0251 196.5)", "oklch(65% 0.0251 196.5)", "oklch(80% 0.0251 196.5)", "oklch(95% 0.0251 196.5)"]
+      },
+      "header-text": {
+        "role": "neutral",
+        "displayName": "Header Text",
+        "canonical": "#9ab1ae",
+        "tonalRamp": ["oklch(15% 0.0258 187.1)", "oklch(25% 0.0258 187.1)", "oklch(35% 0.0258 187.1)", "oklch(45% 0.0258 187.1)", "oklch(55% 0.0258 187.1)", "oklch(65% 0.0258 187.1)", "oklch(80% 0.0258 187.1)", "oklch(95% 0.0258 187.1)"]
+      },
+      "body-text": {
+        "role": "neutral",
+        "displayName": "Body Text",
+        "canonical": "#d3dcda",
+        "tonalRamp": ["oklch(15% 0.0101 181.4)", "oklch(25% 0.0101 181.4)", "oklch(35% 0.0101 181.4)", "oklch(45% 0.0101 181.4)", "oklch(55% 0.0101 181.4)", "oklch(65% 0.0101 181.4)", "oklch(80% 0.0101 181.4)", "oklch(95% 0.0101 181.4)"]
+      },
+      "high-text": {
+        "role": "neutral",
+        "displayName": "High Text",
+        "canonical": "#eef6f2",
+        "tonalRamp": ["oklch(15% 0.0100 164.9)", "oklch(25% 0.0100 164.9)", "oklch(35% 0.0100 164.9)", "oklch(45% 0.0100 164.9)", "oklch(55% 0.0100 164.9)", "oklch(65% 0.0100 164.9)", "oklch(80% 0.0100 164.9)", "oklch(95% 0.0100 164.9)"]
+      }
+    },
+    "typographyMeta": {
+      "body": { "displayName": "Terminal Body", "purpose": "Record values, instructions, descriptions, and notices in the host terminal face." },
+      "title": { "displayName": "Terminal Title", "purpose": "Bold product, sheet, and state headings." },
+      "label": { "displayName": "Ledger Label", "purpose": "Bold structural labels, field names, column headings, incident tabs, and key glyphs." }
+    },
+    "breakpoints": [
+      { "name": "minimum-width", "value": "50 columns" },
+      { "name": "minimum-height", "value": "12 rows" },
+      { "name": "header-instance", "value": "80 columns" },
+      { "name": "footer-query", "value": "90 columns" },
+      { "name": "wide-split", "value": "104 columns" },
+      { "name": "ledger-columns-3", "value": "58 columns of ledger width" },
+      { "name": "ledger-columns-4", "value": "82 columns of ledger width" },
+      { "name": "ledger-columns-6", "value": "112 columns of ledger width" },
+      { "name": "incident-files-label", "value": "72 columns of workspace width" },
+      { "name": "incident-tab-counts", "value": "78 columns of workspace width" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Brand Stamp",
+      "kind": "custom",
+      "refersTo": "brand-stamp",
+      "description": "Mint-filled product identity at the start of the fixed header.",
+      "html": "<span class=\"ds-brand-stamp\"> SERVICENOW </span><strong class=\"ds-brand-title\"> OPERATIONS LEDGER</strong>",
+      "css": ".ds-brand-stamp,.ds-brand-title{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:700}.ds-brand-stamp{background:#65f0ca;color:#04181b}.ds-brand-title{background:#080e12;color:#eef6f2}"
+    },
+    {
+      "name": "Ledger Column Header",
+      "kind": "nav",
+      "refersTo": "ledger-column-header",
+      "description": "A dense uppercase index heading on the system's only tonal panel fill.",
+      "html": "<div class=\"ds-ledger-header\"><span>NUMBER</span><span>PRIORITY</span><span>DESCRIPTION</span></div>",
+      "css": ".ds-ledger-header{display:grid;grid-template-columns:2fr 2fr 4fr;gap:1ch;background:#0f1b20;color:#9ab1ae;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:700;white-space:nowrap}"
+    },
+    {
+      "name": "Selected Ledger Row",
+      "kind": "custom",
+      "refersTo": "ledger-row-selected",
+      "description": "The single punched active record, distinguished by both a leading glyph and mint inversion.",
+      "html": "<div class=\"ds-ledger-selection\" tabindex=\"0\"><span>▌INC0010001</span><span>1 - Critical</span><span>Mail is unavailable</span></div>",
+      "css": ".ds-ledger-selection{display:grid;grid-template-columns:2fr 2fr 4fr;gap:1ch;background:#65f0ca;color:#04181b;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:700;white-space:nowrap;outline:none}.ds-ledger-selection:focus-visible{outline:1px solid #65f0ca;outline-offset:1px}"
+    },
+    {
+      "name": "Record Sheet",
+      "kind": "card",
+      "refersTo": "record-sheet",
+      "description": "Square generic-table all-fields inspection surface with an active mint hairline and ordered field ledger.",
+      "html": "<section class=\"ds-record-sheet\" tabindex=\"0\"><strong class=\"ds-sheet-title\">RECORD SHEET · INC0010001 · ESC BACK</strong><p class=\"ds-sheet-meta\">ALL FIELDS <span>· 8 fields · scroll 0 · j/k or PgUp/PgDn · g/G edges</span></p><p><b>DESCRIPTION&nbsp;&nbsp;</b>Mail is unavailable</p><p><b>STATE&nbsp;&nbsp;</b>In Progress</p></section>",
+      "css": ".ds-record-sheet{border:1px solid #65f0ca;border-radius:0;background:#080e12;color:#d3dcda;padding:1ch;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none}.ds-record-sheet:focus-visible{border-color:#65f0ca}.ds-sheet-title,.ds-record-sheet b{color:#65f0ca;font-weight:700}.ds-sheet-meta{color:#f6b752;font-weight:700}.ds-sheet-meta span{color:#7b9191;font-weight:400}.ds-record-sheet p{margin:1em 0 0}"
+    },
+    {
+      "name": "Query Input Sheet",
+      "kind": "input",
+      "refersTo": "input-sheet",
+      "description": "A centered keyboard input sheet whose prompt and cursor remain visible as long values scroll.",
+      "html": "<label class=\"ds-input-sheet\"><strong>FILTER RECORDS · ENTER APPLY ESC CANCEL</strong><span>ServiceNow encoded query; blank clears</span><span class=\"ds-input-row\"><b>›</b><input value=\"active=true\" aria-label=\"ServiceNow encoded query\"></span></label>",
+      "css": ".ds-input-sheet{display:grid;gap:1em;border:1px solid #65f0ca;border-radius:0;background:#080e12;color:#d3dcda;padding:1ch;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.ds-input-sheet>strong{color:#eef6f2}.ds-input-sheet>span:not(.ds-input-row){color:#7b9191}.ds-input-row{display:flex;gap:1ch}.ds-input-row b{color:#f6b752}.ds-input-row input{min-width:0;flex:1;border:0;border-radius:0;outline:0;background:#080e12;color:#d3dcda;font-family:inherit;font-size:1em;font-weight:700}.ds-input-row input:focus-visible{outline:1px solid #65f0ca;outline-offset:1px}"
+    },
+    {
+      "name": "Keyboard Hint",
+      "kind": "chip",
+      "description": "An amber executable key paired with muted human-readable action copy.",
+      "html": "<span class=\"ds-key-hint\"><kbd>enter</kbd><span> inspect</span></span>",
+      "css": ".ds-key-hint{background:#080e12;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:nowrap}.ds-key-hint kbd{border:0;background:transparent;color:#f6b752;font-family:inherit;font-size:1em;font-weight:700}.ds-key-hint span{color:#7b9191}"
+    },
+    {
+      "name": "Load Failure",
+      "kind": "card",
+      "description": "A coral hairline recovery state that is unmistakably distinct from an empty result.",
+      "html": "<section class=\"ds-load-failure\"><strong>COULD NOT LOAD THE LEDGER</strong><p>ServiceNow rejected the query. Press r to retry.</p><p><b>r</b> retry&nbsp;&nbsp; <b>/</b> change query&nbsp;&nbsp; <b>t</b> change table</p></section>",
+      "css": ".ds-load-failure{border:1px solid #ff7e77;border-radius:0;background:#080e12;color:#d3dcda;padding:2ch;text-align:center;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.ds-load-failure>strong{color:#ff7e77}.ds-load-failure b{color:#f6b752}.ds-load-failure p{margin:1em 0 0}"
+    },
+    {
+      "name": "Incident Workspace",
+      "kind": "custom",
+      "refersTo": "incident-workspace",
+      "description": "The incident-only four-view sheet with redundant active-tab state and progressive related-data loading.",
+      "html": "<section class=\"ds-incident-workspace\" tabindex=\"0\"><header><strong>INCIDENT WORKSPACE&nbsp; INC0010001&nbsp; ·&nbsp; ESC BACK</strong><nav aria-label=\"Incident views\"><span class=\"ds-incident-tab ds-incident-tab-active\">▌1 OVERVIEW 42</span><span class=\"ds-incident-tab\"> 2 ACTIVITY 100+</span><span class=\"ds-incident-tab\"> 3 ATTACHMENTS 3</span><span class=\"ds-incident-tab\"> 4 SLAs 2</span></nav></header><div class=\"ds-incident-body\"><p><b>ALL FIELDS</b><span>&nbsp; ·&nbsp; 42 fields&nbsp; ·&nbsp; scroll 0&nbsp; ·&nbsp; Tab changes view</span></p><p><strong>DESCRIPTION&nbsp;&nbsp;</strong>Mail is unavailable</p></div></section>",
+      "css": ".ds-incident-workspace{border:1px solid #65f0ca;border-radius:0;background:#080e12;color:#d3dcda;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;outline:none}.ds-incident-workspace>header{padding:1ch;border-bottom:1px solid #354a4d}.ds-incident-workspace>header>strong{color:#65f0ca}.ds-incident-workspace nav{display:flex;gap:2ch;margin-top:1em;overflow:hidden;white-space:nowrap}.ds-incident-tab{color:#7b9191}.ds-incident-tab-active{color:#65f0ca;font-weight:700;text-decoration:underline}.ds-incident-body{padding:0 1ch}.ds-incident-body b{color:#f6b752}.ds-incident-body strong{color:#65f0ca}.ds-incident-body span{color:#7b9191}.ds-incident-workspace:focus-visible{outline:1px solid #65f0ca;outline-offset:1px}"
+    },
+    {
+      "name": "Degraded Incident Overview",
+      "kind": "custom",
+      "refersTo": "incident-workspace",
+      "description": "A recoverable Overview state that labels the ledger projection honestly when the complete record is unavailable.",
+      "html": "<section class=\"ds-overview-degraded\"><strong>COMPLETE RECORD UNAVAILABLE</strong><p>Required field ACL missing</p><p><b>r</b><span> retry the full record&nbsp; ·&nbsp; Showing the ledger's index projection.</span></p><p><em>INDEX FIELDS ONLY</em><span>&nbsp; ·&nbsp; 8 fields&nbsp; ·&nbsp; scroll 0&nbsp; ·&nbsp; Tab changes view</span></p></section>",
+      "css": ".ds-overview-degraded{border:1px solid #65f0ca;border-radius:0;background:#080e12;color:#d3dcda;padding:1ch;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.ds-overview-degraded>strong{color:#ff7e77}.ds-overview-degraded b,.ds-overview-degraded em{color:#f6b752;font-style:normal;font-weight:700}.ds-overview-degraded span{color:#7b9191}.ds-overview-degraded p{margin:1em 0 0}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Operations Ledger",
+    "overview": "The TUI treats live ServiceNow data as an operator's ledger: located, inspectable, dense, and calm. Midnight ink holds the field while mint marks identity, indexed fields, success, and the one active record. Amber is reserved for executable keys and attention; coral names failure. This is an operational instrument, not a miniature browser dashboard.\n\nInformation density is intentional. One-row records, uppercase ledger labels, square hairline enclosures, and persistent location and status bands make the screen read like a precise terminal artifact. Detail is progressive: a wide terminal shows an index preview beside the ledger; generic records unfold into an all-fields sheet, while incidents unfold into a four-view workspace that loads related context only when requested.\n\nThe implementation follows the direction contract in src/tui.rs (operations-ledger direction, seed 221c1ea6). Its visual semantics remain meaningful without color through borders, labels, copy, position, and the punched ▌ selection marker.",
+    "keyCharacteristics": [
+      "Midnight terminal canvas with restrained, role-specific accents.",
+      "Dense one-row record indexing and visibly punched selection.",
+      "Square sheets and single-cell hairline rules instead of card chrome.",
+      "Wide split view that collapses to a ledger-first compact view.",
+      "Full record, help, and input sheets that preserve keyboard context.",
+      "Incident detail organized as Overview, Activity, Attachments, and SLAs without weakening generic-table browsing.",
+      "Explicit loading, failure, empty, and undersized-terminal states.",
+      "Keyboard-only operation with a complete no-color fallback."
+    ],
+    "rules": [
+      { "name": "The One Active Mark Rule", "body": "Mint may fill the selected ledger row and the brand stamp; elsewhere it stays a foreground or hairline. Do not create competing mint panels.", "section": "colors" },
+      { "name": "The Semantic Accent Rule", "body": "Amber always denotes a key or prompt, coral always denotes failure, and neither substitutes for generic emphasis.", "section": "colors" },
+      { "name": "The Structural Fallback Rule", "body": "When color is disabled, foreground and background colors resolve to terminal defaults while structural glyphs, bold weight, underline, labels, and recovery copy remain. Selection, focus, state, and recovery must never depend on hue.", "section": "colors" },
+      { "name": "The Terminal Owns the Typeface Rule", "body": "Do not prescribe a downloaded font, a pixel size, or proportional text. The host monospace grid is part of the product contract.", "section": "typography" },
+      { "name": "The Ledger Case Rule", "body": "Uppercase is for short structural labels and decisive state headings, never for record values or explanatory prose.", "section": "typography" },
+      { "name": "The Ledger-First Rule", "body": "Responsive reduction removes preview detail and low-priority columns before it compromises the record index.", "section": "layout" },
+      { "name": "The Fixed Chrome Rule", "body": "Preserve the 3-row header and footer bands; give the remaining vertical space to records and sheets.", "section": "layout" },
+      { "name": "The Hairline Depth Rule", "body": "A single terminal-cell rule is the only separator at rest; active modality changes its color, never its thickness.", "section": "elevation" },
+      { "name": "The Square Instrument Rule", "body": "Keep every enclosure flush, rectangular, and one cell thick; rounded web-control silhouettes do not belong in this system.", "section": "shapes" },
+      { "name": "The Active Tab Redundancy Rule", "body": "Every active incident tab carries a structural mark and underline; mint reinforces that state but never owns it alone.", "section": "components" },
+      { "name": "The Lazy View Rule", "body": "Load related views only when entered, preserve ready siblings, and make r retry the current view in place.", "section": "components" },
+      { "name": "The Hundred-Plus Rule", "body": "Never present a truncated related view as complete: cap rendering at the latest 100 and disclose the sentinel as 100+ and more available.", "section": "components" }
+    ],
+    "dos": [
+      "Do preserve the operations-ledger hierarchy: location, index, contextual detail, then status and keys.",
+      "Do keep mint for active/indexed/success state, amber for keys, and coral for errors.",
+      "Do show focus and availability with glyphs, labels, position, and copy in addition to color.",
+      "Do keep record rows at one terminal row and disclose fewer columns as width contracts.",
+      "Do make loading, error, empty, no-selection, and undersized-terminal states visually and verbally distinct.",
+      "Do retain the operator's context when opening and closing sheets, including returning help to an expanded record sheet.",
+      "Do keep incident loading, failure, empty, and retry state local to each view; reset scroll on view changes and calculate it from the active view's wrapped content.",
+      "Do disclose the 100-item display boundary with both 100+ and latest-100 language whenever the sentinel is present.",
+      "Do sanitize terminal control characters and redact sensitive field values before rendering them."
+    ],
+    "donts": [
+      "Don't turn the TUI into a miniature web dashboard with rounded cards, sidebars, charts, shadows, gradients, or decorative iconography.",
+      "Don't use a filled accent surface anywhere except the brand stamp and selected record row.",
+      "Don't make color the only signal for selection, failure, disabled pagination, focus, or success.",
+      "Don't preserve secondary detail at the expense of the ledger on compact terminals.",
+      "Don't turn incident tabs into decorative color-only navigation or report a truncated related view as a complete total.",
+      "Don't hide essential actions behind mouse interaction or undocumented shortcuts.",
+      "Don't let long notices, queries, input, or record values displace fixed chrome and recovery guidance.",
+      "Don't render secrets, raw control characters, or credential-bearing configuration."
+    ]
+  }
+}
