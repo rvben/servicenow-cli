@@ -2,6 +2,19 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.0](https://github.com/rvben/servicenow-cli/compare/v0.3.14...v0.4.0) - 2026-08-26
+
+### Added
+
+- **tui**: add interactive ServiceNow browser ([ebcf1e3](https://github.com/rvben/servicenow-cli/commit/ebcf1e3e019c970fcbca72bac9cfa80c494518c1))
+- **cli**: standardize onboarding command ([1d39cf5](https://github.com/rvben/servicenow-cli/commit/1d39cf54362acd4aea72773cbd839a993320e0d5))
+
+### Fixed
+
+- **onboarding**: remove stale setup references ([6c8591c](https://github.com/rvben/servicenow-cli/commit/6c8591cb213b7e8a93adbbe60d348ad515a663fa))
+- **package**: include README in PyPI metadata ([aa49e1b](https://github.com/rvben/servicenow-cli/commit/aa49e1bf1cd19d027dfd154c38cdc38b45bdb3a9))
+- **ci**: install pinned Rust components ([ec4d639](https://github.com/rvben/servicenow-cli/commit/ec4d639549401e5921b078584d9008b921237ca7))
+
 ## 0.4.0 — 2026-08-26
 
 ### Added
