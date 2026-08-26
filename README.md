@@ -67,10 +67,46 @@ servicenow init work --instance company --insecure-storage
 servicenow doctor
 servicenow incidents mine
 servicenow incidents show INC0010042
+
+# Or stay in the terminal and browse interactively
+servicenow tui
 ```
 
 For browser SSO, OAuth, bearer-token, CI, migration, and production-profile guidance, see
 [Authentication and profiles](docs/authentication.md).
+
+## Interactive terminal browser
+
+Launch the read-only Ratatui interface on incidents, or start directly on any
+standard or custom table:
+
+```sh
+servicenow tui
+servicenow tui cmdb_ci
+servicenow tui change_request --query 'active=true^ORDERBYDESCsys_updated_on'
+```
+
+The ledger adapts to the terminal width: wide terminals keep the selected
+record's field sheet beside the index, while compact terminals open that sheet
+on demand. Use `↑`/`↓` or `j`/`k` to move, `enter` to inspect, `/` to apply an
+encoded query, `t` to change tables, `n`/`p` to page, and `?` for the complete
+keyboard map. Press `o` to hand the selected record off to the ServiceNow web
+interface.
+
+Incident inspection unfolds into four read-only views: **Overview** shows every
+readable field, **Activity** shows recent comments and work notes, **Attachments**
+lists file metadata, and **SLAs** shows task-SLA progress and breach state. Move
+between them with `tab`/`shift-tab` or jump directly with `1`–`4`; related views
+load only when opened, return up to 100 recent entries, and can be retried
+independently with `r`. Access remains subject to the active ServiceNow user's
+table and field ACLs.
+
+The first TUI release deliberately performs no ServiceNow writes. It reuses the
+active profile and credentials, keeps secrets out of the rendered state, honors
+`--no-color`, and refuses to start when stdin or stdout is not an interactive
+terminal. Fields whose names identify passwords, secrets, tokens, cookies,
+credentials, authorization values, or private/API keys are always shown as
+`[REDACTED]`.
 
 ## Incident workflows
 

@@ -44,6 +44,44 @@ fn auth_login_help_advertises_secret_free_verbose_progress() {
         ));
 }
 
+#[test]
+fn tui_help_describes_generic_read_only_browsing() {
+    let config_home = TempDir::new().unwrap();
+    command(&config_home)
+        .args(["tui", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Browse ServiceNow interactively in a read-only terminal interface",
+        ))
+        .stdout(predicate::str::contains("Table to open first"))
+        .stdout(predicate::str::contains("--page-size"));
+}
+
+#[test]
+fn tui_refuses_non_interactive_streams_before_loading_credentials() {
+    let config_home = TempDir::new().unwrap();
+    command(&config_home)
+        .arg("tui")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "the TUI requires an interactive terminal on stdin and stdout",
+        ));
+}
+
+#[test]
+fn tui_rejects_an_unbounded_page_size() {
+    let config_home = TempDir::new().unwrap();
+    command(&config_home)
+        .args(["tui", "--page-size", "4"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "page size must be between 5 and 200",
+        ));
+}
+
 fn authenticated_command(config_home: &TempDir, server: &MockServer) -> Command {
     let mut command = command(config_home);
     command

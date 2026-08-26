@@ -9,3 +9,4 @@ pub mod incident;
 pub mod metadata;
 pub mod output;
 pub mod record;
+pub mod tui;

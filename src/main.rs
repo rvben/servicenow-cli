@@ -128,6 +128,21 @@ enum Command {
     #[command(subcommand, visible_alias = "profiles")]
     Profile(ProfileCommand),
 
+    /// Browse ServiceNow interactively in a read-only terminal interface
+    Tui {
+        /// Table to open first
+        #[arg(default_value = "incident")]
+        table: String,
+
+        /// ServiceNow encoded query to apply
+        #[arg(short, long)]
+        query: Option<String>,
+
+        /// Records loaded per page
+        #[arg(long, default_value = "25", value_parser = parse_tui_page_size)]
+        page_size: usize,
+    },
+
     /// Work with incidents
     #[command(subcommand, visible_alias = "incident")]
     Incidents(IncidentsCommand),
@@ -642,6 +657,17 @@ enum ConfigCommand {
     Path,
 }
 
+fn parse_tui_page_size(value: &str) -> Result<usize, String> {
+    let page_size = value
+        .parse::<usize>()
+        .map_err(|_| "page size must be a whole number".to_string())?;
+    if (5..=200).contains(&page_size) {
+        Ok(page_size)
+    } else {
+        Err("page size must be between 5 and 200".into())
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -817,6 +843,13 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             clap_complete::generate(shell, &mut command, "servicenow", &mut std::io::stdout());
             return Ok(());
         }
+        Command::Tui { .. }
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() =>
+        {
+            return Err(ApiError::InvalidInput(
+                "the TUI requires an interactive terminal on stdin and stdout".into(),
+            ));
+        }
         Command::Config(ConfigCommand::Init) => {
             if output.json {
                 output.value(&init_document());
@@ -882,6 +915,23 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     )?;
 
     match cli.command {
+        Command::Tui {
+            table,
+            query,
+            page_size,
+        } => {
+            servicenow_cli::tui::run(
+                &client,
+                &config,
+                servicenow_cli::tui::TuiOptions {
+                    table,
+                    query,
+                    page_size,
+                    color: output.color,
+                },
+            )
+            .await?
+        }
         Command::Incidents(command) => run_incidents(command, &client, &config, &output).await?,
         Command::Attachments(command) => {
             run_attachments(command, &client, &config, &output).await?

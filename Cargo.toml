@@ -29,6 +29,7 @@ keyring = "4.1"
 mime_guess = "2"
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 open = "5.4"
+ratatui = "0.30.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query", "form", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
