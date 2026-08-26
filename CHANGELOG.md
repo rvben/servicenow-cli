@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.1](https://github.com/rvben/servicenow-cli/compare/v0.4.0...v0.4.1) - 2026-08-26
+
+### Added
+
+- **packaging**: add package-named launcher ([91ac1c4](https://github.com/rvben/servicenow-cli/commit/91ac1c4457dcb488f1a3503f78e6983ff302bd1f))
+
 ## [0.4.0](https://github.com/rvben/servicenow-cli/compare/v0.3.14...v0.4.0) - 2026-08-26
 
 ### Added
