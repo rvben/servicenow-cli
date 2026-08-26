@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.2](https://github.com/rvben/servicenow-cli/compare/v0.4.1...v0.4.2) - 2026-08-26
+
+### Added
+
+- **tui**: make authentication recoverable in place ([9f69501](https://github.com/rvben/servicenow-cli/commit/9f695017c2fcb85540f61468581ed43994c8c48a))
+
 ## [0.4.1](https://github.com/rvben/servicenow-cli/compare/v0.4.0...v0.4.1) - 2026-08-26
 
 ### Added
