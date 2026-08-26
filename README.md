@@ -55,14 +55,14 @@ cargo install --path .
 
 ```sh
 # Detects SSO and opens a private browser window; no OAuth app is required.
-servicenow setup work --instance company
+servicenow init work --instance company
 
 # Managed OAuth remains available when your organization provides a client ID:
 servicenow auth login work --instance company --method oauth \
   --client-id YOUR_CLIENT_ID
 
 # On headless Linux/WSL2, choose the permission-locked file fallback directly:
-servicenow setup work --instance company --insecure-storage
+servicenow init work --instance company --insecure-storage
 
 servicenow doctor
 servicenow incidents mine

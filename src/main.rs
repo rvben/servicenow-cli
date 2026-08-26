@@ -756,7 +756,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                     &records,
                     None,
                     output.color,
-                    "No profiles yet. Start here: `servicenow setup`.",
+                    "No profiles yet. Start here: `servicenow init`.",
                 );
             }
             return Ok(());
@@ -831,7 +831,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                     toml::to_string_pretty(&document["example"])
                         .unwrap_or_else(|_| "[default]\ninstance = \"dev12345\"".into())
                 );
-                println!("Next: {}", document["setupCommand"].as_str().unwrap_or(""));
+                println!("Next: {}", document["initCommand"].as_str().unwrap_or(""));
             }
             return Ok(());
         }
@@ -2748,7 +2748,7 @@ fn argument_dynamic_default(path: &str, argument: &str) -> Option<&'static str> 
     if argument == "display_value" {
         return Some("display values for text output; raw values for machine output");
     }
-    if path.ends_with("setup") || path.ends_with("auth login") {
+    if path.ends_with("init") || path.ends_with("auth login") {
         return match argument {
             "instance" => Some("saved profile value when resuming; otherwise prompted"),
             "method" => Some(
@@ -2809,7 +2809,7 @@ fn command_behavior(path: &str) -> Value {
         "tables delete",
     ];
     let local_mutations = [
-        "setup",
+        "init",
         "auth login",
         "auth logout",
         "profile use",
@@ -2820,7 +2820,7 @@ fn command_behavior(path: &str) -> Value {
         || local_mutations.iter().any(|suffix| path.ends_with(suffix));
     let remote_mutation = remote_mutations.iter().any(|suffix| path.ends_with(suffix));
     let local_mutation = local_mutations.iter().any(|suffix| path.ends_with(suffix));
-    let side_effect = if path.ends_with("setup") || path.ends_with("auth login") {
+    let side_effect = if path.ends_with("init") || path.ends_with("auth login") {
         "local_and_remote"
     } else if remote_mutation {
         "remote"

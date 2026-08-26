@@ -93,10 +93,10 @@ fn schema_can_describe_one_command_compactly() {
 }
 
 #[test]
-fn setup_schema_describes_adaptive_onboarding_defaults() {
+fn init_schema_describes_adaptive_onboarding_defaults() {
     let config_home = TempDir::new().unwrap();
     let output = command(&config_home)
-        .args(["schema", "--command", "setup"])
+        .args(["schema", "--command", "init"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -230,7 +230,7 @@ fn config_init_does_not_require_credentials() {
 }
 
 #[tokio::test]
-async fn setup_can_fall_back_to_the_protected_config_file() {
+async fn init_can_fall_back_to_the_protected_config_file() {
     let config_home = TempDir::new().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -250,10 +250,10 @@ async fn setup_can_fall_back_to_the_protected_config_file() {
         .mount(&server)
         .await;
 
-    let mut setup = assert_cmd::Command::from_std(command(&config_home));
-    let output = setup
+    let mut init = assert_cmd::Command::from_std(command(&config_home));
+    let output = init
         .args([
-            "setup",
+            "init",
             "work",
             "--instance",
             &server.uri(),
@@ -310,7 +310,7 @@ async fn setup_can_fall_back_to_the_protected_config_file() {
 }
 
 #[tokio::test]
-async fn setup_detects_microsoft_entra_and_selects_zero_admin_browser_sign_in() {
+async fn init_detects_microsoft_entra_and_selects_zero_admin_browser_sign_in() {
     let config_home = TempDir::new().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -325,7 +325,7 @@ async fn setup_detects_microsoft_entra_and_selects_zero_admin_browser_sign_in() 
 
     command(&config_home)
         .args([
-            "setup",
+            "init",
             "work",
             "--instance",
             &server.uri(),
@@ -342,7 +342,7 @@ async fn setup_detects_microsoft_entra_and_selects_zero_admin_browser_sign_in() 
 }
 
 #[tokio::test]
-async fn setup_does_not_treat_a_local_login_form_as_basic_authentication() {
+async fn init_does_not_treat_a_local_login_form_as_basic_authentication() {
     let config_home = TempDir::new().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -360,7 +360,7 @@ async fn setup_does_not_treat_a_local_login_form_as_basic_authentication() {
         .await;
 
     command(&config_home)
-        .args(["setup", "work", "--instance", &server.uri()])
+        .args(["init", "work", "--instance", &server.uri()])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -394,29 +394,28 @@ async fn rejected_basic_auth_on_federated_instance_recommends_browser_sign_in() 
         .mount(&server)
         .await;
 
-    let mut setup = assert_cmd::Command::from_std(command(&config_home));
-    setup
-        .args([
-            "setup",
-            "work",
-            "--instance",
-            &server.uri(),
-            "--username",
-            "federated-user",
-            "--method",
-            "basic",
-            "--secret-stdin",
-            "--insecure-storage",
-        ])
-        .write_stdin("not-a-servicenow-password\n")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Microsoft Entra SSO"))
-        .stderr(predicate::str::contains("Federated accounts"))
-        .stderr(predicate::str::contains("--method browser"))
-        .stderr(predicate::str::contains("no OAuth application"))
-        .stderr(predicate::str::contains("Application Registry").not())
-        .stderr(predicate::str::contains("servicenow auth login").not());
+    let mut init = assert_cmd::Command::from_std(command(&config_home));
+    init.args([
+        "init",
+        "work",
+        "--instance",
+        &server.uri(),
+        "--username",
+        "federated-user",
+        "--method",
+        "basic",
+        "--secret-stdin",
+        "--insecure-storage",
+    ])
+    .write_stdin("not-a-servicenow-password\n")
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Microsoft Entra SSO"))
+    .stderr(predicate::str::contains("Federated accounts"))
+    .stderr(predicate::str::contains("--method browser"))
+    .stderr(predicate::str::contains("no OAuth application"))
+    .stderr(predicate::str::contains("Application Registry").not())
+    .stderr(predicate::str::contains("servicenow auth login").not());
 }
 
 #[tokio::test]

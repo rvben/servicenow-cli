@@ -223,12 +223,12 @@ fn error_remediation(error: &ApiError) -> Option<&'static str> {
         || message.contains("No browser session configured")
         || message.contains("No access token configured")
     {
-        Some("run `servicenow setup` to connect an instance securely")
+        Some("run `servicenow init` to connect an instance securely")
     } else if matches!(error, ApiError::Auth(_))
         && message.contains("appears to use")
         && message.contains("SSO")
     {
-        Some("retry with `servicenow setup --method browser`; no OAuth application is required")
+        Some("retry with `servicenow init --method browser`; no OAuth application is required")
     } else {
         match error {
             ApiError::Auth(_) if message.contains("browser session") => {
