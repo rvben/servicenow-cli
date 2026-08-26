@@ -16,6 +16,10 @@ readme = "README.md"
 name = "servicenow"
 path = "src/main.rs"
 
+[[bin]]
+name = "servicenow-cli"
+path = "src/servicenow_cli_alias.rs"
+
 [dependencies]
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

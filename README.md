@@ -36,13 +36,16 @@ $ servicenow incidents mine
 
 ## Install
 
-Both packages install the `servicenow` binary:
+Both packages install the `servicenow` and `servicenow-cli` binaries:
 
 ```sh
 cargo install servicenow-cli --locked
 
 # or
 pipx install servicenow-cli
+
+# or run from PyPI without installing
+uvx servicenow-cli --help
 ```
 
 From a checkout:
