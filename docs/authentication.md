@@ -23,6 +23,18 @@ username, authentication type, and safety mode are stored in the configuration
 file. Pass `--method browser`, `basic`, `oauth`, or `bearer` to select a method
 explicitly.
 
+## Sign in from the TUI
+
+`servicenow tui` is also a valid starting point before authentication is ready.
+When the active profile is new, missing a credential, expired, or rejected by
+the instance, the TUI shows a dedicated connection state. Press `enter` or `a`
+to start the same guided secure sign-in used by `servicenow auth login`.
+
+Authentication runs in the normal terminal so password and browser prompts are
+never drawn into the ledger. After a successful sign-in, the CLI reopens the
+TUI automatically and loads the requested table and query. Press `q`, `esc`, or
+Ctrl-C from the connection state to leave without changing the profile.
+
 ## Browser sign-in for SSO
 
 Browser sign-in is the recommended employee experience for SAML/Entra-federated

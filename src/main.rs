@@ -843,12 +843,27 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             clap_complete::generate(shell, &mut command, "servicenow", &mut std::io::stdout());
             return Ok(());
         }
-        Command::Tui { .. }
-            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() =>
-        {
-            return Err(ApiError::InvalidInput(
-                "the TUI requires an interactive terminal on stdin and stdout".into(),
-            ));
+        Command::Tui {
+            table,
+            query,
+            page_size,
+        } => {
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                return Err(ApiError::InvalidInput(
+                    "the TUI requires an interactive terminal on stdin and stdout".into(),
+                ));
+            }
+            return run_tui_command(
+                &output,
+                cli.instance,
+                cli.username,
+                cli.profile,
+                table,
+                query,
+                page_size,
+                verbose,
+            )
+            .await;
         }
         Command::Config(ConfigCommand::Init) => {
             if output.json {
@@ -915,23 +930,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     )?;
 
     match cli.command {
-        Command::Tui {
-            table,
-            query,
-            page_size,
-        } => {
-            servicenow_cli::tui::run(
-                &client,
-                &config,
-                servicenow_cli::tui::TuiOptions {
-                    table,
-                    query,
-                    page_size,
-                    color: output.color,
-                },
-            )
-            .await?
-        }
+        Command::Tui { .. } => unreachable!("TUI commands return before shared client setup"),
         Command::Incidents(command) => run_incidents(command, &client, &config, &output).await?,
         Command::Attachments(command) => {
             run_attachments(command, &client, &config, &output).await?
@@ -964,6 +963,189 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tui_command(
+    output: &OutputConfig,
+    instance_arg: Option<String>,
+    username_arg: Option<String>,
+    profile_arg: Option<String>,
+    table: String,
+    query: Option<String>,
+    page_size: usize,
+    verbose: bool,
+) -> Result<(), ApiError> {
+    let options = servicenow_cli::tui::TuiOptions {
+        table,
+        query,
+        page_size,
+        color: output.color,
+    };
+    options.validate()?;
+    let requested_profile = profile_arg.unwrap_or(active_profile_name()?);
+
+    loop {
+        let mut config = match Config::load(
+            instance_arg.clone(),
+            username_arg.clone(),
+            Some(requested_profile.clone()),
+        ) {
+            Ok(config) => config,
+            Err(error) if tui_login_recoverable(&error) => {
+                let saved = profile_defaults(&requested_profile)?;
+                let instance_hint = instance_arg
+                    .as_deref()
+                    .or_else(|| saved.as_ref().map(|profile| profile.instance.as_str()));
+                let login_instance = saved.is_none().then(|| instance_arg.clone()).flatten();
+                let reason = tui_connection_reason(&error);
+                if !request_tui_login(
+                    output,
+                    &requested_profile,
+                    instance_hint,
+                    login_instance,
+                    username_arg.clone(),
+                    &reason,
+                    verbose,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Err(error) = servicenow_cli::auth::refresh_if_needed(&mut config).await {
+            if !tui_login_recoverable(&error) {
+                return Err(error);
+            }
+            let reason = tui_connection_reason(&error);
+            let login_instance = profile_defaults(&config.profile)?
+                .is_none()
+                .then(|| config.instance.clone());
+            if !request_tui_login(
+                output,
+                &config.profile,
+                Some(&config.instance),
+                login_instance,
+                config.username.clone(),
+                &reason,
+                verbose,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            continue;
+        }
+
+        let client = ServiceNowClient::new_with_user_token(
+            &config.instance,
+            config.username.as_deref(),
+            &config.secret,
+            config.auth_type,
+            config.browser_user_token.as_deref(),
+        )?;
+        match servicenow_cli::tui::run(&client, &config, options.clone()).await? {
+            servicenow_cli::tui::TuiExit::Quit => return Ok(()),
+            servicenow_cli::tui::TuiExit::Authenticate => {
+                let login_instance = profile_defaults(&config.profile)?
+                    .is_none()
+                    .then(|| config.instance.clone());
+                if !request_tui_login(
+                    output,
+                    &config.profile,
+                    Some(&config.instance),
+                    login_instance,
+                    config.username.clone(),
+                    "ServiceNow rejected the current session. Sign in again to continue where you left off.",
+                    verbose,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn request_tui_login(
+    output: &OutputConfig,
+    profile: &str,
+    instance_hint: Option<&str>,
+    login_instance: Option<String>,
+    username: Option<String>,
+    reason: &str,
+    verbose: bool,
+) -> Result<bool, ApiError> {
+    if servicenow_cli::tui::request_authentication(profile, instance_hint, reason, output.color)?
+        == servicenow_cli::tui::TuiExit::Quit
+    {
+        return Ok(false);
+    }
+
+    let auth_output = OutputConfig {
+        json: false,
+        quiet: false,
+        format: OutputFormat::Text,
+        color: output.color,
+    };
+    run_auth_login(
+        &auth_output,
+        profile.to_string(),
+        login_instance,
+        None,
+        username,
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        verbose,
+    )
+    .await
+}
+
+fn tui_login_recoverable(error: &ApiError) -> bool {
+    if matches!(error, ApiError::Auth(_)) {
+        return true;
+    }
+    let message = error.to_string();
+    matches!(error, ApiError::InvalidInput(_) | ApiError::NotFound(_))
+        && [
+            "No ServiceNow instance configured",
+            "No username configured",
+            "No password configured",
+            "No browser session configured",
+            "No access token configured",
+            "config profile '",
+            "OAuth profile is missing client_id",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
+}
+
+fn tui_connection_reason(error: &ApiError) -> String {
+    let message = error.to_string();
+    if message.contains("No ServiceNow instance configured") {
+        "No ServiceNow instance is connected to this profile yet.".into()
+    } else if message.contains("config profile '") {
+        "This profile has not been connected yet.".into()
+    } else if message.contains("No username configured")
+        || message.contains("No password configured")
+        || message.contains("No browser session configured")
+        || message.contains("No access token configured")
+    {
+        "This profile does not have a usable credential yet.".into()
+    } else {
+        message
+    }
 }
 
 async fn run_table_schema(
@@ -2924,4 +3106,38 @@ fn command_behavior(path: &str) -> Value {
         "requiresConfirmation": requires_confirmation,
         "supportsDryRun": supports_dry_run,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_recovers_only_connection_and_authentication_failures() {
+        assert!(tui_login_recoverable(&ApiError::InvalidInput(
+            "No ServiceNow instance configured. Run `servicenow init`.".into()
+        )));
+        assert!(tui_login_recoverable(&ApiError::NotFound(
+            "config profile 'work'. Available: none defined".into()
+        )));
+        assert!(tui_login_recoverable(&ApiError::Auth(
+            "browser session expired".into()
+        )));
+        assert!(!tui_login_recoverable(&ApiError::InvalidInput(
+            "invalid table name".into()
+        )));
+        assert!(!tui_login_recoverable(&ApiError::RateLimit));
+    }
+
+    #[test]
+    fn tui_connection_copy_removes_dead_end_command_instructions() {
+        let reason = tui_connection_reason(&ApiError::InvalidInput(
+            "No access token configured. Run `servicenow init`.".into(),
+        ));
+        assert_eq!(
+            reason,
+            "This profile does not have a usable credential yet."
+        );
+        assert!(!reason.contains("servicenow init"));
+    }
 }

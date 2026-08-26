@@ -225,6 +225,7 @@ The footer dedicates its first row to the latest notice and, at 90 columns or wi
 
 ### Loading, Error, and Empty States
 
+- **Authentication required:** A mint-ruled `SIGN-IN REQUIRED` panel replaces the ledger when the selected profile has no usable credential. It names the profile and instance when known, makes `Enter`/`a` the primary `start secure sign-in` action, and keeps `q`/Escape as a no-change exit. Authentication continues outside the alternate screen so prompts and secrets never enter rendered TUI state; success returns directly to the requested ledger. A rejected or expired live session uses the same action in place and keeps `r` available for a transient retry.
 - **Loading:** An inset framed panel states `INDEXING RECORDS` and names the table and instance being read. Generic complete-record loading stays inside the expanded sheet. Each incident view names its own loading task without blocking sibling views.
 - **Error:** A coral framed panel distinguishes ledger load failure from emptiness, repeats the safe error notice, and offers `r`, `/`, and `t` recovery keys. Incident Overview degrades to `INDEX FIELDS ONLY`; each related incident view keeps its failure and retry local while stating that Overview remains available.
 - **Empty:** A normally framed `RECORD INDEX` states that no records match and offers query or table changes. Activity, Attachments, and SLAs each use a specific empty heading and an `r reload this view` action.
@@ -233,7 +234,7 @@ The footer dedicates its first row to the latest notice and, at 90 columns or wi
 
 ### Interaction Grammar
 
-The base ledger accepts `↑`/`k`, `↓`/`j`, `g`/`G`, Enter/Right/`l`, `r`, `n`/`p`, Page Down/Page Up, `t`, `/`, `?`, `o`, `q`, and Ctrl-C. Overlays narrow that vocabulary to their local task: inputs accept text editing plus Enter/Escape; the help sheet accepts only close keys; generic detail accepts scroll, close, help, open, and quit; incident detail adds Tab/Shift-Tab, `1`–`4`, and current-view reload with `r`. Ctrl-C remains a global exit. All navigation operates on key press and requires no mouse.
+The base ledger accepts `↑`/`k`, `↓`/`j`, `g`/`G`, Enter/Right/`l`, `r`, `n`/`p`, Page Down/Page Up, `t`, `/`, `?`, `o`, `q`, and Ctrl-C. When authentication is required, Enter/`a` starts secure sign-in and `q`/Escape declines. Overlays narrow that vocabulary to their local task: inputs accept text editing plus Enter/Escape; the help sheet accepts only close keys; generic detail accepts scroll, close, help, open, and quit; incident detail adds Tab/Shift-Tab, `1`–`4`, and current-view reload with `r`. Ctrl-C remains a global exit. All navigation operates on key press and requires no mouse.
 
 ## Do's and Don'ts
 

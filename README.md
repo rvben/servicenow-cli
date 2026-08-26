@@ -96,6 +96,12 @@ encoded query, `t` to change tables, `n`/`p` to page, and `?` for the complete
 keyboard map. Press `o` to hand the selected record off to the ServiceNow web
 interface.
 
+You can launch the TUI before setup is complete. If the active profile is not
+connected—or if its session has expired—the ledger presents secure sign-in as
+the primary recovery. Press `enter` or `a`, complete the guided authentication
+outside the alternate screen, and the TUI returns directly to the record list.
+Press `q` or `esc` instead to return to the shell without changing anything.
+
 Incident inspection unfolds into four read-only views: **Overview** shows every
 readable field, **Activity** shows recent comments and work notes, **Attachments**
 lists file metadata, and **SLAs** shows task-SLA progress and breach state. Move

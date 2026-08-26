@@ -106,10 +106,17 @@ impl Notice {
 enum Action {
     None,
     Quit,
+    Authenticate,
     Load,
     LoadDetail,
     LoadIncidentTab(IncidentTab),
     Open,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiExit {
+    Quit,
+    Authenticate,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -192,6 +199,7 @@ struct App {
     loading: bool,
     detail_loading: bool,
     load_failed: bool,
+    auth_failed: bool,
     color: bool,
     overlay: Overlay,
     notice: Notice,
@@ -223,6 +231,7 @@ impl App {
             loading: false,
             detail_loading: false,
             load_failed: false,
+            auth_failed: false,
             color: options.color,
             overlay: Overlay::None,
             notice: Notice::quiet("Preparing the ledger…"),
@@ -262,6 +271,7 @@ impl App {
                 self.table_state.select(selected);
                 self.detail_scroll = 0;
                 self.load_failed = false;
+                self.auth_failed = false;
                 self.notice = if self.records.is_empty() {
                     Notice::quiet("No records match this view. Press / to change the query.")
                 } else {
@@ -278,7 +288,12 @@ impl App {
                 self.table_state.select(None);
                 self.has_next_page = false;
                 self.load_failed = true;
-                self.notice = Notice::error(format!("{error}. Press r to retry."));
+                self.auth_failed = matches!(error, ApiError::Auth(_));
+                self.notice = if self.auth_failed {
+                    Notice::error(format!("{error}. Press Enter or a to sign in again."))
+                } else {
+                    Notice::error(format!("{error}. Press r to retry."))
+                };
             }
         }
         self.loading = false;
@@ -581,6 +596,9 @@ impl App {
             },
             Overlay::None => match key.code {
                 KeyCode::Char('q') => Action::Quit,
+                KeyCode::Enter | KeyCode::Char('a') if self.load_failed && self.auth_failed => {
+                    Action::Authenticate
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.select_next();
                     Action::None
@@ -782,13 +800,22 @@ impl App {
             frame.render_widget(message, frame.area());
             return;
         }
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let chrome = if frame.area().height < 14 {
+            [
+                Constraint::Length(3),
+                Constraint::Min(7),
+                Constraint::Length(2),
+            ]
+        } else {
+            [
                 Constraint::Length(3),
                 Constraint::Min(8),
                 Constraint::Length(3),
-            ])
+            ]
+        };
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(chrome)
             .split(frame.area());
         self.render_header(frame, areas[0], theme);
         self.render_body(frame, areas[1], theme);
@@ -860,6 +887,31 @@ impl App {
         }
 
         if self.load_failed {
+            if self.auth_failed {
+                let failure = Paragraph::new(vec![
+                    Line::styled("YOUR SERVICENOW SESSION NEEDS ATTENTION", theme.title()),
+                    Line::styled(&self.notice.text, theme.body()),
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled("enter / a", theme.key()),
+                        Span::styled("  start secure sign-in   ", theme.muted()),
+                        Span::styled("r", theme.key()),
+                        Span::styled("  retry   ", theme.muted()),
+                        Span::styled("q", theme.key()),
+                        Span::styled("  quit", theme.muted()),
+                    ]),
+                ])
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .title(" SIGN-IN REQUIRED ")
+                        .borders(Borders::ALL)
+                        .border_style(theme.active_rule()),
+                );
+                frame.render_widget(failure, state_panel_area(area));
+                return;
+            }
             let failure = Paragraph::new(vec![
                 Line::styled("COULD NOT LOAD THE LEDGER", theme.error()),
                 Line::styled(&self.notice.text, theme.body()),
@@ -880,7 +932,7 @@ impl App {
                     .borders(Borders::ALL)
                     .border_style(theme.error()),
             );
-            frame.render_widget(failure, inset(area, 2, 2));
+            frame.render_widget(failure, state_panel_area(area));
             return;
         }
 
@@ -1224,38 +1276,51 @@ impl App {
         } else {
             theme.muted()
         };
-        let hints = Line::from(vec![
-            Span::styled("↑↓", theme.key()),
-            Span::styled(" move  ", theme.muted()),
-            Span::styled("enter", theme.key()),
-            Span::styled(" inspect  ", theme.muted()),
-            Span::styled("/", theme.key()),
-            Span::styled(" filter  ", theme.muted()),
-            Span::styled("t", theme.key()),
-            Span::styled(" table  ", theme.muted()),
-            Span::styled("p", previous_key),
-            Span::styled(
-                if self.offset > 0 {
-                    " prev  "
-                } else {
-                    " start  "
-                },
-                theme.muted(),
-            ),
-            Span::styled("n", next_key),
-            Span::styled(
-                if self.has_next_page {
-                    " next  "
-                } else {
-                    " end  "
-                },
-                theme.muted(),
-            ),
-            Span::styled("?", theme.key()),
-            Span::styled(" help  ", theme.muted()),
-            Span::styled("q", theme.key()),
-            Span::styled(" quit", theme.muted()),
-        ]);
+        let hints = if self.load_failed && self.auth_failed {
+            Line::from(vec![
+                Span::styled("enter / a", theme.key()),
+                Span::styled(" authenticate  ", theme.muted()),
+                Span::styled("r", theme.key()),
+                Span::styled(" retry  ", theme.muted()),
+                Span::styled("?", theme.key()),
+                Span::styled(" help  ", theme.muted()),
+                Span::styled("q", theme.key()),
+                Span::styled(" quit", theme.muted()),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("↑↓", theme.key()),
+                Span::styled(" move  ", theme.muted()),
+                Span::styled("enter", theme.key()),
+                Span::styled(" inspect  ", theme.muted()),
+                Span::styled("/", theme.key()),
+                Span::styled(" filter  ", theme.muted()),
+                Span::styled("t", theme.key()),
+                Span::styled(" table  ", theme.muted()),
+                Span::styled("p", previous_key),
+                Span::styled(
+                    if self.offset > 0 {
+                        " prev  "
+                    } else {
+                        " start  "
+                    },
+                    theme.muted(),
+                ),
+                Span::styled("n", next_key),
+                Span::styled(
+                    if self.has_next_page {
+                        " next  "
+                    } else {
+                        " end  "
+                    },
+                    theme.muted(),
+                ),
+                Span::styled("?", theme.key()),
+                Span::styled(" help  ", theme.muted()),
+                Span::styled("q", theme.key()),
+                Span::styled(" quit", theme.muted()),
+            ])
+        };
         let status = if area.width >= 90 {
             Line::from(vec![
                 Span::styled(format!(" {notice} "), notice_style),
@@ -1287,6 +1352,10 @@ impl App {
             ("/", "Set or clear an encoded query"),
             ("n / p", "Load the next or previous page"),
             ("r", "Reload the current page or incident view"),
+            (
+                "enter / a",
+                "Sign in when the current session needs attention",
+            ),
             ("j/k, PgUp/PgDn", "Scroll inside a complete record sheet"),
             ("o", "Open the selected record in ServiceNow"),
             ("g / G", "Jump to first or last record"),
@@ -1337,7 +1406,7 @@ pub async fn run(
     client: &ServiceNowClient,
     config: &Config,
     options: TuiOptions,
-) -> Result<(), ApiError> {
+) -> Result<TuiExit, ApiError> {
     options.validate()?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(ApiError::InvalidInput(
@@ -1373,7 +1442,8 @@ pub async fn run(
         }
         match app.handle_key(key) {
             Action::None => {}
-            Action::Quit => break,
+            Action::Quit => return Ok(TuiExit::Quit),
+            Action::Authenticate => return Ok(TuiExit::Authenticate),
             Action::Open => app.open_selected(client),
             Action::Load => {
                 terminal
@@ -1395,7 +1465,185 @@ pub async fn run(
             }
         }
     }
-    Ok(())
+}
+
+struct ConnectionApp<'a> {
+    profile: &'a str,
+    instance: Option<&'a str>,
+    reason: &'a str,
+    color: bool,
+}
+
+impl ConnectionApp<'_> {
+    fn render(&self, frame: &mut ratatui::Frame<'_>) {
+        let theme = Theme::new(self.color);
+        frame.render_widget(Block::default().style(theme.canvas()), frame.area());
+        if frame.area().width < 50 || frame.area().height < 12 {
+            let message = Paragraph::new(vec![
+                Line::styled("SIGN-IN REQUIRED", theme.title()),
+                Line::from(vec![
+                    Span::styled("enter", theme.key()),
+                    Span::styled(" authenticate  ·  ", theme.muted()),
+                    Span::styled("q", theme.key()),
+                    Span::styled(" quit", theme.muted()),
+                ]),
+            ])
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+            frame.render_widget(message, frame.area());
+            return;
+        }
+
+        let chrome = if frame.area().height < 14 {
+            [
+                Constraint::Length(3),
+                Constraint::Min(7),
+                Constraint::Length(2),
+            ]
+        } else {
+            [
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(3),
+            ]
+        };
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(chrome)
+            .split(frame.area());
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" SERVICENOW ", theme.brand()),
+                Span::styled(" SECURE CONNECTION", theme.title()),
+            ]),
+            Line::styled(
+                format!(
+                    "{}{}",
+                    safe_text(self.profile),
+                    self.instance
+                        .map(|instance| format!("  ·  {}", safe_text(instance)))
+                        .unwrap_or_default()
+                ),
+                theme.muted(),
+            ),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(theme.rule()),
+        );
+        frame.render_widget(header, areas[0]);
+
+        let panel_lines = if areas[1].height < 12 {
+            vec![
+                Line::styled("CONNECT THE OPERATIONS LEDGER", theme.title()),
+                Line::styled("This profile needs a ServiceNow session.", theme.body()),
+                Line::from(vec![
+                    Span::styled("enter / a", theme.key()),
+                    Span::styled("  secure sign-in", theme.body()),
+                ]),
+                Line::from(vec![
+                    Span::styled("q / esc", theme.key()),
+                    Span::styled("    return to shell", theme.muted()),
+                ]),
+            ]
+        } else {
+            vec![
+                Line::styled("CONNECT THE OPERATIONS LEDGER", theme.title()),
+                Line::styled(
+                    "Authenticate this profile to browse live ServiceNow records.",
+                    theme.body(),
+                ),
+                Line::raw(""),
+                Line::styled(safe_text(self.reason), theme.muted()),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled("enter / a", theme.key()),
+                    Span::styled("  start secure sign-in", theme.body()),
+                ]),
+                Line::from(vec![
+                    Span::styled("q / esc", theme.key()),
+                    Span::styled("    return to the shell", theme.muted()),
+                ]),
+            ]
+        };
+        let panel = Paragraph::new(panel_lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" SIGN-IN REQUIRED ")
+                    .borders(Borders::ALL)
+                    .border_style(theme.active_rule()),
+            );
+        let panel_area = if areas[1].height < 12 {
+            state_panel_area(areas[1])
+        } else {
+            centered_rect(76, 11, areas[1])
+        };
+        frame.render_widget(panel, panel_area);
+
+        let footer_text = if areas[2].width < 70 {
+            " Sign-in returns you to this ledger."
+        } else {
+            " Sign-in continues outside the TUI, then returns you to this ledger."
+        };
+        let footer = Paragraph::new(Line::styled(footer_text, theme.muted())).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(theme.rule()),
+        );
+        frame.render_widget(footer, areas[2]);
+    }
+}
+
+pub fn request_authentication(
+    profile: &str,
+    instance: Option<&str>,
+    reason: &str,
+    color: bool,
+) -> Result<TuiExit, ApiError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(ApiError::InvalidInput(
+            "the TUI requires an interactive terminal on stdin and stdout".into(),
+        ));
+    }
+
+    enable_raw_mode().map_err(terminal_error)?;
+    let _restore = RestoreTerminal;
+    execute!(io::stdout(), EnterAlternateScreen).map_err(terminal_error)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).map_err(terminal_error)?;
+    terminal.clear().map_err(terminal_error)?;
+    let app = ConnectionApp {
+        profile,
+        instance,
+        reason,
+        color,
+    };
+
+    loop {
+        terminal
+            .draw(|frame| app.render(frame))
+            .map_err(terminal_error)?;
+        if !event::poll(Duration::from_millis(200)).map_err(terminal_error)? {
+            continue;
+        }
+        let Event::Key(key) = event::read().map_err(terminal_error)? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(TuiExit::Quit);
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('a') => return Ok(TuiExit::Authenticate),
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(TuiExit::Quit),
+            _ => {}
+        }
+    }
 }
 
 struct RestoreTerminal;
@@ -1893,6 +2141,14 @@ fn inset(area: Rect, horizontal: u16, vertical: u16) -> Rect {
     }
 }
 
+fn state_panel_area(area: Rect) -> Rect {
+    if area.height < 12 {
+        inset(area, 1, 0)
+    } else {
+        inset(area, 2, 2)
+    }
+}
+
 fn terminal_error(error: io::Error) -> ApiError {
     ApiError::Other(format!("terminal error: {error}"))
 }
@@ -2201,6 +2457,84 @@ mod tests {
         assert!(text.contains("COULD NOT LOAD THE LEDGER"));
         assert!(!text.contains("THE LEDGER IS EMPTY"));
         assert!(!text.contains('\u{1b}'));
+    }
+
+    #[tokio::test]
+    async fn authentication_failures_offer_sign_in_as_the_primary_recovery() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {"message": "User is not authenticated", "detail": "Session expired"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("admin"), "expired", AuthType::Basic)
+                .unwrap();
+        let mut app = app();
+        app.load(&client).await;
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("SIGN-IN REQUIRED"));
+        assert!(text.contains("enter / a"));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Authenticate
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Action::Authenticate
+        );
+    }
+
+    #[test]
+    fn unauthenticated_launch_explains_the_handoff_and_return() {
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = ConnectionApp {
+            profile: "work",
+            instance: Some("dev12345.service-now.com"),
+            reason: "This profile does not have a usable credential yet.",
+            color: true,
+        };
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        if std::env::var_os("SERVICENOW_TUI_SNAPSHOT").is_some() {
+            eprintln!("\n{text}");
+        }
+        assert!(text.contains("SECURE CONNECTION"));
+        assert!(text.contains("CONNECT THE OPERATIONS LEDGER"));
+        assert!(text.contains("enter / a"));
+        assert!(text.contains("returns you to this ledger"));
+        assert!(text.contains("work"));
+        assert!(text.contains("dev12345.service-now.com"));
+    }
+
+    #[test]
+    fn compact_unauthenticated_launch_keeps_both_decisions_visible() {
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = ConnectionApp {
+            profile: "work",
+            instance: None,
+            reason: "No ServiceNow instance is connected to this profile yet.",
+            color: false,
+        };
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        if std::env::var_os("SERVICENOW_TUI_SNAPSHOT").is_some() {
+            eprintln!("\n{text}");
+        }
+        assert!(text.contains("SIGN-IN REQUIRED"));
+        assert!(text.contains("enter / a"));
+        assert!(text.contains("q / esc"));
+        assert!(text.contains("Sign-in returns you to this ledger"));
+        assert!(!text.contains("THE LEDGER NEEDS MORE ROOM"));
     }
 
     #[test]
