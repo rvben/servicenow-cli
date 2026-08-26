@@ -25,7 +25,8 @@ use servicenow_cli::record;
     name = "servicenow",
     version,
     about = "Fast, safe, human-friendly ServiceNow operations from the terminal",
-    arg_required_else_help = true
+    arg_required_else_help = true,
+    after_help = "Get started:\n  servicenow init                    Configure and sign in\n  servicenow doctor                  Check configuration and instance access\n  servicenow incidents mine          See what needs your attention\n  servicenow schema --command 'incidents list'\n                                      Inspect one command for automation"
 )]
 struct Cli {
     /// Instance name, hostname, or URL
@@ -73,7 +74,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Connect an instance with guided, secure setup
-    Setup {
+    Init {
         /// Profile name to create or replace
         #[arg(default_value = "default")]
         profile: String,
@@ -660,7 +661,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     let verbose = cli.verbose;
 
     match cli.command {
-        Command::Setup {
+        Command::Init {
             profile,
             instance,
             method,
@@ -903,7 +904,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         Command::Doctor | Command::Auth(AuthCommand::Status) => {
             run_doctor(&client, &config, &output).await?
         }
-        Command::Setup { .. }
+        Command::Init { .. }
         | Command::Auth(_)
         | Command::Profile(_)
         | Command::Config(_)
