@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.3](https://github.com/rvben/servicenow-cli/compare/v0.4.2...v0.4.3) - 2026-08-27
+
+### Added
+
+- **tui**: focus incidents on relevant assignments ([cdf3cfb](https://github.com/rvben/servicenow-cli/commit/cdf3cfb45f38d7d7e399a96f1579089ee3634fb0))
+
 ## [0.4.2](https://github.com/rvben/servicenow-cli/compare/v0.4.1...v0.4.2) - 2026-08-26
 
 ### Added
