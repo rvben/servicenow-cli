@@ -1,6 +1,8 @@
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::config::AuthType;
-use wiremock::matchers::{body_bytes, body_partial_json, header, method, path, query_param};
+use wiremock::matchers::{
+    body_bytes, body_partial_json, header, header_regex, method, path, query_param,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn client(server: &MockServer) -> ServiceNowClient {
@@ -95,9 +97,9 @@ async fn browser_sessions_send_only_the_service_now_cookie() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/now/table/incident"))
-        .and(header(
+        .and(header_regex(
             "cookie",
-            "JSESSIONID=synthetic-session; route=synthetic-route",
+            r"^(JSESSIONID=synthetic-session; route=synthetic-route|route=synthetic-route; JSESSIONID=synthetic-session)$",
         ))
         .and(header("x-usertoken", "synthetic-user-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -121,6 +123,52 @@ async fn browser_sessions_send_only_the_service_now_cookie() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn browser_sessions_adopt_rotated_service_now_cookies() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(header("cookie", "JSESSIONID=initial-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("set-cookie", "JSESSIONID=rotated-session; Path=/; HttpOnly")
+                .set_body_json(serde_json::json!({"result": []})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(header("cookie", "JSESSIONID=rotated-session"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ServiceNowClient::new_with_user_token(
+        &server.uri(),
+        None,
+        "JSESSIONID=initial-session",
+        AuthType::Browser,
+        Some("synthetic-user-token"),
+    )
+    .unwrap();
+
+    client
+        .list_records("incident", &ListOptions::default())
+        .await
+        .unwrap();
+    client
+        .list_records("incident", &ListOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        client.refreshed_browser_cookie().as_deref(),
+        Some("JSESSIONID=rotated-session")
     );
 }
 

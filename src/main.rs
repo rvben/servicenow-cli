@@ -929,29 +929,26 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         config.browser_user_token.as_deref(),
     )?;
 
-    match cli.command {
+    let command_result = match cli.command {
         Command::Tui { .. } => unreachable!("TUI commands return before shared client setup"),
-        Command::Incidents(command) => run_incidents(command, &client, &config, &output).await?,
-        Command::Attachments(command) => {
-            run_attachments(command, &client, &config, &output).await?
-        }
-        Command::Tables(command) => run_tables(command, &client, &config, &output).await?,
+        Command::Incidents(command) => run_incidents(command, &client, &config, &output).await,
+        Command::Attachments(command) => run_attachments(command, &client, &config, &output).await,
+        Command::Tables(command) => run_tables(command, &client, &config, &output).await,
         Command::Schema {
             table: Some(table),
             refresh,
             ..
-        } => run_table_schema(&table, refresh, &client, &config, &output).await?,
+        } => run_table_schema(&table, refresh, &client, &config, &output).await,
         Command::Choices {
             table,
             field,
             refresh,
-        } => run_choices(&table, &field, refresh, &client, &config, &output).await?,
-        Command::Resolve { kind, value } => {
-            let record = metadata::resolve_reference(&client, kind, &value).await?;
-            emit_record(&output, record);
-        }
+        } => run_choices(&table, &field, refresh, &client, &config, &output).await,
+        Command::Resolve { kind, value } => metadata::resolve_reference(&client, kind, &value)
+            .await
+            .map(|record| emit_record(&output, record)),
         Command::Doctor | Command::Auth(AuthCommand::Status) => {
-            run_doctor(&client, &config, &output).await?
+            run_doctor(&client, &config, &output).await
         }
         Command::Init { .. }
         | Command::Auth(_)
@@ -961,8 +958,13 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         | Command::Completions { .. } => {
             unreachable!()
         }
+    };
+    if command_result.is_ok()
+        && let Some(cookie) = client.refreshed_browser_cookie()
+    {
+        config.persist_browser_cookie(&cookie)?;
     }
-    Ok(())
+    command_result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1048,8 +1050,14 @@ async fn run_tui_command(
             config.auth_type,
             config.browser_user_token.as_deref(),
         )?;
-        match servicenow_cli::tui::run(&client, &config, options.clone()).await? {
-            servicenow_cli::tui::TuiExit::Quit => return Ok(()),
+        let tui_exit = servicenow_cli::tui::run(&client, &config, options.clone()).await?;
+        match tui_exit {
+            servicenow_cli::tui::TuiExit::Quit => {
+                if let Some(cookie) = client.refreshed_browser_cookie() {
+                    config.persist_browser_cookie(&cookie)?;
+                }
+                return Ok(());
+            }
             servicenow_cli::tui::TuiExit::Authenticate => {
                 let login_instance = profile_defaults(&config.profile)?
                     .is_none()
@@ -1333,7 +1341,7 @@ async fn run_auth_login(
     } else {
         Some(choose_credential_storage(insecure_storage)?)
     };
-    let credential = match method {
+    let mut credential = match method {
         AuthType::Basic => StoredCredential::Basic {
             password: read_login_secret(secret_stdin, "Password", false)?,
         },
@@ -1465,6 +1473,14 @@ async fn run_auth_login(
             }
         } else if output.format == OutputFormat::Text {
             output.success(&format!("Browser sign-in complete as {identity}"));
+        }
+        if let Some(cookie) = client.refreshed_browser_cookie()
+            && let StoredCredential::Browser {
+                cookie: stored_cookie,
+                ..
+            } = &mut credential
+        {
+            *stored_cookie = cookie;
         }
     }
 

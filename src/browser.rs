@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::api::{ApiError, normalize_instance};
+use crate::cookies::BrowserCookies;
 use crate::credentials::StoredCredential;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -289,10 +290,6 @@ async fn wait_for_session_cookie_with_progress(
         .host_str()
         .ok_or_else(|| ApiError::InvalidInput("instance URL has no hostname".into()))?;
     let is_https = origin.scheme() == "https";
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
-        .build()?;
     let started = Instant::now();
     let mut id = 0_u64;
     let mut last_stage = "the authenticated ServiceNow page";
@@ -357,8 +354,8 @@ async fn wait_for_session_cookie_with_progress(
                     progress.report(BrowserProgress::UserTokenDetected);
                     last_stage = "ServiceNow REST session validation";
                     progress.report(BrowserProgress::ValidatingSession);
-                    match validate_session(&http, site_url, &cookie, &user_token).await? {
-                        SessionValidation::Authenticated => {
+                    match validate_session(site_url, &cookie, &user_token).await? {
+                        SessionValidation::Authenticated(cookie) => {
                             progress.report(BrowserProgress::SessionValidated);
                             return Ok(Some(BrowserSession { cookie, user_token }));
                         }
@@ -549,48 +546,61 @@ fn service_now_cookie_header(document: &Value, host: &str, is_https: bool) -> Op
 }
 
 enum SessionValidation {
-    Authenticated,
+    Authenticated(String),
     Waiting(u16),
 }
 
 async fn validate_session(
-    http: &reqwest::Client,
     site_url: &str,
     cookie: &str,
     user_token: &str,
 ) -> Result<SessionValidation, ApiError> {
-    let response = http
-        .get(format!("{site_url}/api/now/table/sys_user"))
-        .query(&[
-            ("sysparm_query", "sys_id=javascript:gs.getUserID()"),
-            ("sysparm_fields", "sys_id,user_name,name"),
-            ("sysparm_limit", "1"),
-        ])
-        .header(reqwest::header::COOKIE, cookie)
-        .header("X-UserToken", user_token)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await?;
-    if response.status().is_success() {
-        return Ok(SessionValidation::Authenticated);
+    let cookies = BrowserCookies::new(site_url, cookie)?;
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .cookie_provider(cookies.provider())
+        .build()?;
+    for attempt in 0..2 {
+        let response = http
+            .get(format!("{site_url}/api/now/table/sys_user"))
+            .query(&[
+                ("sysparm_query", "sys_id=javascript:gs.getUserID()"),
+                ("sysparm_fields", "sys_id,user_name,name"),
+                ("sysparm_limit", "1"),
+            ])
+            .header("X-UserToken", user_token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await?;
+        if response.status().is_success() {
+            let cookie = cookies.current_header().ok_or_else(|| {
+                ApiError::Auth("browser-session validation removed every session cookie".into())
+            })?;
+            return Ok(SessionValidation::Authenticated(cookie));
+        }
+        let logged_in = response
+            .headers()
+            .get("x-is-logged-in")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let status = response.status().as_u16();
+        let waiting = status == 401 || status == 403 && !logged_in || (300..=399).contains(&status);
+        if attempt == 0 && waiting && cookies.refreshed_header().is_some() {
+            continue;
+        }
+        return match status {
+            status if waiting => Ok(SessionValidation::Waiting(status)),
+            403 => Err(ApiError::Auth(
+                "browser sign-in succeeded, but this account is not allowed to use the ServiceNow Table API"
+                    .into(),
+            )),
+            status => Err(ApiError::Other(format!(
+                "browser-session validation returned HTTP {status}"
+            ))),
+        };
     }
-    let logged_in = response
-        .headers()
-        .get("x-is-logged-in")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    match response.status().as_u16() {
-        status @ 401 => Ok(SessionValidation::Waiting(status)),
-        status @ 403 if !logged_in => Ok(SessionValidation::Waiting(status)),
-        status @ 300..=399 => Ok(SessionValidation::Waiting(status)),
-        403 => Err(ApiError::Auth(
-            "browser sign-in succeeded, but this account is not allowed to use the ServiceNow Table API"
-                .into(),
-        )),
-        status => Err(ApiError::Other(format!(
-            "browser-session validation returned HTTP {status}"
-        ))),
-    }
+    unreachable!("browser session validation makes at most two attempts")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1249,6 +1259,12 @@ try {
             if ($cookies.Count -gt 0) {
                 Write-Stage 'session-cookies-detected'
                 $cookieHeader = ($cookies | ForEach-Object { "$($_.name)=$($_.value)" }) -join '; '
+                $webSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+                foreach ($sourceCookie in $cookies) {
+                    $cookiePath = if ($sourceCookie.path) { $sourceCookie.path } else { '/' }
+                    $sessionCookie = [Net.Cookie]::new($sourceCookie.name, $sourceCookie.value, $cookiePath, $instance.Host)
+                    $webSession.Cookies.Add($instance, $sessionCookie)
+                }
                 $lastStage = 'the ServiceNow user token (g_ck or sysparm_ck)'
                 Write-Stage 'reading-user-token'
                 $evaluated = Invoke-CdpCommand $socket ([ref]$requestId) 'Runtime.evaluate' @{ expression = $userTokenExpression; returnByValue = $true } $sessionId
@@ -1258,8 +1274,10 @@ try {
                     $lastStage = 'ServiceNow REST session validation'
                     Write-Stage 'validating-session'
                     try {
-                        $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -Headers @{ Cookie = $cookieHeader; 'X-UserToken' = $userToken; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
+                        $response = Invoke-WebRequest -UseBasicParsing -Uri $apiUrl -WebSession $webSession -Headers @{ 'X-UserToken' = $userToken; Accept = 'application/json' } -MaximumRedirection 0 -TimeoutSec 10
                         if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
+                            $cookieHeader = $webSession.Cookies.GetCookieHeader([Uri]$apiUrl)
+                            if (-not $cookieHeader) { throw 'ServiceNow validation removed every session cookie.' }
                             Write-Stage 'session-validated'
                             $session = @{ cookie = $cookieHeader; user_token = $userToken }
                             Write-Output ('SERVICENOW_RESULT:' + ($session | ConvertTo-Json -Compress))
@@ -1359,6 +1377,9 @@ mod tests {
         assert!(WINDOWS_BROWSER_BRIDGE.contains("Network.getCookies"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("'Browser.close'"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("'X-UserToken' = $userToken"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("-WebSession $webSession"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("GetCookieHeader([Uri]$apiUrl)"));
+        assert!(!WINDOWS_BROWSER_BRIDGE.contains("@{ Cookie = $cookieHeader"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("$instance.Host"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__INSTANCE_HEX__"));
         assert!(WINDOWS_BROWSER_BRIDGE.contains("__USER_TOKEN_EXPRESSION_HEX__"));
@@ -1633,15 +1654,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cdp_session_is_validated_before_its_cookie_is_returned() {
+    async fn cdp_session_is_validated_and_rotation_is_captured_before_returning() {
         let instance = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/now/table/sys_user"))
             .and(header("cookie", "JSESSIONID=validated-session"))
             .and(header("x-usertoken", "synthetic-user-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "result": [{"sys_id": "0123456789abcdef0123456789abcdef"}]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "set-cookie",
+                        "JSESSIONID=rotated-validation-session; Path=/; HttpOnly",
+                    )
+                    .set_body_json(json!({
+                        "result": [{"sys_id": "0123456789abcdef0123456789abcdef"}]
+                    })),
+            )
             .expect(1)
             .mount(&instance)
             .await;
@@ -1718,7 +1746,7 @@ mod tests {
         .await
         .unwrap();
         drop(progress);
-        assert_eq!(session.cookie, "JSESSIONID=validated-session");
+        assert_eq!(session.cookie, "JSESSIONID=rotated-validation-session");
         assert_eq!(session.user_token, "synthetic-user-token");
         assert_eq!(
             events,

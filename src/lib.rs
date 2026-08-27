@@ -4,6 +4,7 @@ pub mod auth;
 pub mod browser;
 pub mod commands;
 pub mod config;
+mod cookies;
 pub mod credentials;
 pub mod incident;
 pub mod metadata;

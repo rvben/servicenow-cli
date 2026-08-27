@@ -223,6 +223,104 @@ async fn incident_machine_output_keeps_raw_values_by_default() {
 }
 
 #[tokio::test]
+async fn successful_commands_persist_rotated_browser_cookies() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let config_dir = config_home.path().join("servicenow");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"active_profile = "work"
+
+[profiles.work]
+instance = "{}"
+auth_type = "browser"
+credential_store = "file"
+
+[profiles.work.credential]
+kind = "browser"
+cookie = "JSESSIONID=initial-session"
+user_token = "synthetic-user-token"
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .and(header("cookie", "JSESSIONID=initial-session"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("set-cookie", "JSESSIONID=rotated-session; Path=/; HttpOnly")
+                .set_body_json(serde_json::json!({"result": []})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command(&config_home)
+        .args(["--profile", "work", "incidents", "list", "--limit", "1"])
+        .assert()
+        .success();
+
+    let config = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+    assert!(config.contains("cookie = \"JSESSIONID=rotated-session\""));
+    assert!(!config.contains("JSESSIONID=initial-session"));
+}
+
+#[tokio::test]
+async fn rejected_commands_do_not_persist_response_cookies() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let config_dir = config_home.path().join("servicenow");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"active_profile = "work"
+
+[profiles.work]
+instance = "{}"
+auth_type = "browser"
+credential_store = "file"
+
+[profiles.work.credential]
+kind = "browser"
+cookie = "JSESSIONID=last-known-good"
+user_token = "synthetic-user-token"
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header(
+                    "set-cookie",
+                    "JSESSIONID=rejected-session; Path=/; HttpOnly",
+                )
+                .set_body_json(serde_json::json!({
+                    "error": {"message": "User is not authenticated", "detail": "Session expired"}
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    command(&config_home)
+        .args(["--profile", "work", "incidents", "list", "--limit", "1"])
+        .assert()
+        .code(3);
+
+    let config = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+    assert!(config.contains("cookie = \"JSESSIONID=last-known-good\""));
+    assert!(!config.contains("JSESSIONID=rejected-session"));
+}
+
+#[tokio::test]
 async fn incident_text_output_prefers_display_values_and_curated_columns() {
     let config_home = TempDir::new().unwrap();
     let server = MockServer::start().await;

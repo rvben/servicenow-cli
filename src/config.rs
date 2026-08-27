@@ -278,6 +278,29 @@ impl Config {
     pub fn credential_store(&self) -> &str {
         &self.credential_store
     }
+
+    /// Persist a server-rotated browser cookie without changing credentials
+    /// supplied through environment variables or legacy configuration.
+    pub fn persist_browser_cookie(&mut self, cookie: &str) -> Result<bool, ApiError> {
+        if !matches!(self.auth_type, AuthType::Browser)
+            || !self.uses_persistent_store()
+            || cookie == self.secret
+        {
+            return Ok(false);
+        }
+        let user_token = self.browser_user_token.clone().ok_or_else(|| {
+            ApiError::Other("stored browser credential has no matching user token".into())
+        })?;
+        update_stored_credential(
+            &self.profile,
+            StoredCredential::Browser {
+                cookie: cookie.into(),
+                user_token,
+            },
+        )?;
+        self.secret = cookie.into();
+        Ok(true)
+    }
 }
 
 pub fn config_path() -> PathBuf {
@@ -634,5 +657,30 @@ mod tests {
         assert!(!encoded.contains("credential"));
         assert!(!encoded.contains("password"));
         assert!(!encoded.contains("token"));
+    }
+
+    #[test]
+    fn environment_browser_credentials_are_never_persisted() {
+        let mut config = Config {
+            instance: "https://company.service-now.com".into(),
+            username: None,
+            secret: "JSESSIONID=environment-session".into(),
+            auth_type: AuthType::Browser,
+            read_only: true,
+            profile: "work".into(),
+            client_id: None,
+            oauth_scope: None,
+            redirect_uri: None,
+            oauth: None,
+            browser_user_token: Some("environment-user-token".into()),
+            credential_store: "environment".into(),
+        };
+
+        assert!(
+            !config
+                .persist_browser_cookie("JSESSIONID=rotated-session")
+                .unwrap()
+        );
+        assert_eq!(config.secret, "JSESSIONID=environment-session");
     }
 }

@@ -59,6 +59,14 @@ session with cookies](https://www.servicenow.com/docs/r/api-reference/rest-api-e
 The matching `X-UserToken` is included for operations protected by
 [ServiceNow's anti-CSRF validation](https://www.servicenow.com/docs/r/platform-security/instance-security-hardening-settings/sc-prevent-users-from-accepting-warning-to-bypass-csrf-validation.html).
 
+ServiceNow can rotate session cookies while handling an API request. The CLI
+uses a cookie jar for browser-authenticated requests, immediately adopts those
+rotations, and writes the refreshed cookie back to the profile's existing OS
+keychain or protected configuration-file credential. A cookie supplied through
+`SERVICENOW_COOKIE` is never written anywhere. Refreshed cookies are persisted
+only after a command succeeds; a failed or rejected response cannot replace the
+last known working credential.
+
 No ServiceNow Application Registry entry or administrator action is required.
 The user's normal ServiceNow ACLs and REST access policies still apply. Browser
 sessions do not have OAuth refresh tokens, so when ServiceNow expires the
@@ -70,6 +78,9 @@ servicenow auth login work --method browser
 
 The CLI never retries a failed command automatically after session expiry. This
 avoids accidentally repeating a write whose outcome is uncertain.
+It also does not run a hidden keepalive process: instance inactivity and
+absolute-lifetime policies remain authoritative. Use managed OAuth when access
+must remain available without an interactive browser session.
 
 ## WSL2 and headless Linux
 

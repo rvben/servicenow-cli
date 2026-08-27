@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 use reqwest::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, HeaderValue,
+    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -10,6 +10,7 @@ use tokio_util::io::ReaderStream;
 
 use super::ApiError;
 use crate::config::AuthType;
+use crate::cookies::BrowserCookies;
 
 const ATTACHMENT_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
@@ -84,6 +85,7 @@ pub struct AttachmentMetadata {
 pub struct ServiceNowClient {
     http: reqwest::Client,
     auth_type: AuthType,
+    browser_cookies: Option<BrowserCookies>,
     site_url: String,
     table_url: String,
     attachment_url: String,
@@ -107,6 +109,9 @@ impl ServiceNowClient {
         browser_user_token: Option<&str>,
     ) -> Result<Self, ApiError> {
         let site_url = normalize_instance(instance)?;
+        let browser_cookies = matches!(auth_type, AuthType::Browser)
+            .then(|| BrowserCookies::new(&site_url, secret))
+            .transpose()?;
         let authorization = match auth_type {
             AuthType::Basic => {
                 let username = username
@@ -132,11 +137,6 @@ impl ServiceNowClient {
                     .map_err(|error| ApiError::Other(error.to_string()))?,
             );
         } else {
-            let mut cookie = HeaderValue::from_str(secret).map_err(|_| {
-                ApiError::InvalidInput("stored browser session cookie is invalid".into())
-            })?;
-            cookie.set_sensitive(true);
-            headers.insert(COOKIE, cookie);
             if let Some(user_token) = browser_user_token {
                 let mut user_token = HeaderValue::from_str(user_token).map_err(|_| {
                     ApiError::InvalidInput("stored browser user token is invalid".into())
@@ -151,7 +151,14 @@ impl ServiceNowClient {
             .default_headers(headers)
             .timeout(std::time::Duration::from_secs(30));
         if matches!(auth_type, AuthType::Browser) {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
+            builder = builder
+                .redirect(reqwest::redirect::Policy::none())
+                .cookie_provider(
+                    browser_cookies
+                        .as_ref()
+                        .expect("browser cookie jar was initialized")
+                        .provider(),
+                );
         }
         let http = builder.build()?;
         let table_url = format!("{site_url}/api/now/table");
@@ -160,6 +167,7 @@ impl ServiceNowClient {
         Ok(Self {
             http,
             auth_type,
+            browser_cookies,
             site_url,
             table_url,
             attachment_url,
@@ -168,6 +176,17 @@ impl ServiceNowClient {
 
     pub fn site_url(&self) -> &str {
         &self.site_url
+    }
+
+    /// Return a cookie header only when ServiceNow rotated the browser session.
+    ///
+    /// Callers with a persistent credential store can save this value after a
+    /// successful operation so the next CLI process resumes the current
+    /// server-side session. Environment-provided credentials remain read-only.
+    pub fn refreshed_browser_cookie(&self) -> Option<String> {
+        self.browser_cookies
+            .as_ref()
+            .and_then(BrowserCookies::refreshed_header)
     }
 
     pub fn record_url(&self, table: &str, sys_id: &str) -> String {
