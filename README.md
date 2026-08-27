@@ -89,6 +89,11 @@ servicenow tui cmdb_ci
 servicenow tui change_request --query 'active=true^ORDERBYDESCsys_updated_on'
 ```
 
+The default incident view shows active incidents assigned to the signed-in user
+or one of their assignment groups, ordered by most recently updated. Pass
+`--query` to open a different view, or clear the query with `/` inside the TUI
+to browse all incidents.
+
 The ledger adapts to the terminal width: wide terminals keep the selected
 record's field sheet beside the index, while compact terminals open that sheet
 on demand. Use `↑`/`↓` or `j`/`k` to move, `enter` to inspect, `/` to apply an

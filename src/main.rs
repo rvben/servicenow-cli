@@ -134,7 +134,7 @@ enum Command {
         #[arg(default_value = "incident")]
         table: String,
 
-        /// ServiceNow encoded query to apply
+        /// ServiceNow encoded query to apply instead of the default incident view
         #[arg(short, long)]
         query: Option<String>,
 

@@ -33,6 +33,7 @@ use crate::config::Config;
 const MIN_PAGE_SIZE: usize = 5;
 const MAX_PAGE_SIZE: usize = 200;
 const RELATED_VIEW_LIMIT: usize = 100;
+const DEFAULT_INCIDENT_QUERY: &str = "active=true^assigned_to=javascript:gs.getUserID()^ORassignment_group=javascript:getMyGroups()^ORDERBYDESCsys_updated_on";
 
 #[derive(Clone, Debug)]
 pub struct TuiOptions {
@@ -207,11 +208,15 @@ struct App {
 
 impl App {
     fn new(profile: &str, instance: &str, options: TuiOptions) -> Self {
+        let query = options
+            .query
+            .filter(|query| !query.trim().is_empty())
+            .or_else(|| default_query(&options.table));
         Self {
             profile: profile.into(),
             instance: compact_instance(instance),
             table: options.table,
-            query: options.query.filter(|query| !query.trim().is_empty()),
+            query,
             page_size: options.page_size,
             offset: 0,
             records: Vec::new(),
@@ -677,7 +682,7 @@ impl App {
                     return Action::None;
                 }
                 self.table = table.into();
-                self.query = None;
+                self.query = default_query(&self.table);
                 self.offset = 0;
                 self.table_state.select(Some(0));
                 Action::Load
@@ -2161,6 +2166,10 @@ fn compact_instance(instance: &str) -> String {
         .into()
 }
 
+fn default_query(table: &str) -> Option<String> {
+    (table == "incident").then(|| DEFAULT_INCIDENT_QUERY.into())
+}
+
 fn infer_columns(records: &[Value], table: &str) -> Vec<String> {
     if table == "incident" {
         return [
@@ -2387,6 +2396,52 @@ mod tests {
     }
 
     #[test]
+    fn incidents_open_on_active_work_assigned_to_the_user_or_their_groups() {
+        let app = App::new(
+            "work",
+            "https://dev12345.service-now.com",
+            TuiOptions {
+                table: "incident".into(),
+                query: None,
+                page_size: 25,
+                color: true,
+            },
+        );
+
+        assert_eq!(app.query.as_deref(), Some(DEFAULT_INCIDENT_QUERY));
+    }
+
+    #[test]
+    fn explicit_and_non_incident_views_do_not_inherit_the_incident_default() {
+        let explicit = App::new(
+            "work",
+            "https://dev12345.service-now.com",
+            TuiOptions {
+                table: "incident".into(),
+                query: Some("priority=1^ORDERBYDESCnumber".into()),
+                page_size: 25,
+                color: true,
+            },
+        );
+        let generic = App::new(
+            "work",
+            "https://dev12345.service-now.com",
+            TuiOptions {
+                table: "cmdb_ci".into(),
+                query: None,
+                page_size: 25,
+                color: true,
+            },
+        );
+
+        assert_eq!(
+            explicit.query.as_deref(),
+            Some("priority=1^ORDERBYDESCnumber")
+        );
+        assert_eq!(generic.query, None);
+    }
+
+    #[test]
     fn renders_identity_ledger_and_selected_record_without_secrets() {
         let backend = TestBackend::new(140, 34);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2562,6 +2617,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(matches!(app.overlay, Overlay::QueryInput(_)));
         if let Overlay::QueryInput(buffer) = &mut app.overlay {
+            buffer.clear();
             buffer.push_str("active=true");
         }
         assert_eq!(
