@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.4](https://github.com/rvben/servicenow-cli/compare/v0.4.3...v0.4.4) - 2026-08-27
+
+### Fixed
+
+- **auth**: persist rotated browser session cookies ([84d7b82](https://github.com/rvben/servicenow-cli/commit/84d7b8201eb5a13a101a738ce24c436b34f869db))
+
 ## [0.4.3](https://github.com/rvben/servicenow-cli/compare/v0.4.2...v0.4.3) - 2026-08-27
 
 ### Added
