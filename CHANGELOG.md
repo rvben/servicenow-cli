@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.4.5](https://github.com/rvben/servicenow-cli/compare/v0.4.4...v0.4.5) - 2026-08-31
+
+### Added
+
+- **tui**: add local page search ([41b3ca4](https://github.com/rvben/servicenow-cli/commit/41b3ca42ea7f8bc6651b45863941913b2626288b))
+
 ## [0.4.4](https://github.com/rvben/servicenow-cli/compare/v0.4.3...v0.4.4) - 2026-08-27
 
 ### Fixed
