@@ -65,6 +65,7 @@ enum Overlay {
     },
     TableInput(String),
     QueryInput(String),
+    SearchInput(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +182,7 @@ struct App {
     instance: String,
     table: String,
     query: Option<String>,
+    search: Option<String>,
     page_size: usize,
     offset: usize,
     records: Vec<Value>,
@@ -217,6 +219,7 @@ impl App {
             instance: compact_instance(instance),
             table: options.table,
             query,
+            search: None,
             page_size: options.page_size,
             offset: 0,
             records: Vec::new(),
@@ -267,11 +270,12 @@ impl App {
                 self.records = records;
                 self.clear_detail_record();
                 self.columns = infer_columns(&self.records, &self.table);
-                let selected = (!self.records.is_empty()).then_some(
+                let visible_records = self.visible_record_count();
+                let selected = (visible_records > 0).then_some(
                     self.table_state
                         .selected()
                         .unwrap_or(0)
-                        .min(self.records.len().saturating_sub(1)),
+                        .min(visible_records.saturating_sub(1)),
                 );
                 self.table_state.select(selected);
                 self.detail_scroll = 0;
@@ -279,6 +283,8 @@ impl App {
                 self.auth_failed = false;
                 self.notice = if self.records.is_empty() {
                     Notice::quiet("No records match this view. Press / to change the query.")
+                } else if self.search.is_some() {
+                    self.search_notice()
                 } else {
                     Notice::success(format!(
                         "Loaded {} record{}",
@@ -469,26 +475,79 @@ impl App {
     }
 
     fn selected_record(&self) -> Option<&Value> {
+        let visible_index = self.table_state.selected()?;
+        let record_index = self.matching_record_indices().nth(visible_index)?;
+        self.records.get(record_index)
+    }
+
+    fn matching_record_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        let search = self.search.as_deref();
+        self.records
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, record)| match search {
+                Some(search) if !record_matches_search(record, search) => None,
+                _ => Some(index),
+            })
+    }
+
+    fn visible_record_count(&self) -> usize {
+        self.matching_record_indices().count()
+    }
+
+    fn search_notice(&self) -> Notice {
+        let matches = self.visible_record_count();
+        let loaded = self.records.len();
+        if matches == 0 {
+            Notice::quiet(format!(
+                "No loaded records contain '{}'. Press s to change or clear the search.",
+                self.search.as_deref().unwrap_or_default()
+            ))
+        } else {
+            Notice::success(format!(
+                "{matches} of {loaded} loaded record{} match{}",
+                if loaded == 1 { "" } else { "s" },
+                if matches == 1 { "es" } else { "" }
+            ))
+        }
+    }
+
+    fn apply_search(&mut self, value: &str) {
+        let value = value.trim();
+        self.search = (!value.is_empty()).then(|| value.to_string());
         self.table_state
-            .selected()
-            .and_then(|index| self.records.get(index))
+            .select((self.visible_record_count() > 0).then_some(0));
+        self.detail_scroll = 0;
+        self.clear_detail_record();
+        self.notice = if self.search.is_some() {
+            self.search_notice()
+        } else if self.records.is_empty() {
+            Notice::quiet("No records match this view. Press / to change the query.")
+        } else {
+            Notice::success(format!(
+                "Showing all {} loaded record{}",
+                self.records.len(),
+                if self.records.len() == 1 { "" } else { "s" }
+            ))
+        };
     }
 
     fn select_next(&mut self) {
-        if self.records.is_empty() {
+        let visible_records = self.visible_record_count();
+        if visible_records == 0 {
             return;
         }
         let next = self
             .table_state
             .selected()
-            .map_or(0, |index| (index + 1).min(self.records.len() - 1));
+            .map_or(0, |index| (index + 1).min(visible_records - 1));
         self.table_state.select(Some(next));
         self.detail_scroll = 0;
         self.clear_detail_record();
     }
 
     fn select_previous(&mut self) {
-        if self.records.is_empty() {
+        if self.visible_record_count() == 0 {
             return;
         }
         let previous = self.table_state.selected().unwrap_or(0).saturating_sub(1);
@@ -502,7 +561,9 @@ impl App {
             return Action::Quit;
         }
         match &mut self.overlay {
-            Overlay::TableInput(buffer) | Overlay::QueryInput(buffer) => match key.code {
+            Overlay::TableInput(buffer)
+            | Overlay::QueryInput(buffer)
+            | Overlay::SearchInput(buffer) => match key.code {
                 KeyCode::Esc => {
                     self.overlay = Overlay::None;
                     Action::None
@@ -614,14 +675,15 @@ impl App {
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.table_state
-                        .select((!self.records.is_empty()).then_some(0));
+                        .select((self.visible_record_count() > 0).then_some(0));
                     self.detail_scroll = 0;
                     self.clear_detail_record();
                     Action::None
                 }
                 KeyCode::End | KeyCode::Char('G') => {
+                    let visible_records = self.visible_record_count();
                     self.table_state
-                        .select((!self.records.is_empty()).then_some(self.records.len() - 1));
+                        .select((visible_records > 0).then_some(visible_records.saturating_sub(1)));
                     self.detail_scroll = 0;
                     self.clear_detail_record();
                     Action::None
@@ -657,6 +719,10 @@ impl App {
                     self.overlay = Overlay::QueryInput(self.query.clone().unwrap_or_default());
                     Action::None
                 }
+                KeyCode::Char('s') => {
+                    self.overlay = Overlay::SearchInput(self.search.clone().unwrap_or_default());
+                    Action::None
+                }
                 KeyCode::Char('?') => {
                     self.overlay = Overlay::Help {
                         return_to_detail: false,
@@ -683,9 +749,14 @@ impl App {
                 }
                 self.table = table.into();
                 self.query = default_query(&self.table);
+                self.search = None;
                 self.offset = 0;
                 self.table_state.select(Some(0));
                 Action::Load
+            }
+            Overlay::SearchInput(value) => {
+                self.apply_search(&value);
+                Action::None
             }
             Overlay::QueryInput(value) => {
                 self.query = (!value.trim().is_empty()).then(|| value.trim().into());
@@ -834,8 +905,15 @@ impl App {
             Overlay::QueryInput(buffer) => render_input(
                 frame,
                 theme,
-                "FILTER RECORDS",
+                "QUERY SERVICENOW",
                 "ServiceNow encoded query; blank clears",
+                &buffer,
+            ),
+            Overlay::SearchInput(buffer) => render_input(
+                frame,
+                theme,
+                "SEARCH THIS PAGE",
+                "Matches loaded display values; blank clears",
                 &buffer,
             ),
             Overlay::Detail => self.render_detail_sheet(frame, frame.area(), theme, true),
@@ -979,8 +1057,47 @@ impl App {
             return;
         }
 
+        let matching_indices = self.matching_record_indices().collect::<Vec<_>>();
+        if matching_indices.is_empty() {
+            let search = safe_text(self.search.as_deref().unwrap_or_default());
+            let recovery = if self.has_next_page {
+                Line::from(vec![
+                    Span::styled("s", theme.key()),
+                    Span::styled(" change or clear search   ", theme.muted()),
+                    Span::styled("n", theme.key()),
+                    Span::styled(" search next page", theme.muted()),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("s", theme.key()),
+                    Span::styled(" change or clear search   ", theme.muted()),
+                    Span::styled("/", theme.key()),
+                    Span::styled(" broaden query", theme.muted()),
+                ])
+            };
+            let empty = Paragraph::new(vec![
+                Line::styled("NO LOCAL MATCHES", theme.title()),
+                Line::styled(
+                    format!("No records on this loaded page contain '{}'.", search),
+                    theme.muted(),
+                ),
+                recovery,
+            ])
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(" LOCAL SEARCH ")
+                    .borders(Borders::ALL)
+                    .border_style(theme.rule()),
+            );
+            frame.render_widget(empty, area);
+            return;
+        }
+
         let visible_columns = visible_columns(&self.columns, area.width);
-        let rows = self.records.iter().map(|record| {
+        let rows = matching_indices.iter().map(|index| {
+            let record = &self.records[*index];
             let cells = visible_columns
                 .iter()
                 .map(|field| Cell::from(display_field(record, field)));
@@ -1002,11 +1119,24 @@ impl App {
             .into_iter()
             .map(|weight| Constraint::Ratio(weight, total_weight))
             .collect();
-        let title = format!(
-            " RECORD INDEX  {}–{} ",
-            self.offset + 1,
-            self.offset + self.records.len()
-        );
+        let title = if self.search.is_some() {
+            format!(
+                " RECORD INDEX  ·  {} OF {} LOCAL MATCH{} ",
+                matching_indices.len(),
+                self.records.len(),
+                if matching_indices.len() == 1 {
+                    ""
+                } else {
+                    "ES"
+                }
+            )
+        } else {
+            format!(
+                " RECORD INDEX  {}–{} ",
+                self.offset + 1,
+                self.offset + self.records.len()
+            )
+        };
         let table = Table::new(rows, widths)
             .header(header)
             .row_highlight_style(theme.selection())
@@ -1269,6 +1399,10 @@ impl App {
             NoticeKind::Error => theme.error(),
         };
         let query = safe_text(self.query.as_deref().unwrap_or("all records"));
+        let context = self.search.as_deref().map_or_else(
+            || format!("QUERY  {query}"),
+            |search| format!("SEARCH  {}  ·  QUERY  {query}", safe_text(search)),
+        );
         let notice_limit = usize::from(area.width).saturating_div(2).max(20);
         let notice = truncate_text(&self.notice.text, notice_limit);
         let previous_key = if self.offset > 0 {
@@ -1292,14 +1426,48 @@ impl App {
                 Span::styled("q", theme.key()),
                 Span::styled(" quit", theme.muted()),
             ])
+        } else if area.width < 80 {
+            Line::from(vec![
+                Span::styled("↑↓", theme.key()),
+                Span::styled(" move  ", theme.muted()),
+                Span::styled("enter", theme.key()),
+                Span::styled(" inspect  ", theme.muted()),
+                Span::styled("s", theme.key()),
+                Span::styled(" search  ", theme.muted()),
+                Span::styled("?", theme.key()),
+                Span::styled(" help  ", theme.muted()),
+                Span::styled("q", theme.key()),
+                Span::styled(" quit", theme.muted()),
+            ])
+        } else if area.width < 112 {
+            Line::from(vec![
+                Span::styled("↑↓", theme.key()),
+                Span::styled(" move  ", theme.muted()),
+                Span::styled("enter", theme.key()),
+                Span::styled(" inspect  ", theme.muted()),
+                Span::styled("s", theme.key()),
+                Span::styled(" search  ", theme.muted()),
+                Span::styled("/", theme.key()),
+                Span::styled(" query  ", theme.muted()),
+                Span::styled("t", theme.key()),
+                Span::styled(" table  ", theme.muted()),
+                Span::styled("p/n", theme.key()),
+                Span::styled(" page  ", theme.muted()),
+                Span::styled("?", theme.key()),
+                Span::styled(" help  ", theme.muted()),
+                Span::styled("q", theme.key()),
+                Span::styled(" quit", theme.muted()),
+            ])
         } else {
             Line::from(vec![
                 Span::styled("↑↓", theme.key()),
                 Span::styled(" move  ", theme.muted()),
                 Span::styled("enter", theme.key()),
                 Span::styled(" inspect  ", theme.muted()),
+                Span::styled("s", theme.key()),
+                Span::styled(" search  ", theme.muted()),
                 Span::styled("/", theme.key()),
-                Span::styled(" filter  ", theme.muted()),
+                Span::styled(" query  ", theme.muted()),
                 Span::styled("t", theme.key()),
                 Span::styled(" table  ", theme.muted()),
                 Span::styled("p", previous_key),
@@ -1330,7 +1498,7 @@ impl App {
             Line::from(vec![
                 Span::styled(format!(" {notice} "), notice_style),
                 Span::styled(
-                    format!("  QUERY  {}", truncate_text(&query, notice_limit)),
+                    format!("  {}", truncate_text(&context, notice_limit)),
                     theme.muted(),
                 ),
             ])
@@ -1354,6 +1522,7 @@ impl App {
             ("tab / shift-tab", "Move through incident detail views"),
             ("1 / 2 / 3 / 4", "Open Overview, Activity, Files, or SLAs"),
             ("t", "Browse another table"),
+            ("s", "Search display values on the loaded page"),
             ("/", "Set or clear an encoded query"),
             ("n / p", "Load the next or previous page"),
             ("r", "Reload the current page or incident view"),
@@ -2278,6 +2447,28 @@ fn display_field_value(field: &str, value: &Value) -> String {
     }
 }
 
+fn record_matches_search(record: &Value, search: &str) -> bool {
+    let terms = search
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return true;
+    }
+    let Some(fields) = record.as_object() else {
+        let haystack = display_value(record).to_lowercase();
+        return terms.iter().all(|term| haystack.contains(term));
+    };
+    let haystack = fields
+        .iter()
+        .filter(|(field, _)| !is_sensitive_field(field))
+        .map(|(field, value)| display_field_value(field, value))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
 fn display_value(value: &Value) -> String {
     let value = match value {
         Value::Object(object) => object
@@ -2602,6 +2793,114 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text = rendered_text(terminal.backend().buffer());
         assert!(text.contains("TAIL"));
+    }
+
+    #[test]
+    fn local_search_matches_display_values_without_inspecting_secrets() {
+        let app = app();
+        let record = &app.records[0];
+
+        assert!(record_matches_search(record, "mail"));
+        assert!(record_matches_search(record, "AVERY progress"));
+        assert!(record_matches_search(record, "critical"));
+        assert!(!record_matches_search(record, "never-rendered"));
+
+        let reference = serde_json::json!({
+            "assigned_to": {
+                "value": "raw-user-reference",
+                "display_value": "Avery Stone"
+            }
+        });
+        assert!(!record_matches_search(&reference, "raw-user-reference"));
+    }
+
+    #[test]
+    fn local_search_filters_selection_and_blank_input_restores_the_page() {
+        let mut app = app();
+        app.records.push(serde_json::json!({
+            "sys_id": "fedcba9876543210fedcba9876543210",
+            "number": "INC0010002",
+            "short_description": "VPN unavailable",
+            "assigned_to": {"value": "def", "display_value": "Grace Hopper"}
+        }));
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(matches!(app.overlay, Overlay::SearchInput(_)));
+        if let Overlay::SearchInput(buffer) = &mut app.overlay {
+            buffer.push_str("grace vpn");
+        }
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.visible_record_count(), 1);
+        assert_eq!(app.table_state.selected(), Some(0));
+        assert_eq!(
+            app.selected_record().map(record_title).as_deref(),
+            Some("INC0010002")
+        );
+
+        app.overlay = Overlay::QueryInput("active=true".into());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Load
+        );
+        assert_eq!(app.search.as_deref(), Some("grace vpn"));
+
+        app.overlay = Overlay::SearchInput(String::new());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.search, None);
+        assert_eq!(app.visible_record_count(), 2);
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn local_search_empty_state_is_distinct_from_an_empty_service_now_view() {
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.apply_search("vpn");
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        if std::env::var_os("SERVICENOW_TUI_SNAPSHOT").is_some() {
+            eprintln!("\n{text}");
+        }
+        assert!(text.contains("NO LOCAL MATCHES"));
+        assert!(text.contains("No records on this loaded page contain 'vpn'"));
+        assert!(!text.contains("THE LEDGER IS EMPTY"));
+    }
+
+    #[test]
+    fn persisted_search_can_be_cleared_when_service_now_returns_no_records() {
+        let mut app = app();
+        app.apply_search("mail");
+        app.records.clear();
+        app.table_state.select(None);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Action::None
+        );
+        let Overlay::SearchInput(buffer) = &mut app.overlay else {
+            panic!("expected search input overlay");
+        };
+        assert_eq!(buffer, "mail");
+        buffer.clear();
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.search, None);
+        assert_eq!(app.visible_record_count(), 0);
+        assert!(app.notice.text.contains("No records match this view"));
     }
 
     #[test]

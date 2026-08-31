@@ -97,8 +97,10 @@ to browse all incidents.
 The ledger adapts to the terminal width: wide terminals keep the selected
 record's field sheet beside the index, while compact terminals open that sheet
 on demand. Use `↑`/`↓` or `j`/`k` to move, `enter` to inspect, `/` to apply an
-encoded query, `t` to change tables, `n`/`p` to page, and `?` for the complete
-keyboard map. Press `o` to hand the selected record off to the ServiceNow web
+encoded query, `s` to search display values on the currently loaded page, `t`
+to change tables, `n`/`p` to page, and `?` for the complete keyboard map. Local
+search stays active across page loads and query changes; submit a blank search
+to clear it. Press `o` to hand the selected record off to the ServiceNow web
 interface.
 
 You can launch the TUI before setup is complete. If the active profile is not
