@@ -91,6 +91,42 @@ fn authenticated_command(config_home: &TempDir, server: &MockServer) -> Command 
     command
 }
 
+fn cache_incident_resolution_choices(config_home: &TempDir) {
+    let path = config_home
+        .path()
+        .join("cache/servicenow/metadata/default/incident.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "table": "incident",
+            "fetched_at": 1,
+            "fields": [],
+            "choices": {
+                "state": [
+                    {"value": "2", "label": "In Progress", "sequence": 20},
+                    {"value": "9", "label": "Resolved", "sequence": 90},
+                    {"value": "7", "label": "Closed", "sequence": 100}
+                ],
+                "close_code": [
+                    {
+                        "value": "solved_permanently",
+                        "label": "Solved (Permanently)",
+                        "sequence": 10
+                    },
+                    {
+                        "value": "solved_workaround",
+                        "label": "Solved (Work Around)",
+                        "sequence": 20
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn schema_is_offline_and_machine_readable() {
     let config_home = TempDir::new().unwrap();
@@ -188,6 +224,33 @@ fn schema_marks_destructive_and_dry_run_commands() {
     assert_eq!(deletion["behavior"]["destructive"], true);
     assert_eq!(deletion["behavior"]["requiresConfirmation"], true);
     assert_eq!(deletion["behavior"]["supportsDryRun"], true);
+
+    let resolution = command(&config_home)
+        .args(["schema", "--command", "incidents resolve"])
+        .output()
+        .unwrap();
+    let resolution: serde_json::Value = serde_json::from_slice(&resolution.stdout).unwrap();
+    assert_eq!(resolution["behavior"]["mutation"], true);
+    assert_eq!(resolution["behavior"]["destructive"], false);
+    assert_eq!(resolution["behavior"]["requiresConfirmation"], false);
+    assert_eq!(resolution["behavior"]["supportsDryRun"], true);
+    assert_eq!(resolution["argumentGroups"][0]["required"], true);
+    assert_eq!(
+        resolution["argumentGroups"][0]["arguments"],
+        serde_json::json!(["notes", "notes_file"])
+    );
+    let state = resolution["arguments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|argument| argument["id"] == "state")
+        .unwrap();
+    assert!(
+        state["dynamicDefault"]
+            .as_str()
+            .unwrap()
+            .contains("Resolved")
+    );
 }
 
 #[tokio::test]
@@ -858,6 +921,182 @@ async fn incident_edit_applies_only_changed_fields() {
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["result"]["short_description"], "After");
+}
+
+#[tokio::test]
+async fn incident_resolve_dry_run_maps_configured_labels_without_patching() {
+    let config_home = TempDir::new().unwrap();
+    cache_incident_resolution_choices(&config_home);
+    let server = MockServer::start().await;
+    let sys_id = "0123456789abcdef0123456789abcdef";
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/table/incident/{sys_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "INC0010001",
+                "state": {"value": "2", "display_value": "In Progress"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .env("SERVICENOW_READ_ONLY", "true")
+        .args([
+            "incidents",
+            "resolve",
+            sys_id,
+            "--code",
+            "solved (permanently)",
+            "--notes",
+            "Restored the VPN gateway configuration.",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["operation"], "resolve");
+    assert_eq!(result["changes"]["state"], "9");
+    assert_eq!(result["changes"]["close_code"], "solved_permanently");
+    assert_eq!(
+        result["changes"]["close_notes"],
+        "Restored the VPN gateway configuration."
+    );
+}
+
+#[tokio::test]
+async fn incident_resolve_patches_resolution_atomically_with_custom_fields() {
+    let config_home = TempDir::new().unwrap();
+    cache_incident_resolution_choices(&config_home);
+    let server = MockServer::start().await;
+    let sys_id = "0123456789abcdef0123456789abcdef";
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/table/incident/{sys_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "INC0010001",
+                "state": {"value": "2", "display_value": "In Progress"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/now/table/incident/{sys_id}")))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "state": "9",
+            "close_code": "solved_workaround",
+            "close_notes": "Temporary route restored service.\n",
+            "u_resolution_source": "network_runbook"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "INC0010001",
+                "state": "9",
+                "close_code": "solved_workaround"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let notes = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(notes.path(), "Temporary route restored service.\n").unwrap();
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "incidents",
+            "resolve",
+            sys_id,
+            "--code",
+            "Solved (Work Around)",
+            "--notes-file",
+            notes.path().to_str().unwrap(),
+            "--field",
+            "u_resolution_source=network_runbook",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"]["state"], "9");
+    assert_eq!(result["result"]["close_code"], "solved_workaround");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Resolved"));
+}
+
+#[tokio::test]
+async fn incident_resolve_refuses_closed_incidents() {
+    let config_home = TempDir::new().unwrap();
+    cache_incident_resolution_choices(&config_home);
+    let server = MockServer::start().await;
+    let sys_id = "0123456789abcdef0123456789abcdef";
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/table/incident/{sys_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": sys_id,
+                "number": "INC0010001",
+                "state": {"value": "7", "display_value": "Closed"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    authenticated_command(&config_home, &server)
+        .args([
+            "incidents",
+            "resolve",
+            sys_id,
+            "--code",
+            "solved_permanently",
+            "--notes",
+            "Already closed.",
+        ])
+        .assert()
+        .code(7)
+        .stderr(predicate::str::contains("already Closed"));
+}
+
+#[tokio::test]
+async fn incident_resolve_requires_non_empty_notes_before_network_access() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    authenticated_command(&config_home, &server)
+        .args([
+            "incidents",
+            "resolve",
+            "INC0010001",
+            "--code",
+            "solved_permanently",
+            "--notes",
+            "   ",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("resolution notes cannot be empty"));
 }
 
 #[tokio::test]

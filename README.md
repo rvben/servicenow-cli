@@ -144,9 +144,19 @@ servicenow incidents update INC0010042 --state 2
 # Focused daily actions
 servicenow incidents note INC0010042 "Investigating the gateway"
 servicenow incidents assign INC0010042 --to ada@example.com --group "Network"
+servicenow incidents resolve INC0010042 \
+  --code "Solved (Permanently)" \
+  --notes "Corrected the VPN gateway configuration"
 servicenow incidents open INC0010042
 servicenow incidents watch INC0010042
 ```
+
+Resolution is a guarded, atomic workflow: the CLI maps configured state and
+resolution-code labels to their raw values, requires non-empty resolution notes,
+and refuses incidents that are already resolved, closed, or canceled. Use
+`--notes-file PATH` for longer notes, repeated `--field name=value` arguments for
+instance-specific mandatory fields, `--state` for a customized resolved state,
+or `--refresh` after instance choices change.
 
 Edit safely in `$EDITOR`. The document contains only curated editable fields;
 the CLI shows a diff, confirms, and PATCHes only values that changed:
@@ -158,6 +168,8 @@ servicenow incidents edit INC0010042
 servicenow incidents edit INC0010042 --file incident.yaml --dry-run
 servicenow incidents note INC0010042 --file note.md --dry-run
 servicenow incidents assign INC0010042 --to @me --dry-run
+servicenow incidents resolve INC0010042 \
+  --code "Solved (Work Around)" --notes-file resolution.md --dry-run
 ```
 
 Use repeated `--field name=value` arguments for instance-specific fields.

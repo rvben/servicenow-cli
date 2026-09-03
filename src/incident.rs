@@ -21,6 +21,119 @@ pub const EDITABLE_FIELDS: &[&str] = &[
     "close_notes",
 ];
 
+pub const DEFAULT_RESOLVED_STATE: &str = "6";
+
+pub fn resolution_choice_value(
+    metadata: &TableMetadata,
+    field: &str,
+    input: &str,
+) -> Result<String, ApiError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(ApiError::InvalidInput(format!(
+            "{} cannot be empty",
+            resolution_field_name(field)
+        )));
+    }
+    let Some(choices) = metadata.choices.get(field) else {
+        return Ok(input.into());
+    };
+    if choices.is_empty() {
+        return Ok(input.into());
+    }
+    if let Some(choice) = choices.iter().find(|choice| choice.value == input) {
+        return Ok(choice.value.clone());
+    }
+    if let Some(choice) = choices
+        .iter()
+        .find(|choice| choice.label.eq_ignore_ascii_case(input))
+    {
+        return Ok(choice.value.clone());
+    }
+    let configured = choices
+        .iter()
+        .map(|choice| format!("{} ({})", choice.label, choice.value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ApiError::InvalidInput(format!(
+        "unknown {} '{input}'; configured choices: {configured}. Rerun with --refresh if the instance configuration changed",
+        resolution_field_name(field)
+    )))
+}
+
+pub fn resolved_state_value(
+    metadata: &TableMetadata,
+    requested: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(requested) = requested {
+        return resolution_choice_value(metadata, "state", requested);
+    }
+    let Some(choices) = metadata.choices.get("state") else {
+        return Ok(DEFAULT_RESOLVED_STATE.into());
+    };
+    if choices.is_empty() {
+        return Ok(DEFAULT_RESOLVED_STATE.into());
+    }
+    choices
+        .iter()
+        .find(|choice| choice.label.eq_ignore_ascii_case("Resolved"))
+        .or_else(|| {
+            choices
+                .iter()
+                .find(|choice| choice.value == DEFAULT_RESOLVED_STATE)
+        })
+        .map(|choice| choice.value.clone())
+        .ok_or_else(|| {
+            ApiError::InvalidInput(
+                "the incident metadata has no Resolved state; supply its configured label or value with --state"
+                    .into(),
+            )
+        })
+}
+
+pub fn require_resolvable(
+    record: &Value,
+    resolved_state: &str,
+    metadata: &TableMetadata,
+) -> Result<(), ApiError> {
+    let Some(current_value) = record.get("state").and_then(raw_text) else {
+        return Ok(());
+    };
+    let display = record
+        .get("state")
+        .and_then(|value| value.get("display_value"))
+        .and_then(Value::as_str)
+        .or_else(|| metadata.choice_label("state", current_value));
+    if current_value == resolved_state
+        || display.is_some_and(|label| label.eq_ignore_ascii_case("Resolved"))
+    {
+        return Err(ApiError::Conflict("incident is already resolved".into()));
+    }
+    let terminal_value = matches!(current_value, "7" | "8");
+    let terminal_label = display.is_some_and(|label| {
+        matches!(
+            label.to_ascii_lowercase().as_str(),
+            "closed" | "canceled" | "cancelled"
+        )
+    });
+    if terminal_value || terminal_label {
+        return Err(ApiError::Conflict(format!(
+            "incident is already {}; closed or canceled incidents cannot be resolved",
+            display.unwrap_or("in a terminal state")
+        )));
+    }
+    Ok(())
+}
+
+fn resolution_field_name(field: &str) -> &str {
+    match field {
+        "state" => "resolution state",
+        "close_code" => "resolution code",
+        "close_notes" => "resolution notes",
+        _ => field,
+    }
+}
+
 pub fn edit_document(record: &Value, metadata: Option<&TableMetadata>) -> Result<String, ApiError> {
     let object = record
         .as_object()
@@ -155,5 +268,100 @@ mod tests {
     fn editor_rejects_unknown_fields() {
         let error = parse_edit_document("sys_id: dangerous\n").unwrap_err();
         assert!(matches!(error, ApiError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn resolution_choices_accept_values_and_case_insensitive_labels() {
+        let metadata = resolution_metadata();
+        assert_eq!(
+            resolution_choice_value(&metadata, "close_code", "Solved (Permanently)").unwrap(),
+            "solved_permanently"
+        );
+        assert_eq!(
+            resolution_choice_value(&metadata, "close_code", "solved_permanently").unwrap(),
+            "solved_permanently"
+        );
+        assert_eq!(resolved_state_value(&metadata, None).unwrap(), "9");
+
+        let metadata_without_choices = TableMetadata {
+            table: "incident".into(),
+            fetched_at: 0,
+            fields: Vec::new(),
+            choices: BTreeMap::new(),
+        };
+        assert_eq!(
+            resolved_state_value(&metadata_without_choices, None).unwrap(),
+            DEFAULT_RESOLVED_STATE
+        );
+        assert_eq!(
+            resolution_choice_value(&metadata_without_choices, "close_code", "custom_resolution")
+                .unwrap(),
+            "custom_resolution"
+        );
+    }
+
+    #[test]
+    fn resolution_choices_reject_unknown_values_when_choices_are_known() {
+        let error =
+            resolution_choice_value(&resolution_metadata(), "close_code", "typo").unwrap_err();
+        assert!(matches!(error, ApiError::InvalidInput(_)));
+        assert!(error.to_string().contains("Solved (Permanently)"));
+        assert!(error.to_string().contains("--refresh"));
+    }
+
+    #[test]
+    fn terminal_and_resolved_incidents_cannot_be_resolved_again() {
+        let metadata = resolution_metadata();
+        let resolved = serde_json::json!({
+            "state": {"value": "9", "display_value": "Resolved"}
+        });
+        assert!(matches!(
+            require_resolvable(&resolved, "9", &metadata),
+            Err(ApiError::Conflict(_))
+        ));
+
+        let closed = serde_json::json!({
+            "state": {"value": "7", "display_value": "Closed"}
+        });
+        assert!(matches!(
+            require_resolvable(&closed, "9", &metadata),
+            Err(ApiError::Conflict(_))
+        ));
+
+        let canceled = serde_json::json!({
+            "state": {"value": "42", "display_value": "Canceled"}
+        });
+        assert!(matches!(
+            require_resolvable(&canceled, "9", &metadata),
+            Err(ApiError::Conflict(_))
+        ));
+    }
+
+    fn resolution_metadata() -> TableMetadata {
+        use crate::metadata::ChoiceMetadata;
+
+        TableMetadata {
+            table: "incident".into(),
+            fetched_at: 0,
+            fields: Vec::new(),
+            choices: BTreeMap::from([
+                (
+                    "state".into(),
+                    vec![ChoiceMetadata {
+                        value: "9".into(),
+                        label: "Resolved".into(),
+                        sequence: 90,
+                    }],
+                ),
+                (
+                    "close_code".into(),
+                    vec![ChoiceMetadata {
+                        value: "solved_permanently".into(),
+                        label: "Solved (Permanently)".into(),
+                        sequence: 10,
+                    }],
+                ),
+            ]),
+        }
     }
 }

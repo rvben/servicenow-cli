@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Read, Write};
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use dialoguer::{Confirm, Editor, Input, Password, Select};
 use serde_json::{Map, Value};
@@ -406,6 +406,46 @@ enum IncidentsCommand {
         /// Additional field as name=value; repeatable
         #[arg(long = "field")]
         fields: Vec<String>,
+    },
+
+    /// Resolve an incident with its required resolution details
+    #[command(group(
+        ArgGroup::new("resolution_notes")
+            .required(true)
+            .multiple(false)
+            .args(["notes", "notes_file"])
+    ))]
+    Resolve {
+        /// Incident number or sys_id
+        identifier: String,
+
+        /// Resolution code value or configured label
+        #[arg(long)]
+        code: String,
+
+        /// Resolution notes
+        #[arg(long)]
+        notes: Option<String>,
+
+        /// Read resolution notes from a file, or - for stdin
+        #[arg(long, value_name = "PATH")]
+        notes_file: Option<std::path::PathBuf>,
+
+        /// Resolved-state value or configured label; inferred from metadata when omitted
+        #[arg(long)]
+        state: Option<String>,
+
+        /// Additional field as name=value; repeatable
+        #[arg(long = "field")]
+        fields: Vec<String>,
+
+        /// Refresh incident choices before resolving
+        #[arg(long)]
+        refresh: bool,
+
+        /// Preview the update without sending it
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Edit an incident safely in your preferred editor
@@ -2074,6 +2114,79 @@ async fn run_incidents(
             output.success("Incident updated.");
             emit_record(output, record);
         }
+        IncidentsCommand::Resolve {
+            identifier,
+            code,
+            notes,
+            notes_file,
+            state,
+            fields,
+            refresh,
+            dry_run,
+        } => {
+            let notes = match (notes, notes_file) {
+                (Some(notes), None) => notes,
+                (None, Some(path)) => read_file_or_stdin(&path, "resolution notes")?,
+                (Some(_), Some(_)) => unreachable!("clap rejects conflicting note inputs"),
+                (None, None) => {
+                    return Err(ApiError::InvalidInput(
+                        "resolution notes are required; provide --notes or --notes-file".into(),
+                    ));
+                }
+            };
+            if notes.trim().is_empty() {
+                return Err(ApiError::InvalidInput(
+                    "resolution notes cannot be empty".into(),
+                ));
+            }
+            if code.trim().is_empty() {
+                return Err(ApiError::InvalidInput(
+                    "resolution code cannot be empty".into(),
+                ));
+            }
+            let mut body = build_body(None, &fields)?;
+            for reserved in ["state", "close_code", "close_notes"] {
+                if body.contains_key(reserved) {
+                    return Err(ApiError::InvalidInput(format!(
+                        "--field {reserved}=... conflicts with the dedicated resolution option"
+                    )));
+                }
+            }
+            if !dry_run {
+                config.require_writable()?;
+            }
+            let metadata = if refresh {
+                metadata::sync_table(client, &config.profile, "incident").await?
+            } else if let Some(metadata) = metadata::load(&config.profile, "incident")? {
+                metadata
+            } else {
+                metadata::sync_table(client, &config.profile, "incident").await?
+            };
+            let resolved_state = incident::resolved_state_value(&metadata, state.as_deref())?;
+            let resolution_code =
+                incident::resolution_choice_value(&metadata, "close_code", &code)?;
+            body.insert("state".into(), Value::String(resolved_state.clone()));
+            body.insert("close_code".into(), Value::String(resolution_code));
+            body.insert("close_notes".into(), Value::String(notes));
+
+            let existing = resolve_incident(
+                client,
+                &identifier,
+                Some(vec!["sys_id".into(), "number".into(), "state".into()]),
+                DisplayValue::All,
+            )
+            .await?;
+            incident::require_resolvable(&existing, &resolved_state, &metadata)?;
+            if dry_run {
+                emit_mutation_plan(output, "resolve", &identifier, &body);
+                return Ok(());
+            }
+            let record = client
+                .update_record("incident", record_sys_id(&existing)?, &body)
+                .await?;
+            output.success(&format!("Resolved {identifier}."));
+            emit_record(output, record);
+        }
         IncidentsCommand::Edit {
             identifier,
             file,
@@ -2987,14 +3100,33 @@ fn command_schema(command: &clap::Command, path: &str) -> Value {
         "path": path,
         "about": command.get_about().map(|value| value.to_string()),
         "arguments": args,
+        "argumentGroups": command_argument_groups(path),
         "commands": commands,
         "behavior": command_behavior(path),
     })
 }
 
+fn command_argument_groups(path: &str) -> Vec<Value> {
+    if path.ends_with("incidents resolve") {
+        vec![serde_json::json!({
+            "id": "resolution_notes",
+            "arguments": ["notes", "notes_file"],
+            "required": true,
+            "multiple": false,
+        })]
+    } else {
+        Vec::new()
+    }
+}
+
 fn argument_dynamic_default(path: &str, argument: &str) -> Option<&'static str> {
     if argument == "display_value" {
         return Some("display values for text output; raw values for machine output");
+    }
+    if path.ends_with("incidents resolve") && argument == "state" {
+        return Some(
+            "the configured Resolved choice; standard value 6 when choices are unavailable",
+        );
     }
     if path.ends_with("init") || path.ends_with("auth login") {
         return match argument {
@@ -3047,6 +3179,7 @@ fn command_behavior(path: &str) -> Value {
     let remote_mutations = [
         "incidents create",
         "incidents update",
+        "incidents resolve",
         "incidents edit",
         "incidents note",
         "incidents assign",
@@ -3106,6 +3239,7 @@ fn command_behavior(path: &str) -> Value {
         || path.ends_with("profile remove");
     let requires_confirmation = destructive || path.ends_with("incidents edit");
     let supports_dry_run = [
+        "incidents resolve",
         "incidents edit",
         "incidents note",
         "incidents assign",
