@@ -3,7 +3,7 @@
 The recommended setup is an OS-keychain-backed named profile:
 
 ```sh
-servicenow setup work --instance company
+servicenow init --profile work --instance company
 servicenow auth status
 servicenow profile list
 ```
@@ -41,7 +41,7 @@ Browser sign-in is the recommended employee experience for SAML/Entra-federated
 instances when no OAuth application is available:
 
 ```sh
-servicenow setup work --instance company --method browser
+servicenow init --profile work --instance company --method browser
 ```
 
 The CLI launches Edge InPrivate or Chrome/Chromium Incognito with a new
@@ -73,7 +73,7 @@ sessions do not have OAuth refresh tokens, so when ServiceNow expires the
 session, sign in again without repeating setup:
 
 ```sh
-servicenow auth login work --method browser
+servicenow auth login --profile work --method browser
 ```
 
 The CLI never retries a failed command automatically after session expiry. This
@@ -95,13 +95,13 @@ not open a debugging port to the LAN.
 
 ```sh
 # Prefer the matching Linux browser on WSL, then use its Windows counterpart.
-SERVICENOW_BROWSER=chrome servicenow auth login work --method browser
-SERVICENOW_BROWSER=edge servicenow auth login work --method browser
-SERVICENOW_BROWSER=chromium servicenow auth login work --method browser
+SERVICENOW_BROWSER=chrome servicenow auth login --profile work --method browser
+SERVICENOW_BROWSER=edge servicenow auth login --profile work --method browser
+SERVICENOW_BROWSER=chromium servicenow auth login --profile work --method browser
 
 # Explicitly use the Windows bridge.
-SERVICENOW_BROWSER=windows-edge servicenow auth login work --method browser
-SERVICENOW_BROWSER=windows-chrome servicenow auth login work --method browser
+SERVICENOW_BROWSER=windows-edge servicenow auth login --profile work --method browser
+SERVICENOW_BROWSER=windows-chrome servicenow auth login --profile work --method browser
 ```
 
 For the Windows fallback, the CLI checks the managed
@@ -113,7 +113,7 @@ error instead of waiting for the browser channel to time out.
 To see where an in-progress handoff is waiting, enable safe verbose diagnostics:
 
 ```sh
-servicenow auth login work --method browser --verbose
+servicenow auth login --profile work --method browser --verbose
 ```
 
 The timestamped stderr log includes only allowlisted stage transitions and HTTP
@@ -130,7 +130,7 @@ show the storage prompt.
 For non-interactive setup, opt in explicitly:
 
 ```sh
-servicenow setup work --insecure-storage \
+servicenow init --profile work --insecure-storage \
   --instance company --method basic --username api-user \
   --secret-stdin
 ```
@@ -149,7 +149,7 @@ create an **OAuth API endpoint for external clients** and register the loopback
 redirect URI. Then run:
 
 ```sh
-servicenow auth login work \
+servicenow auth login --profile work \
   --instance company \
   --method oauth \
   --client-id YOUR_CLIENT_ID \
@@ -173,7 +173,7 @@ instance and OAuth settings—no credential or secret—and prints the resume
 command. Once the administrator responds, continue without repeating discovery:
 
 ```sh
-servicenow auth login work --client-id YOUR_CLIENT_ID
+servicenow auth login --profile work --client-id YOUR_CLIENT_ID
 ```
 
 The client secret prompt is explicitly marked optional; press Enter when the
@@ -199,7 +199,7 @@ or issue reports.
 Create production profiles as read-only until writes are deliberately needed:
 
 ```sh
-servicenow auth login production --instance company --read-only
+servicenow auth login --profile production --instance company --read-only
 servicenow profile use production
 ```
 
@@ -209,6 +209,6 @@ change can be inspected without sending it.
 ## Migrating from 0.1
 
 Version 0.2 can read the legacy `password` and `token` TOML fields, but it never
-writes them. Run `servicenow auth login PROFILE` to move the credential to the
-OS keychain, verify with `servicenow auth status`, and then remove the plaintext
-secret from any backups or copied configuration.
+writes them. Run `servicenow auth login --profile PROFILE` to move the credential
+to the OS keychain, verify with `servicenow auth status`, and then remove the
+plaintext secret from any backups or copied configuration.

@@ -58,16 +58,19 @@ cargo install --path .
 
 ```sh
 # Detects SSO and opens a private browser window; no OAuth app is required.
-servicenow init work --instance company
+servicenow init --profile work --instance company
 
 # Managed OAuth remains available when your organization provides a client ID:
-servicenow auth login work --instance company --method oauth \
+servicenow auth login --profile work --instance company --method oauth \
   --client-id YOUR_CLIENT_ID
 
 # On headless Linux/WSL2, choose the permission-locked file fallback directly:
-servicenow init work --instance company --insecure-storage
+servicenow init --profile work --instance company --insecure-storage
 
+servicenow auth status
+servicenow auth status --offline
 servicenow doctor
+servicenow doctor --offline
 servicenow incidents mine
 servicenow incidents show INC0010042
 
@@ -264,7 +267,7 @@ variable disable ANSI color. During browser authentication, `--verbose` streams
 timestamped, secret-free handoff milestones to stderr:
 
 ```sh
-servicenow auth login work --method browser --verbose
+servicenow auth login --profile work --method browser --verbose
 ```
 
 Verbose browser diagnostics report only stage transitions and HTTP status
@@ -320,8 +323,12 @@ profile. Environment variables are useful for ephemeral automation:
 ```sh
 servicenow profile list
 servicenow profile use production
+servicenow profile remove old --yes
 servicenow auth status
+servicenow auth status --offline
 servicenow auth logout
+servicenow config show
+servicenow config path
 ```
 
 ## Development and release trust

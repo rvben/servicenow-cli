@@ -38,7 +38,7 @@ struct Cli {
     username: Option<String>,
 
     /// Config profile
-    #[arg(long, env = "SERVICENOW_PROFILE")]
+    #[arg(long, env = "SERVICENOW_PROFILE", global = true)]
     profile: Option<String>,
 
     /// Output format: auto, table, text, json, jsonl, yaml, or csv
@@ -74,10 +74,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Connect an instance with guided, secure setup
+    #[command(alias = "setup")]
     Init {
-        /// Profile name to create or replace
-        #[arg(default_value = "default")]
-        profile: String,
+        /// Legacy positional profile name; prefer the global --profile option
+        #[arg(value_name = "PROFILE", hide = true)]
+        legacy_profile: Option<String>,
 
         /// Instance name, hostname, or URL
         #[arg(long)]
@@ -160,7 +161,11 @@ enum Command {
     Config(ConfigCommand),
 
     /// Verify configuration, authentication, and Table API access
-    Doctor,
+    Doctor {
+        /// Check local configuration without contacting ServiceNow
+        #[arg(long)]
+        offline: bool,
+    },
 
     /// Inspect the command tree or an instance table schema
     Schema {
@@ -204,9 +209,9 @@ enum Command {
 enum AuthCommand {
     /// Sign in and store the credential securely when possible
     Login {
-        /// Profile name to create or replace
-        #[arg(default_value = "default")]
-        profile: String,
+        /// Legacy positional profile name; prefer the global --profile option
+        #[arg(value_name = "PROFILE", hide = true)]
+        legacy_profile: Option<String>,
 
         /// Instance name, hostname, or URL
         #[arg(long)]
@@ -251,12 +256,17 @@ enum AuthCommand {
 
     /// Remove the stored credential but keep profile settings
     Logout {
-        /// Profile whose credential should be removed
-        profile: Option<String>,
+        /// Legacy positional profile name; prefer the global --profile option
+        #[arg(value_name = "PROFILE", hide = true)]
+        legacy_profile: Option<String>,
     },
 
     /// Show the active identity and credential health
-    Status,
+    Status {
+        /// Inspect local credential state without contacting ServiceNow
+        #[arg(long)]
+        offline: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -725,10 +735,11 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), ApiError> {
     let output = OutputConfig::new(&cli.output, cli.json, cli.quiet, cli.no_color)?;
     let verbose = cli.verbose;
+    let profile_override = cli.profile.clone();
 
     match cli.command {
         Command::Init {
-            profile,
+            legacy_profile,
             instance,
             method,
             username,
@@ -740,6 +751,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             no_browser,
             read_only,
         } => {
+            let profile = selected_profile(profile_override.as_deref(), legacy_profile)?
+                .unwrap_or_else(|| "default".into());
             let authenticated = run_auth_login(
                 &output,
                 profile,
@@ -762,7 +775,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             return Ok(());
         }
         Command::Auth(AuthCommand::Login {
-            profile,
+            legacy_profile,
             instance,
             method,
             username,
@@ -774,6 +787,8 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             no_browser,
             read_only,
         }) => {
+            let profile = selected_profile(profile_override.as_deref(), legacy_profile)?
+                .unwrap_or_else(|| "default".into());
             run_auth_login(
                 &output,
                 profile,
@@ -792,8 +807,11 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             .await?;
             return Ok(());
         }
-        Command::Auth(AuthCommand::Logout { profile }) => {
-            let profile = profile.unwrap_or(active_profile_name()?);
+        Command::Auth(AuthCommand::Logout { legacy_profile }) => {
+            let profile = match selected_profile(profile_override.as_deref(), legacy_profile)? {
+                Some(profile) => profile,
+                None => active_profile_name()?,
+            };
             let removed = delete_stored_credential(&profile)?;
             let value = serde_json::json!({
                 "profile": profile,
@@ -931,6 +949,16 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             }
             return Ok(());
         }
+        Command::Auth(AuthCommand::Status { offline: true }) => {
+            let config = Config::load(cli.instance, cli.username, cli.profile)?;
+            render_offline_auth_status(&config, &output);
+            return Ok(());
+        }
+        Command::Doctor { offline: true } => {
+            let config = Config::load(cli.instance, cli.username, cli.profile)?;
+            render_offline_doctor(&config, &output);
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -987,10 +1015,12 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         Command::Resolve { kind, value } => metadata::resolve_reference(&client, kind, &value)
             .await
             .map(|record| emit_record(&output, record)),
-        Command::Doctor | Command::Auth(AuthCommand::Status) => {
-            run_doctor(&client, &config, &output).await
+        Command::Doctor { offline: false } => run_doctor(&client, &config, &output).await,
+        Command::Auth(AuthCommand::Status { offline: false }) => {
+            run_auth_status(&client, &config, &output).await
         }
-        Command::Init { .. }
+        Command::Doctor { offline: true }
+        | Command::Init { .. }
         | Command::Auth(_)
         | Command::Profile(_)
         | Command::Config(_)
@@ -1855,6 +1885,126 @@ fn read_login_secret(
     }
 }
 
+fn credential_detail(config: &Config) -> &'static str {
+    match config.credential_store() {
+        "config-file" => "config file (plaintext, mode 0600)",
+        "os-keychain" => "OS keychain",
+        "environment" => "environment variable",
+        "legacy-config" => "legacy plaintext config field",
+        _ => "unknown",
+    }
+}
+
+fn selected_profile(
+    profile_override: Option<&str>,
+    legacy_profile: Option<String>,
+) -> Result<Option<String>, ApiError> {
+    match (profile_override, legacy_profile) {
+        (Some(_), Some(_)) => Err(ApiError::InvalidInput(
+            "provide the profile with --profile or the legacy positional argument, not both".into(),
+        )),
+        (Some(profile), None) => Ok(Some(profile.into())),
+        (None, legacy_profile) => Ok(legacy_profile),
+    }
+}
+
+fn render_offline_auth_status(config: &Config, output: &OutputConfig) {
+    let value = serde_json::json!({
+        "profile": config.profile,
+        "status": "configured",
+        "verified": false,
+        "instance": config.instance,
+        "authType": config.auth_type.as_str(),
+        "credentialStore": config.credential_store(),
+    });
+    if output.json {
+        output.value(&value);
+    } else {
+        println!(
+            "Profile: {}\nStatus: configured (network not checked)\nAuthentication: {}\nCredentials: {}",
+            config.profile,
+            config.auth_type.as_str(),
+            credential_detail(config)
+        );
+    }
+}
+
+fn render_offline_doctor(config: &Config, output: &OutputConfig) {
+    let checks = serde_json::json!([
+        {"name": "configuration", "ok": true, "detail": config.instance},
+        {"name": "credentials", "ok": true, "detail": credential_detail(config)},
+        {"name": "authentication", "skipped": true, "detail": "network check skipped"},
+        {"name": "table_api", "skipped": true, "detail": "network check skipped"},
+        {"name": "write_safety", "ok": true, "detail": if config.read_only { "read-only mode enabled" } else { "write operations enabled" }}
+    ]);
+    if output.json {
+        output.value(&serde_json::json!({
+            "ok": true,
+            "offline": true,
+            "verified": false,
+            "checks": checks
+        }));
+    } else {
+        println!("ServiceNow connection (offline)\n");
+        for check in checks.as_array().expect("checks are an array") {
+            let marker = if check["skipped"].as_bool().unwrap_or(false) {
+                "–"
+            } else {
+                "✓"
+            };
+            println!(
+                "  {marker} {:<16} {}",
+                check["name"].as_str().unwrap_or("check"),
+                check["detail"].as_str().unwrap_or("")
+            );
+        }
+    }
+}
+
+async fn run_auth_status(
+    client: &ServiceNowClient,
+    config: &Config,
+    output: &OutputConfig,
+) -> Result<(), ApiError> {
+    let users = client
+        .list_records(
+            "sys_user",
+            &ListOptions {
+                query: Some("sys_id=javascript:gs.getUserID()".into()),
+                fields: Some(vec!["sys_id".into(), "user_name".into(), "name".into()]),
+                limit: 1,
+                ..ListOptions::default()
+            },
+        )
+        .await?;
+    let user = users.first().ok_or_else(|| {
+        ApiError::Other("authentication succeeded, but the current user was not returned".into())
+    })?;
+    let username = field_text(user, "user_name")
+        .or_else(|| field_text(user, "name"))
+        .unwrap_or_else(|| "unknown".into());
+    let value = serde_json::json!({
+        "profile": config.profile,
+        "status": "ok",
+        "verified": true,
+        "identity": username,
+        "instance": config.instance,
+        "authType": config.auth_type.as_str(),
+        "credentialStore": config.credential_store(),
+    });
+    if output.json {
+        output.value(&value);
+    } else {
+        println!(
+            "Authenticated as {} ({}, {})",
+            value["identity"].as_str().unwrap_or("unknown"),
+            config.auth_type.as_str(),
+            credential_detail(config)
+        );
+    }
+    Ok(())
+}
+
 async fn run_doctor(
     client: &ServiceNowClient,
     config: &Config,
@@ -1892,13 +2042,7 @@ async fn run_doctor(
         )
         .await?;
 
-    let credential_detail = match config.credential_store() {
-        "config-file" => "config file (plaintext, mode 0600)",
-        "os-keychain" => "OS keychain",
-        "environment" => "environment variable",
-        "legacy-config" => "legacy plaintext config field",
-        _ => "unknown",
-    };
+    let credential_detail = credential_detail(config);
     let checks = serde_json::json!([
         {"name": "configuration", "ok": true, "detail": config.instance},
         {"name": "authentication", "ok": true, "detail": username},
@@ -3213,8 +3357,10 @@ fn command_behavior(path: &str) -> Value {
     let network_access = if path == "servicenow"
         || path == "auth"
         || path == "schema"
+        || path == "doctor"
         || path.ends_with(" auth")
         || path.ends_with(" schema")
+        || path.ends_with("auth status")
     {
         "conditional"
     } else if path == "profile"

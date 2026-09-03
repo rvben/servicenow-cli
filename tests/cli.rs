@@ -453,6 +453,7 @@ async fn init_can_fall_back_to_the_protected_config_file() {
     let output = init
         .args([
             "init",
+            "--profile",
             "work",
             "--instance",
             &server.uri(),
@@ -501,7 +502,7 @@ async fn init_can_fall_back_to_the_protected_config_file() {
     assert_eq!(shown["secretMasked"], "***cret");
 
     command(&config_home)
-        .args(["auth", "logout", "work"])
+        .args(["auth", "logout", "--profile", "work"])
         .assert()
         .success();
     let config = std::fs::read_to_string(config_path).unwrap();
@@ -649,6 +650,7 @@ async fn auth_login_resumes_a_saved_profile_without_reasking_for_the_instance() 
         .args([
             "auth",
             "login",
+            "--profile",
             "work",
             "--username",
             "admin",
@@ -661,6 +663,125 @@ async fn auth_login_resumes_a_saved_profile_without_reasking_for_the_instance() 
         .assert()
         .success()
         .stderr(predicate::str::contains("Resuming profile 'work'"));
+}
+
+#[test]
+fn profile_selection_rejects_ambiguous_global_and_legacy_inputs() {
+    let config_home = TempDir::new().unwrap();
+    command(&config_home)
+        .args(["init", "legacy", "--profile", "preferred"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--profile or the legacy positional argument, not both",
+        ));
+}
+
+#[test]
+fn offline_auth_status_and_doctor_do_not_require_instance_access() {
+    let config_home = TempDir::new().unwrap();
+    let mut offline = command(&config_home);
+    offline
+        .env("SERVICENOW_INSTANCE", "offline.invalid")
+        .env("SERVICENOW_USERNAME", "api-user")
+        .env("SERVICENOW_PASSWORD", "secret");
+
+    let status = offline
+        .args(["auth", "status", "--offline"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["status"], "configured");
+    assert_eq!(status["verified"], false);
+    assert_eq!(status["credentialStore"], "environment");
+
+    let doctor = command(&config_home)
+        .env("SERVICENOW_INSTANCE", "offline.invalid")
+        .env("SERVICENOW_USERNAME", "api-user")
+        .env("SERVICENOW_PASSWORD", "secret")
+        .args(["doctor", "--offline"])
+        .output()
+        .unwrap();
+    assert!(doctor.status.success());
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["offline"], true);
+    assert_eq!(doctor["verified"], false);
+    assert_eq!(doctor["checks"][3]["name"], "table_api");
+    assert_eq!(doctor["checks"][3]["skipped"], true);
+    assert!(doctor["checks"][3].get("ok").is_none());
+    assert_eq!(doctor["checks"][3]["detail"], "network check skipped");
+}
+
+#[tokio::test]
+async fn auth_status_verifies_the_current_identity_without_reading_incidents() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_user"))
+        .and(query_param(
+            "sysparm_query",
+            "sys_id=javascript:gs.getUserID()",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": "0123456789abcdef0123456789abcdef",
+                "user_name": "admin",
+                "name": "System Administrator"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["auth", "status"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["verified"], true);
+    assert_eq!(result["identity"], "admin");
+}
+
+#[tokio::test]
+async fn auth_status_uses_the_display_name_when_username_is_missing() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": "0123456789abcdef0123456789abcdef",
+                "name": "System Administrator"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["auth", "status"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["identity"], "System Administrator");
+}
+
+#[test]
+fn auth_status_and_doctor_schema_mark_network_access_as_conditional() {
+    let config_home = TempDir::new().unwrap();
+    for path in ["auth status", "doctor"] {
+        let output = command(&config_home)
+            .args(["schema", "--command", path])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(schema["behavior"]["networkAccess"], "conditional");
+    }
 }
 
 #[test]
