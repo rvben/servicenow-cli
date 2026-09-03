@@ -1,8 +1,10 @@
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::config::AuthType;
+use tempfile::TempDir;
 
 struct Pdi {
     instance: String,
@@ -48,6 +50,42 @@ fn string_field<'a>(record: &'a Value, field: &str) -> Result<&'a str, ApiError>
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::Other(format!("record has no string field {field}: {record}")))
+}
+
+async fn configured_choice(
+    client: &ServiceNowClient,
+    field: &str,
+    preferred_label: Option<&str>,
+) -> Result<String, ApiError> {
+    let choices = client
+        .list_records(
+            "sys_choice",
+            &ListOptions {
+                query: Some(format!(
+                    "name=incident^element={field}^inactive=false^ORDERBYsequence"
+                )),
+                fields: Some(vec!["value".into(), "label".into()]),
+                all: true,
+                ..ListOptions::default()
+            },
+        )
+        .await?;
+    let choice = match preferred_label {
+        Some(label) => choices
+            .iter()
+            .find(|choice| {
+                string_field(choice, "label").is_ok_and(|value| value.eq_ignore_ascii_case(label))
+            })
+            .ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "configured incident.{field} choice labeled '{label}'"
+                ))
+            })?,
+        None => choices
+            .first()
+            .ok_or_else(|| ApiError::NotFound(format!("configured incident.{field} choice")))?,
+    };
+    Ok(string_field(choice, "value")?.to_string())
 }
 
 /// Exercises the real Table API lifecycle against an isolated incident and
@@ -158,6 +196,142 @@ async fn pdi_incident_crud_lifecycle() {
         panic!("PDI lifecycle verification failed: {error}");
     }
     cleanup.expect("delete test incident");
+
+    let deleted = client
+        .get_record("incident", &sys_id, None, DisplayValue::False)
+        .await;
+    assert!(matches!(deleted, Err(ApiError::NotFound(_))));
+}
+
+/// Exercises the complete CLI resolution workflow against the PDI's real
+/// choices and data policies, then removes the isolated incident fixture.
+#[tokio::test]
+#[ignore = "requires a ServiceNow Personal Developer Instance"]
+async fn pdi_incident_resolution_lifecycle() {
+    let pdi = Pdi::from_env();
+    let client = pdi.client();
+    let current_user = client
+        .list_records(
+            "sys_user",
+            &ListOptions {
+                query: Some("sys_id=javascript:gs.getUserID()".into()),
+                fields: Some(vec!["sys_id".into()]),
+                limit: 1,
+                ..ListOptions::default()
+            },
+        )
+        .await
+        .expect("resolve current PDI user")
+        .into_iter()
+        .next()
+        .expect("PDI returned the current user");
+    let user_id = string_field(&current_user, "sys_id")
+        .expect("current user has sys_id")
+        .to_string();
+    let resolved_state = configured_choice(&client, "state", Some("Resolved"))
+        .await
+        .expect("find the PDI Resolved state");
+    let resolution_code = configured_choice(&client, "close_code", None)
+        .await
+        .expect("find a PDI resolution code");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after Unix epoch")
+        .as_nanos();
+    let marker = format!("servicenow-cli-resolution-e2e-{unique}");
+    let resolution_notes = format!("Resolved by the isolated CLI lifecycle test {marker}");
+
+    let created = client
+        .create_record(
+            "incident",
+            &object([
+                ("short_description", Value::String(marker.clone())),
+                (
+                    "description",
+                    Value::String("Temporary resolution lifecycle fixture".into()),
+                ),
+                ("caller_id", Value::String(user_id.clone())),
+                ("assigned_to", Value::String(user_id)),
+                ("impact", Value::String("3".into())),
+                ("urgency", Value::String("3".into())),
+            ]),
+        )
+        .await
+        .expect("create resolution test incident");
+    let sys_id = string_field(&created, "sys_id")
+        .expect("created incident has sys_id")
+        .to_string();
+
+    let verification: Result<(), ApiError> = async {
+        let isolated_home = TempDir::new()
+            .map_err(|error| ApiError::Other(format!("create isolated CLI home: {error}")))?;
+        let output = Command::new(env!("CARGO_BIN_EXE_servicenow"))
+            .env("SERVICENOW_INSTANCE", &pdi.instance)
+            .env("SERVICENOW_USERNAME", &pdi.username)
+            .env("SERVICENOW_PASSWORD", &pdi.password)
+            .env("SERVICENOW_AUTH_TYPE", "basic")
+            .env("SERVICENOW_CONFIG_DIR", isolated_home.path().join("config"))
+            .env("SERVICENOW_CACHE_DIR", isolated_home.path().join("cache"))
+            .env_remove("SERVICENOW_TOKEN")
+            .env_remove("SERVICENOW_COOKIE")
+            .env_remove("SERVICENOW_USER_TOKEN")
+            .args([
+                "--output",
+                "json",
+                "incidents",
+                "resolve",
+                &sys_id,
+                "--code",
+                &resolution_code,
+                "--state",
+                &resolved_state,
+                "--notes",
+                &resolution_notes,
+            ])
+            .output()
+            .map_err(|error| ApiError::Other(format!("run resolve command: {error}")))?;
+        if !output.status.success() {
+            return Err(ApiError::Other(format!(
+                "resolve command failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let resolved = client
+            .get_record(
+                "incident",
+                &sys_id,
+                Some(&[
+                    "sys_id".into(),
+                    "state".into(),
+                    "close_code".into(),
+                    "close_notes".into(),
+                ]),
+                DisplayValue::False,
+            )
+            .await?;
+        for (field, expected) in [
+            ("state", resolved_state.as_str()),
+            ("close_code", resolution_code.as_str()),
+            ("close_notes", resolution_notes.as_str()),
+        ] {
+            if string_field(&resolved, field)? != expected {
+                return Err(ApiError::Other(format!(
+                    "resolved incident did not preserve {field}"
+                )));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup = client.delete_record("incident", &sys_id).await;
+    if let Err(error) = verification {
+        cleanup.expect("cleanup after failed resolution verification");
+        panic!("PDI resolution lifecycle verification failed: {error}");
+    }
+    cleanup.expect("delete resolution test incident");
 
     let deleted = client
         .get_record("incident", &sys_id, None, DisplayValue::False)
