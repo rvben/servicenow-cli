@@ -125,6 +125,57 @@ pub fn require_resolvable(
     Ok(())
 }
 
+pub fn work_note_body(note: String) -> Result<Map<String, Value>, ApiError> {
+    if note.trim().is_empty() {
+        return Err(ApiError::InvalidInput("work note cannot be empty".into()));
+    }
+    let mut body = Map::new();
+    body.insert("work_notes".into(), Value::String(note));
+    Ok(body)
+}
+
+pub fn require_assignment(assignee: Option<&str>, group: Option<&str>) -> Result<(), ApiError> {
+    let has_assignee = assignee.is_some_and(|value| !value.trim().is_empty());
+    let has_group = group.is_some_and(|value| !value.trim().is_empty());
+    if has_assignee || has_group {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidInput(
+            "provide an assignee, assignment group, or both".into(),
+        ))
+    }
+}
+
+pub fn resolution_body(
+    metadata: &TableMetadata,
+    code: &str,
+    notes: String,
+    state: Option<&str>,
+) -> Result<Map<String, Value>, ApiError> {
+    require_resolution_input(code, &notes)?;
+    let resolved_state = resolved_state_value(metadata, state)?;
+    let resolution_code = resolution_choice_value(metadata, "close_code", code)?;
+    let mut body = Map::new();
+    body.insert("state".into(), Value::String(resolved_state));
+    body.insert("close_code".into(), Value::String(resolution_code));
+    body.insert("close_notes".into(), Value::String(notes));
+    Ok(body)
+}
+
+pub fn require_resolution_input(code: &str, notes: &str) -> Result<(), ApiError> {
+    if notes.trim().is_empty() {
+        return Err(ApiError::InvalidInput(
+            "resolution notes cannot be empty".into(),
+        ));
+    }
+    if code.trim().is_empty() {
+        return Err(ApiError::InvalidInput(
+            "resolution code cannot be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn resolution_field_name(field: &str) -> &str {
     match field {
         "state" => "resolution state",
@@ -363,5 +414,44 @@ mod tests {
                 ),
             ]),
         }
+    }
+
+    #[test]
+    fn focused_mutation_builders_reject_empty_required_input() {
+        assert!(matches!(
+            work_note_body("  ".into()),
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            require_assignment(Some("  "), None),
+            Err(ApiError::InvalidInput(_))
+        ));
+
+        let metadata = resolution_metadata();
+        assert!(matches!(
+            resolution_body(&metadata, "Solved", "\n".into(), None),
+            Err(ApiError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            require_resolution_input("  ", "Ready to close"),
+            Err(ApiError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn resolution_builder_maps_labels_into_one_atomic_patch() {
+        let metadata = resolution_metadata();
+        let body = resolution_body(
+            &metadata,
+            "Solved (Permanently)",
+            "Corrected the gateway".into(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(body["state"], "9");
+        assert_eq!(body["close_code"], "solved_permanently");
+        assert_eq!(body["close_notes"], "Corrected the gateway");
+        assert_eq!(body.len(), 3);
     }
 }

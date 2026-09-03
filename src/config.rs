@@ -268,6 +268,24 @@ impl Config {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(instance: &str, read_only: bool) -> Self {
+        Self {
+            instance: instance.into(),
+            username: Some("api-user".into()),
+            secret: "test-secret".into(),
+            auth_type: AuthType::Basic,
+            read_only,
+            profile: "work".into(),
+            client_id: None,
+            oauth_scope: None,
+            redirect_uri: None,
+            oauth: None,
+            browser_user_token: None,
+            credential_store: "environment".into(),
+        }
+    }
+
     pub fn uses_persistent_store(&self) -> bool {
         matches!(
             self.credential_store.as_str(),

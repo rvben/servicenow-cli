@@ -21,7 +21,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::api::{
     ApiError, AttachmentMetadata, DisplayValue, ListOptions, ServiceNowClient, validate_table,
@@ -29,6 +29,8 @@ use crate::api::{
 use crate::attachment::human_size;
 use crate::commands::INCIDENT_LIST_FIELDS;
 use crate::config::Config;
+use crate::incident;
+use crate::metadata::{self, ReferenceKind, TableMetadata};
 
 const MIN_PAGE_SIZE: usize = 5;
 const MAX_PAGE_SIZE: usize = 200;
@@ -66,6 +68,147 @@ enum Overlay {
     TableInput(String),
     QueryInput(String),
     SearchInput(String),
+    IncidentActions(IncidentActionMenu),
+    IncidentActionForm(IncidentActionForm),
+    IncidentActionReview(PreparedIncidentAction),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IncidentActionKind {
+    Note,
+    Assign,
+    Resolve,
+}
+
+impl IncidentActionKind {
+    const ALL: [Self; 3] = [Self::Note, Self::Assign, Self::Resolve];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Note => "ADD WORK NOTE",
+            Self::Assign => "ASSIGN",
+            Self::Resolve => "RESOLVE",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Note => "Append operator context to the activity stream",
+            Self::Assign => "Set an assignee, assignment group, or both",
+            Self::Resolve => "Map the configured state and resolution code atomically",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Note => 0,
+            Self::Assign => 1,
+            Self::Resolve => 2,
+        }
+    }
+
+    fn progress(self) -> &'static str {
+        match self {
+            Self::Note => "Preparing work note…",
+            Self::Assign => "Resolving assignment references…",
+            Self::Resolve => "Validating the incident lifecycle…",
+        }
+    }
+
+    fn success(self, target: &str) -> String {
+        match self {
+            Self::Note => format!("Added a work note to {target}."),
+            Self::Assign => format!("Assigned {target}."),
+            Self::Resolve => format!("Resolved {target}."),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IncidentTarget {
+    sys_id: String,
+    title: String,
+    return_tab: Option<IncidentTab>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IncidentActionMenu {
+    target: IncidentTarget,
+    selected: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActionField {
+    label: &'static str,
+    hint: &'static str,
+    value: String,
+    multiline: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IncidentActionForm {
+    kind: IncidentActionKind,
+    target: IncidentTarget,
+    fields: Vec<ActionField>,
+    focused: usize,
+}
+
+impl IncidentActionForm {
+    fn new(kind: IncidentActionKind, target: IncidentTarget) -> Self {
+        let fields = match kind {
+            IncidentActionKind::Note => vec![ActionField {
+                label: "WORK NOTE",
+                hint: "Required; Shift-Enter inserts a line break",
+                value: String::new(),
+                multiline: true,
+            }],
+            IncidentActionKind::Assign => vec![
+                ActionField {
+                    label: "ASSIGNEE",
+                    hint: "User name, email, display name, @me, or sys_id; optional",
+                    value: String::new(),
+                    multiline: false,
+                },
+                ActionField {
+                    label: "ASSIGNMENT GROUP",
+                    hint: "Exact group name or sys_id; optional",
+                    value: String::new(),
+                    multiline: false,
+                },
+            ],
+            IncidentActionKind::Resolve => vec![
+                ActionField {
+                    label: "RESOLUTION CODE",
+                    hint: "Configured label or raw value",
+                    value: String::new(),
+                    multiline: false,
+                },
+                ActionField {
+                    label: "RESOLUTION NOTES",
+                    hint: "Required; Shift-Enter inserts a line break",
+                    value: String::new(),
+                    multiline: true,
+                },
+            ],
+        };
+        Self {
+            kind,
+            target,
+            fields,
+            focused: 0,
+        }
+    }
+
+    fn focused_field_mut(&mut self) -> &mut ActionField {
+        &mut self.fields[self.focused]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedIncidentAction {
+    form: IncidentActionForm,
+    body: Map<String, Value>,
+    preview: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,7 +247,7 @@ impl Notice {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Action {
     None,
     Quit,
@@ -113,6 +256,9 @@ enum Action {
     LoadDetail,
     LoadIncidentTab(IncidentTab),
     Open,
+    OpenIncidentActions { return_to_detail: bool },
+    PrepareIncident(IncidentActionForm),
+    ExecuteIncident(PreparedIncidentAction),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,22 +340,27 @@ struct App {
     detail_scroll: u16,
     detail_viewport_width: u16,
     detail_viewport_height: u16,
+    action_review_scroll: u16,
+    action_review_max_scroll: u16,
+    action_review_viewport_height: u16,
     incident_tab: IncidentTab,
     activity: PanelState<Value>,
     attachments: PanelState<AttachmentMetadata>,
     slas: PanelState<Value>,
+    incident_metadata: Option<TableMetadata>,
     has_next_page: bool,
     loading: bool,
     detail_loading: bool,
     load_failed: bool,
     auth_failed: bool,
+    read_only: bool,
     color: bool,
     overlay: Overlay,
     notice: Notice,
 }
 
 impl App {
-    fn new(profile: &str, instance: &str, options: TuiOptions) -> Self {
+    fn new(profile: &str, instance: &str, read_only: bool, options: TuiOptions) -> Self {
         let query = options
             .query
             .filter(|query| !query.trim().is_empty())
@@ -231,15 +382,20 @@ impl App {
             detail_scroll: 0,
             detail_viewport_width: 40,
             detail_viewport_height: 10,
+            action_review_scroll: 0,
+            action_review_max_scroll: 0,
+            action_review_viewport_height: 1,
             incident_tab: IncidentTab::Overview,
             activity: PanelState::Idle,
             attachments: PanelState::Idle,
             slas: PanelState::Idle,
+            incident_metadata: None,
             has_next_page: false,
             loading: false,
             detail_loading: false,
             load_failed: false,
             auth_failed: false,
+            read_only,
             color: options.color,
             overlay: Overlay::None,
             notice: Notice::quiet("Preparing the ledger…"),
@@ -556,6 +712,250 @@ impl App {
         self.clear_detail_record();
     }
 
+    fn open_incident_actions(&mut self, return_to_detail: bool) {
+        if self.table != "incident" {
+            self.notice = Notice::quiet("Focused actions are available for incidents only.");
+            return;
+        }
+        let Some(record) = self.selected_record() else {
+            self.notice = Notice::error("Select an incident before opening actions.");
+            return;
+        };
+        let Some(sys_id) = record_sys_id(record).map(str::to_string) else {
+            self.notice = Notice::error("This incident has no usable sys_id.");
+            return;
+        };
+        let target = IncidentTarget {
+            sys_id,
+            title: record_title(record),
+            return_tab: return_to_detail.then_some(self.incident_tab),
+        };
+        self.overlay = Overlay::IncidentActions(IncidentActionMenu {
+            target,
+            selected: 0,
+        });
+        self.notice = if self.read_only {
+            Notice::quiet(format!(
+                "Profile '{}' is read-only; incident actions are unavailable.",
+                self.profile
+            ))
+        } else {
+            Notice::quiet("Choose a guarded incident action.")
+        };
+    }
+
+    async fn prepare_incident_action(
+        &mut self,
+        client: &ServiceNowClient,
+        form: IncidentActionForm,
+    ) {
+        self.notice = Notice::quiet(form.kind.progress());
+        let prepared = self
+            .build_prepared_incident_action(client, form.clone())
+            .await;
+        match prepared {
+            Ok(prepared) => {
+                self.notice = Notice::quiet("Review the exact ServiceNow update before applying.");
+                self.action_review_scroll = 0;
+                self.overlay = Overlay::IncidentActionReview(prepared);
+            }
+            Err(error) => {
+                self.notice = Notice::error(error.to_string());
+                self.overlay = Overlay::IncidentActionForm(form);
+            }
+        }
+    }
+
+    async fn build_prepared_incident_action(
+        &mut self,
+        client: &ServiceNowClient,
+        form: IncidentActionForm,
+    ) -> Result<PreparedIncidentAction, ApiError> {
+        let (body, preview) = match form.kind {
+            IncidentActionKind::Note => {
+                let note = form.fields[0].value.clone();
+                let body = incident::work_note_body(note.clone())?;
+                (body, vec![("WORK NOTE".into(), note)])
+            }
+            IncidentActionKind::Assign => {
+                let assignee = nonempty(&form.fields[0].value);
+                let group = nonempty(&form.fields[1].value);
+                incident::require_assignment(assignee, group)?;
+                let mut body = Map::new();
+                let mut preview = Vec::new();
+                if let Some(value) = assignee {
+                    let record =
+                        metadata::resolve_reference(client, ReferenceKind::User, value).await?;
+                    let sys_id = record_sys_id(&record).ok_or_else(|| {
+                        ApiError::Other("resolved user has no usable sys_id".into())
+                    })?;
+                    body.insert("assigned_to".into(), Value::String(sys_id.into()));
+                    preview.push(("ASSIGNEE".into(), record_title(&record)));
+                }
+                if let Some(value) = group {
+                    let record =
+                        metadata::resolve_reference(client, ReferenceKind::Group, value).await?;
+                    let sys_id = record_sys_id(&record).ok_or_else(|| {
+                        ApiError::Other("resolved group has no usable sys_id".into())
+                    })?;
+                    body.insert("assignment_group".into(), Value::String(sys_id.into()));
+                    preview.push(("ASSIGNMENT GROUP".into(), record_title(&record)));
+                }
+                (body, preview)
+            }
+            IncidentActionKind::Resolve => {
+                let code = &form.fields[0].value;
+                let notes = form.fields[1].value.clone();
+                incident::require_resolution_input(code, &notes)?;
+                let metadata = if let Some(metadata) = self.incident_metadata.clone() {
+                    metadata
+                } else if let Some(metadata) = metadata::load(&self.profile, "incident")? {
+                    metadata
+                } else {
+                    metadata::sync_table(client, &self.profile, "incident").await?
+                };
+                self.incident_metadata = Some(metadata.clone());
+                let body = incident::resolution_body(&metadata, code, notes.clone(), None)?;
+                let resolved_state = body["state"]
+                    .as_str()
+                    .expect("resolution state is a string");
+                let current = client
+                    .get_record(
+                        "incident",
+                        &form.target.sys_id,
+                        Some(&["sys_id".into(), "number".into(), "state".into()]),
+                        DisplayValue::All,
+                    )
+                    .await?;
+                incident::require_resolvable(&current, resolved_state, &metadata)?;
+                let resolution_code = body["close_code"]
+                    .as_str()
+                    .expect("resolution code is a string");
+                let state_label = metadata
+                    .choice_label("state", resolved_state)
+                    .unwrap_or(resolved_state)
+                    .to_string();
+                let code_label = metadata
+                    .choice_label("close_code", resolution_code)
+                    .unwrap_or(resolution_code)
+                    .to_string();
+                (
+                    body,
+                    vec![
+                        ("STATE".into(), state_label),
+                        ("RESOLUTION CODE".into(), code_label),
+                        ("RESOLUTION NOTES".into(), notes),
+                    ],
+                )
+            }
+        };
+        Ok(PreparedIncidentAction {
+            form,
+            body,
+            preview,
+        })
+    }
+
+    async fn execute_incident_action(
+        &mut self,
+        client: &ServiceNowClient,
+        config: &Config,
+        prepared: PreparedIncidentAction,
+    ) {
+        if let Err(error) = config.require_writable() {
+            self.notice = Notice::error(error.to_string());
+            self.overlay = Overlay::IncidentActionReview(prepared);
+            return;
+        }
+        if prepared.form.kind == IncidentActionKind::Resolve {
+            let recheck = async {
+                let metadata = self.incident_metadata.as_ref().ok_or_else(|| {
+                    ApiError::Other("resolution metadata is no longer available".into())
+                })?;
+                let resolved_state = prepared
+                    .body
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ApiError::Other("resolution state is missing".into()))?;
+                let current = client
+                    .get_record(
+                        "incident",
+                        &prepared.form.target.sys_id,
+                        Some(&["sys_id".into(), "number".into(), "state".into()]),
+                        DisplayValue::All,
+                    )
+                    .await?;
+                incident::require_resolvable(&current, resolved_state, metadata)
+            }
+            .await;
+            if let Err(error) = recheck {
+                self.notice = Notice::error(format!(
+                    "Could not apply resolution after rechecking the incident: {error}"
+                ));
+                self.overlay = Overlay::IncidentActionReview(prepared);
+                return;
+            }
+        }
+        self.notice = Notice::quiet(format!("Applying {}…", prepared.form.kind.label()));
+        if let Err(error) = config.require_writable() {
+            self.notice = Notice::error(error.to_string());
+            self.overlay = Overlay::IncidentActionReview(prepared);
+            return;
+        }
+        if let Err(error) = client
+            .update_record("incident", &prepared.form.target.sys_id, &prepared.body)
+            .await
+        {
+            self.notice = Notice::error(format!(
+                "Could not apply {}: {error}",
+                prepared.form.kind.label().to_ascii_lowercase()
+            ));
+            self.overlay = Overlay::IncidentActionReview(prepared);
+            return;
+        }
+
+        let success = prepared.form.kind.success(&prepared.form.target.title);
+        let target_sys_id = prepared.form.target.sys_id.clone();
+        let return_tab = prepared.form.target.return_tab;
+        self.overlay = Overlay::None;
+        self.load(client).await;
+        if self.load_failed {
+            self.notice = Notice::error(format!(
+                "{success} The ledger refresh failed; press r to retry."
+            ));
+            return;
+        }
+
+        let selected = self.matching_record_indices().position(|record_index| {
+            self.records
+                .get(record_index)
+                .and_then(record_sys_id)
+                .is_some_and(|sys_id| sys_id == target_sys_id)
+        });
+        let Some(selected) = selected else {
+            self.notice =
+                Notice::success(format!("{success} It no longer matches this ledger view."));
+            return;
+        };
+        self.table_state.select(Some(selected));
+
+        if let Some(tab) = return_tab {
+            self.overlay = Overlay::Detail;
+            self.detail_loading = true;
+            self.load_detail(client).await;
+            if tab != IncidentTab::Overview {
+                self.incident_tab = tab;
+                self.detail_scroll = 0;
+                self.load_incident_tab(client, tab).await;
+            }
+            if self.notice.kind == NoticeKind::Error {
+                self.notice = Notice::error(format!("{success} {}", self.notice.text));
+                return;
+            }
+        }
+        self.notice = Notice::success(success);
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
@@ -579,6 +979,173 @@ impl App {
                 {
                     buffer.push(character);
                     Action::None
+                }
+                _ => Action::None,
+            },
+            Overlay::IncidentActions(menu) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.overlay = if menu.target.return_tab.is_some() {
+                        Overlay::Detail
+                    } else {
+                        Overlay::None
+                    };
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    menu.selected = (menu.selected + 1) % IncidentActionKind::ALL.len();
+                    Action::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    menu.selected = (menu.selected + IncidentActionKind::ALL.len() - 1)
+                        % IncidentActionKind::ALL.len();
+                    Action::None
+                }
+                KeyCode::Char('1' | '2' | '3') => {
+                    let selected = match key.code {
+                        KeyCode::Char('1') => 0,
+                        KeyCode::Char('2') => 1,
+                        KeyCode::Char('3') => 2,
+                        _ => unreachable!(),
+                    };
+                    menu.selected = selected;
+                    if self.read_only {
+                        self.notice = Notice::error(format!(
+                            "Write operation blocked: profile '{}' is read-only.",
+                            self.profile
+                        ));
+                        Action::None
+                    } else {
+                        self.notice = Notice::quiet(format!(
+                            "Enter details for {}; nothing changes until review.",
+                            IncidentActionKind::ALL[selected]
+                                .label()
+                                .to_ascii_lowercase()
+                        ));
+                        self.overlay = Overlay::IncidentActionForm(IncidentActionForm::new(
+                            IncidentActionKind::ALL[selected],
+                            menu.target.clone(),
+                        ));
+                        Action::None
+                    }
+                }
+                KeyCode::Enter => {
+                    if self.read_only {
+                        self.notice = Notice::error(format!(
+                            "Write operation blocked: profile '{}' is read-only.",
+                            self.profile
+                        ));
+                        Action::None
+                    } else {
+                        self.notice = Notice::quiet(format!(
+                            "Enter details for {}; nothing changes until review.",
+                            IncidentActionKind::ALL[menu.selected]
+                                .label()
+                                .to_ascii_lowercase()
+                        ));
+                        self.overlay = Overlay::IncidentActionForm(IncidentActionForm::new(
+                            IncidentActionKind::ALL[menu.selected],
+                            menu.target.clone(),
+                        ));
+                        Action::None
+                    }
+                }
+                _ => Action::None,
+            },
+            Overlay::IncidentActionForm(form) => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = Overlay::IncidentActions(IncidentActionMenu {
+                        target: form.target.clone(),
+                        selected: form.kind.index(),
+                    });
+                    Action::None
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    form.focused = (form.focused + 1) % form.fields.len();
+                    Action::None
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.focused = (form.focused + form.fields.len() - 1) % form.fields.len();
+                    Action::None
+                }
+                KeyCode::Enter
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && form.focused_field_mut().multiline =>
+                {
+                    form.focused_field_mut().value.push('\n');
+                    Action::None
+                }
+                KeyCode::Enter if form.focused + 1 < form.fields.len() => {
+                    form.focused += 1;
+                    Action::None
+                }
+                KeyCode::Enter => Action::PrepareIncident(form.clone()),
+                KeyCode::Backspace => {
+                    form.focused_field_mut().value.pop();
+                    Action::None
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    form.focused_field_mut().value.clear();
+                    Action::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !character.is_control() =>
+                {
+                    form.focused_field_mut().value.push(character);
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            Overlay::IncidentActionReview(prepared) => match key.code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                    self.action_review_scroll = 0;
+                    self.overlay = Overlay::IncidentActionForm(prepared.form.clone());
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.action_review_scroll = self
+                        .action_review_scroll
+                        .saturating_add(1)
+                        .min(self.action_review_max_scroll);
+                    Action::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.action_review_scroll = self.action_review_scroll.saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::PageDown => {
+                    self.action_review_scroll = self
+                        .action_review_scroll
+                        .saturating_add(self.action_review_viewport_height)
+                        .min(self.action_review_max_scroll);
+                    Action::None
+                }
+                KeyCode::PageUp => {
+                    self.action_review_scroll = self
+                        .action_review_scroll
+                        .saturating_sub(self.action_review_viewport_height);
+                    Action::None
+                }
+                KeyCode::Char('q') => {
+                    self.action_review_scroll = 0;
+                    self.overlay = if prepared.form.target.return_tab.is_some() {
+                        Overlay::Detail
+                    } else {
+                        Overlay::None
+                    };
+                    self.notice = Notice::quiet("Incident action cancelled; nothing was changed.");
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    if self.read_only {
+                        self.notice = Notice::error(format!(
+                            "Write operation blocked: profile '{}' is read-only.",
+                            self.profile
+                        ));
+                        Action::None
+                    } else {
+                        Action::ExecuteIncident(prepared.clone())
+                    }
                 }
                 _ => Action::None,
             },
@@ -656,6 +1223,9 @@ impl App {
                 KeyCode::Char('r') if self.table == "incident" => {
                     self.select_incident_tab(self.incident_tab, true)
                 }
+                KeyCode::Char('a') if self.table == "incident" => Action::OpenIncidentActions {
+                    return_to_detail: true,
+                },
                 KeyCode::Char('o') => Action::Open,
                 KeyCode::Char('q') => Action::Quit,
                 _ => Action::None,
@@ -722,6 +1292,13 @@ impl App {
                 KeyCode::Char('s') => {
                     self.overlay = Overlay::SearchInput(self.search.clone().unwrap_or_default());
                     Action::None
+                }
+                KeyCode::Char('a')
+                    if self.table == "incident" && self.selected_record().is_some() =>
+                {
+                    Action::OpenIncidentActions {
+                        return_to_detail: false,
+                    }
                 }
                 KeyCode::Char('?') => {
                     self.overlay = Overlay::Help {
@@ -897,7 +1474,17 @@ impl App {
         self.render_body(frame, areas[1], theme);
         self.render_footer(frame, areas[2], theme);
 
-        match self.overlay.clone() {
+        let overlay = self.overlay.clone();
+        let action_returns_to_detail = match &overlay {
+            Overlay::IncidentActions(menu) => menu.target.return_tab.is_some(),
+            Overlay::IncidentActionForm(form) => form.target.return_tab.is_some(),
+            Overlay::IncidentActionReview(prepared) => prepared.form.target.return_tab.is_some(),
+            _ => false,
+        };
+        if action_returns_to_detail {
+            self.render_detail_sheet(frame, frame.area(), theme, true);
+        }
+        match overlay {
             Overlay::Help { .. } => self.render_help(frame, theme),
             Overlay::TableInput(buffer) => {
                 render_input(frame, theme, "GO TO TABLE", "Table name", &buffer)
@@ -916,6 +1503,13 @@ impl App {
                 "Matches loaded display values; blank clears",
                 &buffer,
             ),
+            Overlay::IncidentActions(menu) => self.render_incident_actions(frame, theme, &menu),
+            Overlay::IncidentActionForm(form) => {
+                self.render_incident_action_form(frame, theme, &form)
+            }
+            Overlay::IncidentActionReview(prepared) => {
+                self.render_incident_action_review(frame, theme, &prepared)
+            }
             Overlay::Detail => self.render_detail_sheet(frame, frame.area(), theme, true),
             Overlay::None => {}
         }
@@ -926,20 +1520,27 @@ impl App {
             Span::styled(" SERVICENOW ", theme.brand()),
             Span::styled(" OPERATIONS LEDGER", theme.title()),
         ]);
+        let safety = if self.read_only {
+            "  ·  READ ONLY"
+        } else {
+            ""
+        };
         let location = if area.width >= 80 {
             format!(
-                "{}  ·  {}  /  {}  ·  page {}",
+                "{}  ·  {}  /  {}  ·  page {}{}",
                 safe_text(&self.profile),
                 safe_text(&self.instance),
                 self.table,
-                self.offset / self.page_size + 1
+                self.offset / self.page_size + 1,
+                safety
             )
         } else {
             format!(
-                "{}  /  {}  ·  page {}",
+                "{}  /  {}  ·  page {}{}",
                 safe_text(&self.profile),
                 self.table,
-                self.offset / self.page_size + 1
+                self.offset / self.page_size + 1,
+                safety
             )
         };
         let header = Paragraph::new(vec![title, Line::styled(location, theme.muted())]).block(
@@ -1264,7 +1865,9 @@ impl App {
         title: &str,
     ) {
         let block = Block::default()
-            .title(format!(" INCIDENT WORKSPACE  {title}  ·  ESC BACK "))
+            .title(format!(
+                " INCIDENT WORKSPACE  {title}  ·  A ACTIONS  ·  ESC BACK "
+            ))
             .borders(Borders::ALL)
             .border_style(theme.active_rule())
             .style(theme.canvas());
@@ -1426,73 +2029,63 @@ impl App {
                 Span::styled("q", theme.key()),
                 Span::styled(" quit", theme.muted()),
             ])
-        } else if area.width < 80 {
-            Line::from(vec![
-                Span::styled("↑↓", theme.key()),
-                Span::styled(" move  ", theme.muted()),
-                Span::styled("enter", theme.key()),
-                Span::styled(" inspect  ", theme.muted()),
-                Span::styled("s", theme.key()),
-                Span::styled(" search  ", theme.muted()),
-                Span::styled("?", theme.key()),
-                Span::styled(" help  ", theme.muted()),
-                Span::styled("q", theme.key()),
-                Span::styled(" quit", theme.muted()),
-            ])
-        } else if area.width < 112 {
-            Line::from(vec![
-                Span::styled("↑↓", theme.key()),
-                Span::styled(" move  ", theme.muted()),
-                Span::styled("enter", theme.key()),
-                Span::styled(" inspect  ", theme.muted()),
-                Span::styled("s", theme.key()),
-                Span::styled(" search  ", theme.muted()),
-                Span::styled("/", theme.key()),
-                Span::styled(" query  ", theme.muted()),
-                Span::styled("t", theme.key()),
-                Span::styled(" table  ", theme.muted()),
-                Span::styled("p/n", theme.key()),
-                Span::styled(" page  ", theme.muted()),
-                Span::styled("?", theme.key()),
-                Span::styled(" help  ", theme.muted()),
-                Span::styled("q", theme.key()),
-                Span::styled(" quit", theme.muted()),
-            ])
         } else {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled("↑↓", theme.key()),
                 Span::styled(" move  ", theme.muted()),
                 Span::styled("enter", theme.key()),
                 Span::styled(" inspect  ", theme.muted()),
-                Span::styled("s", theme.key()),
-                Span::styled(" search  ", theme.muted()),
-                Span::styled("/", theme.key()),
-                Span::styled(" query  ", theme.muted()),
-                Span::styled("t", theme.key()),
-                Span::styled(" table  ", theme.muted()),
-                Span::styled("p", previous_key),
-                Span::styled(
+            ];
+            if self.table == "incident" && self.selected_record().is_some() {
+                spans.push(Span::styled("a", theme.key()));
+                spans.push(Span::styled(" actions  ", theme.muted()));
+            }
+            if area.width >= 80 || self.table != "incident" {
+                spans.extend([
+                    Span::styled("s", theme.key()),
+                    Span::styled(" search  ", theme.muted()),
+                ]);
+            }
+            if area.width >= 80 {
+                spans.extend([
+                    Span::styled("/", theme.key()),
+                    Span::styled(" query  ", theme.muted()),
+                    Span::styled("t", theme.key()),
+                    Span::styled(" table  ", theme.muted()),
+                ]);
+            }
+            if area.width >= 112 {
+                spans.push(Span::styled("p", previous_key));
+                spans.push(Span::styled(
                     if self.offset > 0 {
                         " prev  "
                     } else {
                         " start  "
                     },
                     theme.muted(),
-                ),
-                Span::styled("n", next_key),
-                Span::styled(
+                ));
+                spans.push(Span::styled("n", next_key));
+                spans.push(Span::styled(
                     if self.has_next_page {
                         " next  "
                     } else {
                         " end  "
                     },
                     theme.muted(),
-                ),
+                ));
+            } else if area.width >= 80 {
+                spans.extend([
+                    Span::styled("p/n", theme.key()),
+                    Span::styled(" page  ", theme.muted()),
+                ]);
+            }
+            spans.extend([
                 Span::styled("?", theme.key()),
                 Span::styled(" help  ", theme.muted()),
                 Span::styled("q", theme.key()),
                 Span::styled(" quit", theme.muted()),
-            ])
+            ]);
+            Line::from(spans)
         };
         let status = if area.width >= 90 {
             Line::from(vec![
@@ -1519,6 +2112,7 @@ impl App {
         let rows = [
             ("↑ / k, ↓ / j", "Move through records"),
             ("enter / →", "Unfold the selected record sheet"),
+            ("a", "Open guarded actions for the selected incident"),
             ("tab / shift-tab", "Move through incident detail views"),
             ("1 / 2 / 3 / 4", "Open Overview, Activity, Files, or SLAs"),
             ("t", "Browse another table"),
@@ -1548,7 +2142,11 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "This first release is intentionally read-only.",
+            if self.read_only {
+                "This profile is read-only; incident actions cannot write."
+            } else {
+                "Every incident write is previewed and explicitly confirmed."
+            },
             theme.success(),
         ));
         let help = Paragraph::new(lines).block(
@@ -1559,6 +2157,296 @@ impl App {
                 .style(theme.canvas()),
         );
         frame.render_widget(help, area);
+    }
+
+    fn render_incident_actions(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        theme: Theme,
+        menu: &IncidentActionMenu,
+    ) {
+        let width = frame.area().width.saturating_sub(4).min(78);
+        let area = centered_rect(width, 15, frame.area());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title(format!(
+                " INCIDENT ACTIONS  {}  ·  ESC CANCEL ",
+                safe_text(&menu.target.title)
+            ))
+            .borders(Borders::ALL)
+            .border_style(theme.active_rule())
+            .style(theme.canvas());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let compact = inner.height < 13;
+        let status = if self.read_only {
+            format!(
+                "Profile '{}' is read-only. Actions are visible but unavailable.",
+                safe_text(&self.profile)
+            )
+        } else {
+            "Choose one focused update. You will review it before anything changes.".into()
+        };
+        let status_style = if self.read_only {
+            theme.error()
+        } else {
+            theme.muted()
+        };
+        let mut lines = wrap_text_exact(&status, usize::from(inner.width.max(1)))
+            .into_iter()
+            .take(if compact { 2 } else { usize::MAX })
+            .map(|line| Line::styled(line, status_style))
+            .collect::<Vec<_>>();
+        if !compact {
+            lines.push(Line::raw(""));
+        }
+        for (index, kind) in IncidentActionKind::ALL.into_iter().enumerate() {
+            let selected = index == menu.selected;
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "{}{}  {}",
+                    if selected { "▌" } else { " " },
+                    index + 1,
+                    kind.label()
+                ),
+                if selected {
+                    theme.active_tab()
+                } else {
+                    theme.field()
+                },
+            )]));
+            if !compact {
+                lines.push(Line::styled(
+                    format!("    {}", kind.description()),
+                    theme.muted(),
+                ));
+            }
+        }
+        if !compact {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("↑↓", theme.key()),
+            Span::styled(" choose  ", theme.muted()),
+            Span::styled("1–3/enter", theme.key()),
+            Span::styled(
+                if compact { " open  " } else { " continue  " },
+                theme.muted(),
+            ),
+            Span::styled("esc", theme.key()),
+            Span::styled(" cancel", theme.muted()),
+        ]));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_incident_action_form(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        theme: Theme,
+        form: &IncidentActionForm,
+    ) {
+        let width = frame.area().width.saturating_sub(4).min(86);
+        let height = (7 + form.fields.len() as u16 * 3).min(frame.area().height);
+        let area = centered_rect(width, height, frame.area());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title(format!(
+                " {}  {}  ·  ESC ACTIONS ",
+                form.kind.label(),
+                safe_text(&form.target.title)
+            ))
+            .borders(Borders::ALL)
+            .border_style(theme.active_rule())
+            .style(theme.canvas());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let compact = inner.height < 12;
+        let notice_style = match self.notice.kind {
+            NoticeKind::Quiet => theme.muted(),
+            NoticeKind::Success => theme.success(),
+            NoticeKind::Error => theme.error(),
+        };
+        let notice_lines = wrap_text_exact(&self.notice.text, usize::from(inner.width.max(1)))
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let mut lines = Vec::new();
+        if !compact {
+            lines.push(Line::styled(
+                "Enter advances fields; the final Enter prepares a review.",
+                theme.muted(),
+            ));
+        }
+        lines.extend(
+            notice_lines
+                .iter()
+                .cloned()
+                .map(|line| Line::styled(line, notice_style)),
+        );
+        if !compact {
+            lines.push(Line::raw(""));
+        }
+        for (index, field) in form.fields.iter().enumerate() {
+            let focused = index == form.focused;
+            let mut label = vec![
+                Span::styled(
+                    if focused { "▌" } else { " " },
+                    if focused {
+                        theme.active_tab()
+                    } else {
+                        theme.muted()
+                    },
+                ),
+                Span::styled(
+                    format!("{}  ", field.label),
+                    if focused {
+                        theme.field()
+                    } else {
+                        theme.muted()
+                    },
+                ),
+            ];
+            if !compact {
+                label.push(Span::styled(field.hint, theme.muted()));
+            }
+            lines.push(Line::from(label));
+            let visible = safe_text(&field.value.replace('\n', " ↵ "));
+            let input_width = usize::from(inner.width.saturating_sub(4).max(1));
+            let visible = tail_text(&visible, input_width);
+            lines.push(Line::from(vec![
+                Span::styled("  › ", theme.key()),
+                Span::styled(
+                    visible,
+                    if focused {
+                        theme.body().add_modifier(Modifier::BOLD)
+                    } else {
+                        theme.body()
+                    },
+                ),
+            ]));
+            if !compact {
+                lines.push(Line::raw(""));
+            }
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                if compact {
+                    "tab/↑↓"
+                } else {
+                    "tab / ↑↓"
+                },
+                theme.key(),
+            ),
+            Span::styled(" fields  ", theme.muted()),
+            Span::styled("enter", theme.key()),
+            Span::styled(
+                if compact { " review  " } else { " continue  " },
+                theme.muted(),
+            ),
+            Span::styled("esc", theme.key()),
+            Span::styled(" actions", theme.muted()),
+        ]));
+        frame.render_widget(Paragraph::new(lines), inner);
+
+        let field = &form.fields[form.focused];
+        let input_width = usize::from(inner.width.saturating_sub(4).max(1));
+        let visible_length = tail_text(&safe_text(&field.value.replace('\n', " ↵ ")), input_width)
+            .chars()
+            .count() as u16;
+        let cursor_offset = if compact {
+            notice_lines.len() as u16 + form.focused as u16 * 2 + 1
+        } else {
+            3 + notice_lines.len() as u16 + form.focused as u16 * 3
+        };
+        let cursor_y = inner
+            .y
+            .saturating_add(cursor_offset)
+            .min(inner.bottom().saturating_sub(1));
+        let cursor_x = inner
+            .x
+            .saturating_add(4)
+            .saturating_add(visible_length)
+            .min(inner.right().saturating_sub(1));
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+
+    fn render_incident_action_review(
+        &mut self,
+        frame: &mut ratatui::Frame<'_>,
+        theme: Theme,
+        prepared: &PreparedIncidentAction,
+    ) {
+        let width = frame.area().width.saturating_sub(4).min(88);
+        let height = (9 + prepared.preview.len() as u16 * 3).min(frame.area().height);
+        let area = centered_rect(width, height, frame.area());
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title(format!(
+                " REVIEW WRITE  {}  ·  ESC EDIT ",
+                safe_text(&prepared.form.target.title)
+            ))
+            .borders(Borders::ALL)
+            .border_style(theme.active_rule())
+            .style(theme.canvas());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let notice_style = match self.notice.kind {
+            NoticeKind::Quiet => theme.muted(),
+            NoticeKind::Success => theme.success(),
+            NoticeKind::Error => theme.error(),
+        };
+        let mut introduction_lines = vec![Line::styled(
+            format!("{} · atomic ServiceNow PATCH", prepared.form.kind.label()),
+            theme.title(),
+        )];
+        introduction_lines.extend(
+            wrap_text_exact(&self.notice.text, usize::from(sections[0].width.max(1)))
+                .into_iter()
+                .take(2)
+                .map(|line| Line::styled(line, notice_style)),
+        );
+        let introduction = Paragraph::new(introduction_lines);
+        frame.render_widget(introduction, sections[0]);
+
+        let preview_width = usize::from(sections[1].width.max(1));
+        let mut lines = Vec::new();
+        for (label, value) in &prepared.preview {
+            lines.push(Line::styled(label.clone(), theme.field()));
+            for value_line in wrap_text_exact(value, preview_width.saturating_sub(2).max(1)) {
+                lines.push(Line::styled(format!("  {value_line}"), theme.body()));
+            }
+            lines.push(Line::raw(""));
+        }
+        let line_count = lines.len() as u16;
+        let preview = Paragraph::new(lines).scroll((self.action_review_scroll, 0));
+        self.action_review_viewport_height = sections[1].height.max(1);
+        self.action_review_max_scroll =
+            line_count.saturating_sub(self.action_review_viewport_height);
+        self.action_review_scroll = self.action_review_scroll.min(self.action_review_max_scroll);
+        frame.render_widget(preview, sections[1]);
+
+        let footer = Line::from(vec![
+            Span::styled("↑↓", theme.key()),
+            Span::styled(" scroll  ", theme.muted()),
+            Span::styled("enter", theme.key()),
+            Span::styled(" apply  ", theme.muted()),
+            Span::styled("esc", theme.key()),
+            Span::styled(" edit  ", theme.muted()),
+            Span::styled("q", theme.key()),
+            Span::styled(" cancel", theme.muted()),
+        ]);
+        frame.render_widget(Paragraph::new(footer), sections[2]);
     }
 
     fn open_selected(&mut self, client: &ServiceNowClient) {
@@ -1595,7 +2483,7 @@ pub async fn run(
     let mut terminal = Terminal::new(backend).map_err(terminal_error)?;
     terminal.clear().map_err(terminal_error)?;
 
-    let mut app = App::new(&config.profile, &config.instance, options);
+    let mut app = App::new(&config.profile, &config.instance, config.read_only, options);
     terminal
         .draw(|frame| app.render(frame))
         .map_err(terminal_error)?;
@@ -1619,6 +2507,23 @@ pub async fn run(
             Action::Quit => return Ok(TuiExit::Quit),
             Action::Authenticate => return Ok(TuiExit::Authenticate),
             Action::Open => app.open_selected(client),
+            Action::OpenIncidentActions { return_to_detail } => {
+                app.open_incident_actions(return_to_detail);
+            }
+            Action::PrepareIncident(form) => {
+                app.notice = Notice::quiet(form.kind.progress());
+                terminal
+                    .draw(|frame| app.render(frame))
+                    .map_err(terminal_error)?;
+                app.prepare_incident_action(client, form).await;
+            }
+            Action::ExecuteIncident(prepared) => {
+                app.notice = Notice::quiet(format!("Applying {}…", prepared.form.kind.label()));
+                terminal
+                    .draw(|frame| app.render(frame))
+                    .map_err(terminal_error)?;
+                app.execute_incident_action(client, config, prepared).await;
+            }
             Action::Load => {
                 terminal
                     .draw(|frame| app.render(frame))
@@ -2504,6 +3409,46 @@ fn safe_text(value: &str) -> String {
         .collect()
 }
 
+fn nonempty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn wrap_text_exact(value: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+    let mut wrapped = Vec::new();
+    for logical_line in value.split('\n') {
+        let logical_line = safe_text(logical_line);
+        if logical_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for character in logical_line.chars() {
+            let mut candidate = current.clone();
+            candidate.push(character);
+            if !current.is_empty() && Line::raw(candidate.as_str()).width() > max_width {
+                wrapped.push(current);
+                current = String::new();
+            }
+            current.push(character);
+        }
+        wrapped.push(current);
+    }
+    wrapped
+}
+
+fn tail_text(value: &str, max_chars: usize) -> String {
+    let length = value.chars().count();
+    if length <= max_chars {
+        return value.into();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut tail = String::from("…");
+    tail.extend(value.chars().skip(length.saturating_sub(keep)));
+    tail
+}
+
 fn truncate_text(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.into();
@@ -2555,14 +3500,16 @@ fn record_title(record: &Value) -> String {
 mod tests {
     use super::*;
     use crate::config::AuthType;
+    use crate::metadata::ChoiceMetadata;
     use ratatui::backend::TestBackend;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn app() -> App {
         let mut app = App::new(
             "work",
             "https://dev12345.service-now.com",
+            false,
             TuiOptions {
                 table: "incident".into(),
                 query: None,
@@ -2586,11 +3533,402 @@ mod tests {
         app
     }
 
+    fn action_form(
+        kind: IncidentActionKind,
+        return_tab: Option<IncidentTab>,
+    ) -> IncidentActionForm {
+        IncidentActionForm::new(
+            kind,
+            IncidentTarget {
+                sys_id: "0123456789abcdef0123456789abcdef".into(),
+                title: "INC0010001".into(),
+                return_tab,
+            },
+        )
+    }
+
+    fn resolution_metadata() -> TableMetadata {
+        TableMetadata {
+            table: "incident".into(),
+            fetched_at: 0,
+            fields: Vec::new(),
+            choices: std::collections::BTreeMap::from([
+                (
+                    "state".into(),
+                    vec![ChoiceMetadata {
+                        value: "9".into(),
+                        label: "Resolved".into(),
+                        sequence: 90,
+                    }],
+                ),
+                (
+                    "close_code".into(),
+                    vec![ChoiceMetadata {
+                        value: "solved_permanently".into(),
+                        label: "Solved (Permanently)".into(),
+                        sequence: 10,
+                    }],
+                ),
+            ]),
+        }
+    }
+
+    #[test]
+    fn incident_action_sheet_is_discoverable_and_read_only_is_explicit() {
+        let backend = TestBackend::new(96, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.open_incident_actions(false);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("INCIDENT ACTIONS"));
+        assert!(text.contains("ADD WORK NOTE"));
+        assert!(text.contains("ASSIGN"));
+        assert!(text.contains("RESOLVE"));
+        assert!(text.contains("review it before anything changes"));
+
+        app.read_only = true;
+        app.open_incident_actions(false);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("READ ONLY"));
+        assert!(text.contains("Actions are visible but unavailable"));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(matches!(app.overlay, Overlay::IncidentActions(_)));
+        assert!(app.notice.text.contains("read-only"));
+    }
+
+    #[test]
+    fn incident_action_review_keeps_confirmation_visible_and_scrolls_on_compact_terminals() {
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.notice = Notice::quiet("Review the exact ServiceNow update before applying.");
+        app.overlay = Overlay::IncidentActionReview(PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Resolve, None),
+            body: Map::new(),
+            preview: vec![
+                ("STATE".into(), "Resolved".into()),
+                ("RESOLUTION CODE".into(), "Solved (Permanently)".into()),
+                (
+                    "RESOLUTION NOTES".into(),
+                    format!(
+                        "{}§",
+                        "Validated delivery with the requester and confirmed mail flow. ".repeat(8)
+                    ),
+                ),
+            ],
+        });
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("REVIEW WRITE"));
+        assert!(text.contains("Review the exact"));
+        assert!(text.contains("enter apply"));
+        assert!(app.action_review_max_scroll > 0);
+
+        app.action_review_scroll = app.action_review_max_scroll;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains('§'));
+        assert!(text.contains("enter apply"));
+
+        app.notice = Notice::error("Update rejected by a business rule.");
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("Update rejected"));
+        assert!(text.contains("enter apply"));
+    }
+
+    #[test]
+    fn compact_incident_action_chooser_and_form_keep_fields_and_controls_visible() {
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app();
+        app.open_incident_actions(false);
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("ADD WORK NOTE"));
+        assert!(text.contains("ASSIGN"));
+        assert!(text.contains("RESOLVE"));
+        assert!(text.contains("1–3/enter open"));
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+            Action::None
+        );
+        app.notice = Notice::error("Resolution notes cannot be empty.");
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("Resolution notes cannot be empty"));
+        assert!(text.contains("RESOLUTION CODE"));
+        assert!(text.contains("RESOLUTION NOTES"));
+        assert!(text.contains("enter review"));
+    }
+
+    #[test]
+    fn incident_action_form_advances_fields_and_preserves_text_for_review() {
+        let mut app = app();
+        app.open_incident_actions(true);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+            Action::None
+        );
+        let Overlay::IncidentActionForm(form) = &mut app.overlay else {
+            panic!("expected resolution form");
+        };
+        form.fields[0].value = "Solved (Permanently)".into();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let Overlay::IncidentActionForm(form) = &mut app.overlay else {
+            panic!("expected resolution form");
+        };
+        assert_eq!(form.focused, 1);
+        form.fields[1].value = "Corrected the mail gateway".into();
+        let Action::PrepareIncident(form) =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected action preparation");
+        };
+        assert_eq!(form.fields[0].value, "Solved (Permanently)");
+        assert_eq!(form.fields[1].value, "Corrected the mail gateway");
+        assert_eq!(form.target.return_tab, Some(IncidentTab::Overview));
+    }
+
+    #[tokio::test]
+    async fn assignment_preparation_resolves_people_and_groups_before_review() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "name": "Avery Stone",
+                    "email": "avery@example.com"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user_group"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "name": "Network"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let mut app = app();
+        let mut form = action_form(IncidentActionKind::Assign, None);
+        form.fields[0].value = "avery@example.com".into();
+        form.fields[1].value = "Network".into();
+
+        let prepared = app
+            .build_prepared_incident_action(&client, form)
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared.body["assigned_to"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            prepared.body["assignment_group"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(prepared.preview[0].1, "Avery Stone");
+        assert_eq!(prepared.preview[1].1, "Network");
+    }
+
+    #[tokio::test]
+    async fn resolution_preparation_maps_choices_and_rechecks_current_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": "0123456789abcdef0123456789abcdef",
+                    "number": "INC0010001",
+                    "state": {"value": "2", "display_value": "In Progress"}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let mut app = app();
+        app.incident_metadata = Some(resolution_metadata());
+        let mut form = action_form(IncidentActionKind::Resolve, Some(IncidentTab::Activity));
+        form.fields[0].value = "Solved (Permanently)".into();
+        form.fields[1].value = "Corrected the mail gateway".into();
+
+        let prepared = app
+            .build_prepared_incident_action(&client, form)
+            .await
+            .unwrap();
+        assert_eq!(prepared.body["state"], "9");
+        assert_eq!(prepared.body["close_code"], "solved_permanently");
+        assert_eq!(prepared.body["close_notes"], "Corrected the mail gateway");
+        assert_eq!(prepared.preview[0].1, "Resolved");
+        assert_eq!(prepared.preview[1].1, "Solved (Permanently)");
+    }
+
+    #[tokio::test]
+    async fn resolution_confirmation_rechecks_state_before_patching() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {
+                    "sys_id": "0123456789abcdef0123456789abcdef",
+                    "number": "INC0010001",
+                    "state": {"value": "9", "display_value": "Resolved"}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let metadata = resolution_metadata();
+        let body = incident::resolution_body(
+            &metadata,
+            "Solved (Permanently)",
+            "Corrected the mail gateway".into(),
+            None,
+        )
+        .unwrap();
+        let prepared = PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Resolve, None),
+            body,
+            preview: vec![("STATE".into(), "Resolved".into())],
+        };
+        let mut app = app();
+        app.incident_metadata = Some(metadata);
+
+        app.execute_incident_action(&client, &Config::for_test(&server.uri(), false), prepared)
+            .await;
+
+        assert!(matches!(app.overlay, Overlay::IncidentActionReview(_)));
+        assert!(app.notice.text.contains("already resolved"));
+    }
+
+    #[tokio::test]
+    async fn confirmed_incident_action_patches_once_and_refreshes_the_ledger() {
+        let server = MockServer::start().await;
+        let body = incident::work_note_body("Investigating the gateway".into()).unwrap();
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .and(body_json(serde_json::json!({
+                "work_notes": "Investigating the gateway"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"sys_id": "0123456789abcdef0123456789abcdef"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "0123456789abcdef0123456789abcdef",
+                    "number": "INC0010001",
+                    "state": {"value": "2", "display_value": "In Progress"}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let config = Config::for_test(&server.uri(), false);
+        let mut app = app();
+        let prepared = PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Note, None),
+            body,
+            preview: vec![("WORK NOTE".into(), "Investigating the gateway".into())],
+        };
+
+        app.execute_incident_action(&client, &config, prepared)
+            .await;
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.notice.kind, NoticeKind::Success);
+        assert_eq!(app.notice.text, "Added a work note to INC0010001.");
+        assert_eq!(
+            app.selected_record().map(record_title).as_deref(),
+            Some("INC0010001")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_or_read_only_writes_keep_the_review_intact() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {"message": "Update rejected", "detail": "Business rule failed"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let body = incident::work_note_body("Keep this text".into()).unwrap();
+        let prepared = PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Note, None),
+            body,
+            preview: vec![("WORK NOTE".into(), "Keep this text".into())],
+        };
+        let mut app = app();
+        app.execute_incident_action(&client, &Config::for_test(&server.uri(), false), prepared)
+            .await;
+        let Overlay::IncidentActionReview(prepared) = &app.overlay else {
+            panic!("failed write should preserve review");
+        };
+        assert_eq!(prepared.preview[0].1, "Keep this text");
+        assert!(app.notice.text.contains("Update rejected"));
+
+        app.execute_incident_action(
+            &client,
+            &Config::for_test(&server.uri(), true),
+            prepared.clone(),
+        )
+        .await;
+        assert!(matches!(app.overlay, Overlay::IncidentActionReview(_)));
+        assert!(app.notice.text.contains("read-only"));
+    }
+
     #[test]
     fn incidents_open_on_active_work_assigned_to_the_user_or_their_groups() {
         let app = App::new(
             "work",
             "https://dev12345.service-now.com",
+            false,
             TuiOptions {
                 table: "incident".into(),
                 query: None,
@@ -2607,6 +3945,7 @@ mod tests {
         let explicit = App::new(
             "work",
             "https://dev12345.service-now.com",
+            false,
             TuiOptions {
                 table: "incident".into(),
                 query: Some("priority=1^ORDERBYDESCnumber".into()),
@@ -2617,6 +3956,7 @@ mod tests {
         let generic = App::new(
             "work",
             "https://dev12345.service-now.com",
+            false,
             TuiOptions {
                 table: "cmdb_ci".into(),
                 query: None,

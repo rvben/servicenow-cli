@@ -83,8 +83,8 @@ For browser SSO, OAuth, bearer-token, CI, migration, and production-profile guid
 
 ## Interactive terminal browser
 
-Launch the read-only Ratatui interface on incidents, or start directly on any
-standard or custom table:
+Launch the Ratatui incident workspace, or start directly on any standard or
+custom table:
 
 ```sh
 servicenow tui
@@ -101,10 +101,10 @@ The ledger adapts to the terminal width: wide terminals keep the selected
 record's field sheet beside the index, while compact terminals open that sheet
 on demand. Use `↑`/`↓` or `j`/`k` to move, `enter` to inspect, `/` to apply an
 encoded query, `s` to search display values on the currently loaded page, `t`
-to change tables, `n`/`p` to page, and `?` for the complete keyboard map. Local
-search stays active across page loads and query changes; submit a blank search
-to clear it. Press `o` to hand the selected record off to the ServiceNow web
-interface.
+to change tables, `n`/`p` to page, `a` for incident actions, and `?` for the
+complete keyboard map. Local search stays active across page loads and query
+changes; submit a blank search to clear it. Press `o` to hand the selected
+record off to the ServiceNow web interface.
 
 You can launch the TUI before setup is complete. If the active profile is not
 connected—or if its session has expired—the ledger presents secure sign-in as
@@ -120,12 +120,20 @@ load only when opened, return up to 100 recent entries, and can be retried
 independently with `r`. Access remains subject to the active ServiceNow user's
 table and field ACLs.
 
-The first TUI release deliberately performs no ServiceNow writes. It reuses the
-active profile and credentials, keeps secrets out of the rendered state, honors
-`--no-color`, and refuses to start when stdin or stdout is not an interactive
-terminal. Fields whose names identify passwords, secrets, tokens, cookies,
-credentials, authorization values, or private/API keys are always shown as
-`[REDACTED]`.
+On an incident, press `a` to add a work note, change the assignee or assignment
+group, or resolve the incident. The TUI validates the input, resolves user and
+group names, maps configured resolution choices, and shows the exact update on
+a separate review screen. Nothing is written until you confirm with `enter`;
+the update is sent as one PATCH request, failed writes preserve the review, and
+the ledger refreshes after success.
+
+Incident writes honor the active profile's write policy. Read-only profiles are
+clearly labeled and block every action; standard and custom tables remain
+browse-only. The TUI reuses the active credentials, keeps secrets out of the
+rendered state, honors `--no-color`, and refuses to start when stdin or stdout
+is not an interactive terminal. Fields whose names identify passwords, secrets,
+tokens, cookies, credentials, authorization values, or private/API keys are
+always shown as `[REDACTED]`.
 
 ## Incident workflows
 

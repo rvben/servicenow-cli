@@ -129,7 +129,7 @@ enum Command {
     #[command(subcommand, visible_alias = "profiles")]
     Profile(ProfileCommand),
 
-    /// Browse ServiceNow interactively in a read-only terminal interface
+    /// Operate incidents and browse ServiceNow tables interactively
     Tui {
         /// Table to open first
         #[arg(default_value = "incident")]
@@ -2278,16 +2278,7 @@ async fn run_incidents(
                     ));
                 }
             };
-            if notes.trim().is_empty() {
-                return Err(ApiError::InvalidInput(
-                    "resolution notes cannot be empty".into(),
-                ));
-            }
-            if code.trim().is_empty() {
-                return Err(ApiError::InvalidInput(
-                    "resolution code cannot be empty".into(),
-                ));
-            }
+            incident::require_resolution_input(&code, &notes)?;
             let mut body = build_body(None, &fields)?;
             for reserved in ["state", "close_code", "close_notes"] {
                 if body.contains_key(reserved) {
@@ -2306,12 +2297,12 @@ async fn run_incidents(
             } else {
                 metadata::sync_table(client, &config.profile, "incident").await?
             };
-            let resolved_state = incident::resolved_state_value(&metadata, state.as_deref())?;
-            let resolution_code =
-                incident::resolution_choice_value(&metadata, "close_code", &code)?;
-            body.insert("state".into(), Value::String(resolved_state.clone()));
-            body.insert("close_code".into(), Value::String(resolution_code));
-            body.insert("close_notes".into(), Value::String(notes));
+            let resolution = incident::resolution_body(&metadata, &code, notes, state.as_deref())?;
+            let resolved_state = resolution["state"]
+                .as_str()
+                .expect("resolution state is a string")
+                .to_string();
+            body.extend(resolution);
 
             let existing = resolve_incident(
                 client,
@@ -2422,9 +2413,7 @@ async fn run_incidents(
                     ));
                 }
             };
-            if note.trim().is_empty() {
-                return Err(ApiError::InvalidInput("work note cannot be empty".into()));
-            }
+            let body = incident::work_note_body(note)?;
             let existing = resolve_incident(
                 client,
                 &identifier,
@@ -2432,8 +2421,6 @@ async fn run_incidents(
                 DisplayValue::False,
             )
             .await?;
-            let mut body = Map::new();
-            body.insert("work_notes".into(), Value::String(note));
             if dry_run {
                 emit_mutation_plan(output, "append_work_note", &identifier, &body);
                 return Ok(());
@@ -2451,11 +2438,7 @@ async fn run_incidents(
             group,
             dry_run,
         } => {
-            if assignee.is_none() && group.is_none() {
-                return Err(ApiError::InvalidInput(
-                    "provide --to, --group, or both".into(),
-                ));
-            }
+            incident::require_assignment(assignee.as_deref(), group.as_deref())?;
             let mut body = Map::new();
             insert(
                 &mut body,
@@ -3321,6 +3304,7 @@ fn argument_action(action: &clap::ArgAction) -> &'static str {
 
 fn command_behavior(path: &str) -> Value {
     let remote_mutations = [
+        "tui",
         "incidents create",
         "incidents update",
         "incidents resolve",
@@ -3383,7 +3367,8 @@ fn command_behavior(path: &str) -> Value {
     let destructive = path.ends_with("attachments delete")
         || path.ends_with("tables delete")
         || path.ends_with("profile remove");
-    let requires_confirmation = destructive || path.ends_with("incidents edit");
+    let requires_confirmation =
+        destructive || path.ends_with("incidents edit") || path.ends_with("tui");
     let supports_dry_run = [
         "incidents resolve",
         "incidents edit",

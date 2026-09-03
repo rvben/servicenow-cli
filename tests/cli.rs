@@ -45,14 +45,14 @@ fn auth_login_help_advertises_secret_free_verbose_progress() {
 }
 
 #[test]
-fn tui_help_describes_generic_read_only_browsing() {
+fn tui_help_describes_incident_operations_and_generic_browsing() {
     let config_home = TempDir::new().unwrap();
     command(&config_home)
         .args(["tui", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Browse ServiceNow interactively in a read-only terminal interface",
+            "Operate incidents and browse ServiceNow tables interactively",
         ))
         .stdout(predicate::str::contains("Table to open first"))
         .stdout(predicate::str::contains("--page-size"));
@@ -251,6 +251,16 @@ fn schema_marks_destructive_and_dry_run_commands() {
             .unwrap()
             .contains("Resolved")
     );
+
+    let tui = command(&config_home)
+        .args(["schema", "--command", "tui"])
+        .output()
+        .unwrap();
+    let tui: serde_json::Value = serde_json::from_slice(&tui.stdout).unwrap();
+    assert_eq!(tui["behavior"]["mutation"], true);
+    assert_eq!(tui["behavior"]["sideEffect"], "remote");
+    assert_eq!(tui["behavior"]["requiresConfirmation"], true);
+    assert_eq!(tui["behavior"]["supportsDryRun"], false);
 }
 
 #[tokio::test]
