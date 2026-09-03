@@ -2,6 +2,13 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.5.0](https://github.com/rvben/servicenow-cli/compare/v0.4.5...v0.5.0) - 2026-09-03
+
+### Added
+
+- **auth**: improve profile selection and offline checks ([1f05b18](https://github.com/rvben/servicenow-cli/commit/1f05b181840988eb5f64a831e2ca0effd495e41a))
+- **incidents**: add guarded resolve workflow ([1ae636d](https://github.com/rvben/servicenow-cli/commit/1ae636d240b1b92df069a4edc6857a84d79b7589))
+
 ## [0.4.5](https://github.com/rvben/servicenow-cli/compare/v0.4.4...v0.4.5) - 2026-08-31
 
 ### Added
