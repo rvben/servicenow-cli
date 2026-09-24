@@ -149,6 +149,21 @@ fn help_and_version_are_unaffected_by_json_output() {
 }
 
 #[test]
+fn empty_csv_result_prints_nothing() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .args(["--output", "csv", "profile", "list"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "stdout: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
 fn auth_login_help_advertises_secret_free_verbose_progress() {
     let config_home = TempDir::new().unwrap();
     command(&config_home)

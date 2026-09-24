@@ -170,6 +170,10 @@ fn print_csv(value: &Value) {
         owned = vec![value.clone()];
         owned.as_slice()
     };
+    if records.is_empty() {
+        // An empty result set has no columns to name, so it produces no CSV at all.
+        return;
+    }
     let headers: Vec<String> = records
         .iter()
         .filter_map(Value::as_object)
