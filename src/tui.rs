@@ -897,11 +897,6 @@ impl App {
             }
         }
         self.notice = Notice::quiet(format!("Applying {}…", prepared.form.kind.label()));
-        if let Err(error) = config.require_writable() {
-            self.notice = Notice::error(error.to_string());
-            self.overlay = Overlay::IncidentActionReview(prepared);
-            return;
-        }
         if let Err(error) = client
             .update_record("incident", &prepared.form.target.sys_id, &prepared.body)
             .await
@@ -933,6 +928,7 @@ impl App {
                 .is_some_and(|sys_id| sys_id == target_sys_id)
         });
         let Some(selected) = selected else {
+            self.table_state.select(None);
             self.notice =
                 Notice::success(format!("{success} It no longer matches this ledger view."));
             return;
@@ -943,10 +939,20 @@ impl App {
             self.overlay = Overlay::Detail;
             self.detail_loading = true;
             self.load_detail(client).await;
+            let overview_error = self.overview_error.clone();
             if tab != IncidentTab::Overview {
                 self.incident_tab = tab;
                 self.detail_scroll = 0;
                 self.load_incident_tab(client, tab).await;
+            }
+            // An error from load_detail must survive a later successful
+            // load_incident_tab call, which otherwise overwrites self.notice
+            // with its own (non-error) result.
+            if let Some(overview_error) = overview_error {
+                self.notice = Notice::error(format!(
+                    "{success} {overview_error}. Showing index fields only."
+                ));
+                return;
             }
             if self.notice.kind == NoticeKind::Error {
                 self.notice = Notice::error(format!("{success} {}", self.notice.text));
@@ -3921,6 +3927,127 @@ mod tests {
         .await;
         assert!(matches!(app.overlay, Overlay::IncidentActionReview(_)));
         assert!(app.notice.text.contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn stale_selection_is_cleared_when_the_acted_on_incident_no_longer_matches() {
+        let server = MockServer::start().await;
+        let body = incident::work_note_body("Investigating the gateway".into()).unwrap();
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"sys_id": "0123456789abcdef0123456789abcdef"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "fedcba9876543210fedcba9876543210",
+                    "number": "INC0010002",
+                    "state": {"value": "2", "display_value": "In Progress"}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let config = Config::for_test(&server.uri(), false);
+        let mut app = app();
+        let prepared = PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Note, None),
+            body,
+            preview: vec![("WORK NOTE".into(), "Investigating the gateway".into())],
+        };
+
+        app.execute_incident_action(&client, &config, prepared)
+            .await;
+
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.notice.kind, NoticeKind::Success);
+        assert!(
+            app.notice
+                .text
+                .contains("no longer matches this ledger view")
+        );
+        assert_eq!(
+            app.table_state.selected(),
+            None,
+            "a record at the old index must not stay selected once it belongs to a different incident"
+        );
+    }
+
+    #[tokio::test]
+    async fn overview_error_survives_a_successful_incident_tab_reload() {
+        let server = MockServer::start().await;
+        let body = incident::work_note_body("Investigating the gateway".into()).unwrap();
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": {"sys_id": "0123456789abcdef0123456789abcdef"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "0123456789abcdef0123456789abcdef",
+                    "number": "INC0010001",
+                    "state": {"value": "2", "display_value": "In Progress"}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {"message": "Detail lookup failed"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_journal_field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let config = Config::for_test(&server.uri(), false);
+        let mut app = app();
+        let prepared = PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Note, Some(IncidentTab::Activity)),
+            body,
+            preview: vec![("WORK NOTE".into(), "Investigating the gateway".into())],
+        };
+
+        app.execute_incident_action(&client, &config, prepared)
+            .await;
+
+        assert_eq!(
+            app.notice.kind,
+            NoticeKind::Error,
+            "the overview load failure must not be replaced by the activity tab's success, got: {:?}",
+            app.notice
+        );
+        assert!(app.notice.text.contains("Detail lookup failed"));
     }
 
     #[test]
