@@ -2768,8 +2768,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "opens an installed browser"]
     async fn installed_browser_completes_a_local_session_handoff() {
-        if find_native_browser(std::env::var_os("SERVICENOW_BROWSER").as_deref()).is_err() {
-            return;
+        if let Err(error) = find_native_browser(std::env::var_os("SERVICENOW_BROWSER").as_deref()) {
+            panic!(
+                "no native browser available for this live test; install Chrome, Edge, Chromium, or Firefox, or set SERVICENOW_BROWSER to one before running --ignored tests: {error}"
+            );
         }
         let instance = MockServer::start().await;
         Mock::given(method("GET"))
