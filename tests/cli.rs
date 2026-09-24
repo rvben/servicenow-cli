@@ -76,6 +76,79 @@ fn completions_output_survives_a_closed_stdout_pipe() {
 }
 
 #[test]
+fn unknown_flag_under_json_output_uses_the_error_envelope() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .args(["--output", "json", "incidents", "list", "--bogus-flag"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--bogus-flag")
+    );
+}
+
+#[test]
+fn missing_required_argument_under_json_output_uses_the_error_envelope() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .args(["--output", "json", "tables", "get"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+}
+
+#[test]
+fn unknown_subcommand_under_json_output_uses_the_error_envelope() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .args(["--output", "json", "bogus-subcommand"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "invalid_input");
+}
+
+#[test]
+fn unknown_flag_under_text_output_keeps_the_plain_usage_error() {
+    let config_home = TempDir::new().unwrap();
+    for format in [&["--output", "text"][..], &["-otext"]] {
+        let output = command(&config_home)
+            .args(format)
+            .args(["incidents", "list", "--bogus-flag"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{format:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("error: "), "{format:?}: {stderr}");
+    }
+}
+
+#[test]
+fn help_and_version_are_unaffected_by_json_output() {
+    let config_home = TempDir::new().unwrap();
+    command(&config_home)
+        .args(["--output", "json", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Fast, safe, human-friendly"));
+    command(&config_home)
+        .args(["--output", "json", "--version"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("servicenow"));
+}
+
+#[test]
 fn auth_login_help_advertises_secret_free_verbose_progress() {
     let config_home = TempDir::new().unwrap();
     command(&config_home)

@@ -288,6 +288,12 @@ Machine-readable errors use a stable envelope:
 {"error":{"kind":"not_found","message":"not found: ..."}}
 ```
 
+Command-line parsing errors (an unknown flag, a missing required argument, an
+unrecognized subcommand) use the same envelope with `kind: invalid_input` and
+exit code 2 whenever the output mode is machine-readable, including auto-JSON
+mode when stdout is not a terminal. `--help` and `--version` always print
+their normal text to stdout with exit code 0.
+
 | Exit | Meaning |
 |---:|---|
 | 0 | Success |

@@ -719,14 +719,61 @@ fn parse_tui_page_size(value: &str) -> Result<usize, String> {
     }
 }
 
+/// Decides whether errors are rendered as the machine-readable JSON envelope. Explicit
+/// machine formats always are, `text` and `table` never are, and `auto` (or a value that
+/// is not a known format) follows `--json` and whether stdout is a terminal, matching
+/// `OutputConfig`.
+fn machine_readable_errors(output: &str, json_alias: bool) -> bool {
+    match output {
+        "json" | "jsonl" | "ndjson" | "yaml" | "yml" | "csv" => true,
+        "text" | "table" => false,
+        _ => json_alias || !std::io::stdout().is_terminal(),
+    }
+}
+
+/// Recovers `--output` and `--json` from raw arguments when parsing failed and there is no
+/// parsed `Cli` to consult, possibly because the `--output` value itself was invalid.
+/// Scanning stops at `--`, after which everything is positional.
+fn raw_output_flags(args: &[std::ffi::OsString]) -> (String, bool) {
+    let mut output = String::from("auto");
+    let mut json_alias = false;
+    let mut iter = args.iter().skip(1).map(|arg| arg.to_string_lossy());
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
+            break;
+        } else if arg == "--json" {
+            json_alias = true;
+        } else if arg == "--output" || arg == "-o" {
+            if let Some(value) = iter.next() {
+                output = value.into_owned();
+            }
+        } else if let Some(value) = arg.strip_prefix("--output=") {
+            output = value.to_string();
+        } else if let Some(value) = arg.strip_prefix("-o") {
+            output = value.strip_prefix('=').unwrap_or(value).to_string();
+        }
+    }
+    (output, json_alias)
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
-    let machine_errors = matches!(
-        cli.output.as_str(),
-        "json" | "jsonl" | "ndjson" | "yaml" | "yml" | "csv"
-    ) || (cli.output == "auto"
-        && (cli.json || !std::io::IsTerminal::is_terminal(&std::io::stdout())));
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let (output, json_alias) = raw_output_flags(&args);
+            // --help and --version render to stdout with exit 0 whatever the format, and
+            // human output keeps clap's own colored usage text.
+            if !error.use_stderr() || !machine_readable_errors(&output, json_alias) {
+                error.exit();
+            }
+            let parse_error = ApiError::InvalidInput(error.to_string().trim_end().to_string());
+            print_error(&parse_error, true);
+            std::process::exit(exit_code(&parse_error));
+        }
+    };
+    let machine_errors = machine_readable_errors(&cli.output, cli.json);
     if let Err(error) = run(cli).await {
         print_error(&error, machine_errors);
         std::process::exit(exit_code(&error));
@@ -3393,6 +3440,45 @@ fn command_behavior(path: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_flags(args: &[&str]) -> (String, bool) {
+        let args: Vec<std::ffi::OsString> = std::iter::once("servicenow")
+            .chain(args.iter().copied())
+            .map(Into::into)
+            .collect();
+        raw_output_flags(&args)
+    }
+
+    #[test]
+    fn raw_output_flags_recognize_every_spelling_clap_accepts() {
+        for spelling in [
+            &["--output", "yaml"][..],
+            &["--output=yaml"],
+            &["-o", "yaml"],
+            &["-oyaml"],
+            &["-o=yaml"],
+        ] {
+            assert_eq!(raw_flags(spelling), ("yaml".into(), false), "{spelling:?}");
+        }
+        assert_eq!(raw_flags(&["--json", "bogus"]), ("auto".into(), true));
+        assert_eq!(raw_flags(&["bogus"]), ("auto".into(), false));
+    }
+
+    #[test]
+    fn raw_output_flags_ignore_positional_values_after_the_separator() {
+        assert_eq!(
+            raw_flags(&["-o", "text", "tables", "get", "--", "-ojson", "--json"]),
+            ("text".into(), false)
+        );
+    }
+
+    #[test]
+    fn explicit_formats_decide_error_rendering_regardless_of_the_json_alias() {
+        assert!(machine_readable_errors("csv", false));
+        assert!(!machine_readable_errors("text", true));
+        assert!(!machine_readable_errors("table", true));
+        assert!(machine_readable_errors("auto", true));
+    }
 
     #[test]
     fn tui_recovers_only_connection_and_authentication_failures() {
