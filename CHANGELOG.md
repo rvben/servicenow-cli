@@ -2,6 +2,24 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.5.2](https://github.com/rvben/servicenow-cli/compare/v0.5.1...v0.5.2) - 2026-09-24
+
+### Added
+
+- **tui**: make network requests cancellable with Esc or Ctrl-C ([5e2eb12](https://github.com/rvben/servicenow-cli/commit/5e2eb12150d3a126b1cdfa9eadc09e4deae8dd2c))
+
+### Fixed
+
+- **tui**: show the loading panel while a new table, query, or page loads ([2406681](https://github.com/rvben/servicenow-cli/commit/2406681f33a61ca67f94b9cf6e47b31fe93439d3))
+- **attachments**: distinguish omitted metadata fields from empty ones ([f581b40](https://github.com/rvben/servicenow-cli/commit/f581b400eba78f73fd01b6cfd6b2b6122bbdc163))
+- **tui**: clear stale selection and keep the overview error visible ([c40e835](https://github.com/rvben/servicenow-cli/commit/c40e835b5bc2665ee8eae34f75ac7b81654c4070))
+- **cli**: prompt interactively for tables delete like other delete commands ([e63d167](https://github.com/rvben/servicenow-cli/commit/e63d167f6ca2ec2b76ed3aae3078a4b7e2923265))
+- **output**: print nothing for an empty CSV result set ([fc41749](https://github.com/rvben/servicenow-cli/commit/fc417494bd3150ccecfeec6917ed6cc64076d779))
+- **cli**: route argument parsing errors through the JSON error envelope ([ac4df03](https://github.com/rvben/servicenow-cli/commit/ac4df033e9574a4b27a2c3ac4a5687a050628419))
+- **cli**: end the process quietly on a closed stdout pipe ([bd08d9c](https://github.com/rvben/servicenow-cli/commit/bd08d9c0ec0408e4ae800323a3e281f2b5164918))
+- **auth**: describe Firefox sign-in as a profile, not a private browser ([1d330ad](https://github.com/rvben/servicenow-cli/commit/1d330adf0564c24290b70084235394615b816573))
+- **auth**: harden throwaway browser profiles and the CDP sign-in channel ([1e6775b](https://github.com/rvben/servicenow-cli/commit/1e6775b5146f3eadf04758c0c5557325018bdc8d))
+
 ## [0.5.1](https://github.com/rvben/servicenow-cli/compare/v0.5.0...v0.5.1) - 2026-09-24
 
 ### Added

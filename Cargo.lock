@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "servicenow-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "assert_cmd",
  "base64 0.23.1",
