@@ -98,7 +98,7 @@ impl ProgressReporter<'_> {
     }
 }
 
-/// Sign in through an isolated Chromium profile and retain only cookies scoped
+/// Sign in through an isolated browser profile and retain only cookies scoped
 /// to the requested ServiceNow instance.
 pub async fn browser_login(
     instance: &str,
@@ -154,13 +154,25 @@ async fn native_browser_cookie_with_progress(
     browser: PathBuf,
     progress: &mut ProgressReporter<'_>,
 ) -> Result<BrowserSession, ApiError> {
-    let private_mode = private_browsing_argument(&browser);
+    if is_firefox(&browser) {
+        firefox_browser_cookie(site_url, &browser, progress).await
+    } else {
+        chromium_browser_cookie(site_url, &browser, progress).await
+    }
+}
+
+async fn chromium_browser_cookie(
+    site_url: &str,
+    browser: &Path,
+    progress: &mut ProgressReporter<'_>,
+) -> Result<BrowserSession, ApiError> {
+    let private_mode = private_browsing_argument(browser);
     let profile = tempfile::tempdir()
         .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
-    let login_url = format!("{site_url}/nav_to.do?uri=incident_list.do");
     progress.report(BrowserProgress::StartingPrivateBrowser);
-    let child = std::process::Command::new(&browser)
-        .args([
+    let child = spawn_browser(
+        browser,
+        [
             "--remote-debugging-port=0".into(),
             "--remote-debugging-address=127.0.0.1".into(),
             format!("--user-data-dir={}", profile.path().display()),
@@ -169,8 +181,85 @@ async fn native_browser_cookie_with_progress(
             "--disable-sync".into(),
             private_mode.into(),
             "--new-window".into(),
-            login_url,
-        ])
+            login_url(site_url),
+        ],
+    )?;
+    progress.report(BrowserProgress::PrivateBrowserOpened);
+    let mut process = NativeBrowser { child, profile };
+    progress.report(BrowserProgress::WaitingForBrowserChannel);
+    let websocket_url = wait_for_debugger(&mut process).await?;
+    progress.report(BrowserProgress::BrowserChannelReady);
+    wait_for_cdp_session(&websocket_url, site_url, Some(&mut process), progress).await
+}
+
+/// Firefox exposes WebDriver BiDi instead of CDP. Its BiDi server cannot read
+/// cookies from private windows, so the sign-in runs in a normal window of a
+/// throwaway profile that is deleted afterwards.
+async fn firefox_browser_cookie(
+    site_url: &str,
+    browser: &Path,
+    progress: &mut ProgressReporter<'_>,
+) -> Result<BrowserSession, ApiError> {
+    let profile = firefox_profile()
+        .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
+    std::fs::write(profile.path().join("user.js"), FIREFOX_PREFERENCES)
+        .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
+    progress.report(BrowserProgress::StartingPrivateBrowser);
+    let child = spawn_browser(
+        browser,
+        [
+            "--remote-debugging-port=0".into(),
+            "--profile".into(),
+            profile.path().display().to_string(),
+            "--no-remote".into(),
+            login_url(site_url),
+        ],
+    )?;
+    progress.report(BrowserProgress::PrivateBrowserOpened);
+    let mut process = NativeBrowser { child, profile };
+    progress.report(BrowserProgress::WaitingForBrowserChannel);
+    let socket = wait_for_bidi_socket(&mut process).await?;
+    let mut probe = BidiProbe::start(socket).await?;
+    progress.report(BrowserProgress::BrowserChannelReady);
+    let session =
+        wait_for_browser_session(&mut probe, site_url, Some(&mut process), progress).await;
+    probe.close().await;
+    session
+}
+
+const FIREFOX_PREFERENCES: &str = r#"user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+user_pref("signon.rememberSignons", false);
+"#;
+
+/// Snap-packaged Firefox has a private `/tmp`, so its profile must live in the
+/// snap's own home directory to be visible to both processes.
+fn firefox_profile() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("servicenow-cli-browser-");
+    match dirs::home_dir()
+        .map(|home| home.join("snap/firefox/common"))
+        .filter(|directory| directory.is_dir())
+    {
+        Some(directory) => builder.tempdir_in(directory),
+        None => builder.tempdir(),
+    }
+}
+
+fn login_url(site_url: &str) -> String {
+    format!("{site_url}/nav_to.do?uri=incident_list.do")
+}
+
+fn spawn_browser(
+    browser: &Path,
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<Child, ApiError> {
+    std::process::Command::new(browser)
+        .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -180,17 +269,7 @@ async fn native_browser_cookie_with_progress(
                 "failed to start browser {}: {error}",
                 browser.display()
             ))
-        })?;
-    progress.report(BrowserProgress::PrivateBrowserOpened);
-    let mut process = NativeBrowser {
-        child,
-        _profile: profile,
-    };
-    progress.report(BrowserProgress::WaitingForBrowserChannel);
-    let websocket_url = wait_for_debugger(&mut process).await?;
-    progress.report(BrowserProgress::BrowserChannelReady);
-    wait_for_session_cookie_with_progress(&websocket_url, site_url, Some(&mut process), progress)
-        .await
+        })
 }
 
 #[cfg(test)]
@@ -204,12 +283,20 @@ async fn native_browser_cookie(site_url: &str) -> Result<BrowserSession, ApiErro
     native_browser_cookie_with_progress(site_url, browser, &mut progress).await
 }
 
-fn private_browsing_argument(browser: &Path) -> &'static str {
-    let executable = browser
+fn executable_name(browser: &Path) -> String {
+    browser
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default()
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+fn is_firefox(browser: &Path) -> bool {
+    executable_name(browser).contains("firefox")
+}
+
+fn private_browsing_argument(browser: &Path) -> &'static str {
+    let executable = executable_name(browser);
     if executable.contains("msedge") || executable.contains("microsoft-edge") {
         "--inprivate"
     } else {
@@ -219,7 +306,7 @@ fn private_browsing_argument(browser: &Path) -> &'static str {
 
 struct NativeBrowser {
     child: Child,
-    _profile: tempfile::TempDir,
+    profile: tempfile::TempDir,
 }
 
 impl NativeBrowser {
@@ -251,7 +338,7 @@ async fn wait_for_debugger(process: &mut NativeBrowser) -> Result<String, ApiErr
     loop {
         process.ensure_running()?;
         if let Ok(active_port) =
-            std::fs::read_to_string(process._profile.path().join("DevToolsActivePort"))
+            std::fs::read_to_string(process.profile.path().join("DevToolsActivePort"))
             && let Some(port) = active_port.lines().next()
             && port.parse::<u16>().is_ok()
         {
@@ -265,7 +352,7 @@ async fn wait_for_debugger(process: &mut NativeBrowser) -> Result<String, ApiErr
         }
         if started.elapsed() >= BROWSER_START_TIMEOUT {
             return Err(ApiError::Other(
-                "browser started but its private sign-in channel did not become available; set SERVICENOW_BROWSER to Chrome, Edge, or Chromium"
+                "browser started but its private sign-in channel did not become available; set SERVICENOW_BROWSER to Chrome, Edge, Chromium, or Firefox"
                     .into(),
             ));
         }
@@ -273,17 +360,67 @@ async fn wait_for_debugger(process: &mut NativeBrowser) -> Result<String, ApiErr
     }
 }
 
-type CdpSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+async fn wait_for_bidi_socket(process: &mut NativeBrowser) -> Result<BrowserSocket, ApiError> {
+    let started = Instant::now();
+    loop {
+        process.ensure_running()?;
+        if let Ok(server) =
+            std::fs::read_to_string(process.profile.path().join("WebDriverBiDiServer.json"))
+            && let Ok(server) = serde_json::from_str::<Value>(&server)
+            && let Some(port) = server
+                .get("ws_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+            && let Ok((socket, _)) = connect_async(format!("ws://127.0.0.1:{port}/session")).await
+        {
+            return Ok(socket);
+        }
+        if started.elapsed() >= BROWSER_START_TIMEOUT {
+            return Err(ApiError::Other(
+                "Firefox started but its WebDriver BiDi sign-in channel did not become available; update Firefox or set SERVICENOW_BROWSER to Chrome, Edge, or Chromium"
+                    .into(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 
-async fn wait_for_session_cookie_with_progress(
+type BrowserSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Browser-protocol operations the sign-in loop needs from an open browser.
+trait SessionProbe {
+    type Page;
+
+    /// Find a top-level page on the instance host and open it for inspection.
+    async fn find_page(&mut self, host: &str) -> Result<Option<Self::Page>, ApiError>;
+
+    /// Cookies in the CDP `Network.getCookies` result shape.
+    async fn cookies(&mut self, page: &Self::Page, site_url: &str) -> Result<Value, ApiError>;
+
+    async fn user_token(&mut self, page: &Self::Page) -> Result<Option<String>, ApiError>;
+
+    async fn release(&mut self, page: Self::Page);
+}
+
+async fn wait_for_cdp_session(
     websocket_url: &str,
+    site_url: &str,
+    process: Option<&mut NativeBrowser>,
+    progress: &mut ProgressReporter<'_>,
+) -> Result<BrowserSession, ApiError> {
+    let (socket, _) = connect_async(websocket_url)
+        .await
+        .map_err(|error| ApiError::Other(format!("failed to connect to browser: {error}")))?;
+    let mut probe = CdpProbe { socket, id: 0 };
+    wait_for_browser_session(&mut probe, site_url, process, progress).await
+}
+
+async fn wait_for_browser_session<P: SessionProbe>(
+    probe: &mut P,
     site_url: &str,
     mut process: Option<&mut NativeBrowser>,
     progress: &mut ProgressReporter<'_>,
 ) -> Result<BrowserSession, ApiError> {
-    let (mut socket, _) = connect_async(websocket_url)
-        .await
-        .map_err(|error| ApiError::Other(format!("failed to connect to browser: {error}")))?;
     let origin = reqwest::Url::parse(site_url)
         .map_err(|error| ApiError::InvalidInput(format!("invalid instance URL: {error}")))?;
     let host = origin
@@ -291,7 +428,6 @@ async fn wait_for_session_cookie_with_progress(
         .ok_or_else(|| ApiError::InvalidInput("instance URL has no hostname".into()))?;
     let is_https = origin.scheme() == "https";
     let started = Instant::now();
-    let mut id = 0_u64;
     let mut last_stage = "the authenticated ServiceNow page";
     progress.report(BrowserProgress::WaitingForServiceNowPage);
 
@@ -299,9 +435,7 @@ async fn wait_for_session_cookie_with_progress(
         if let Some(process) = process.as_deref_mut() {
             process.ensure_running()?;
         }
-        id += 1;
-        let targets = cdp_command(&mut socket, id, "Target.getTargets", json!({}), None).await?;
-        let Some(target) = service_now_page_target(&targets, host) else {
+        let Some(page) = probe.find_page(host).await? else {
             if started.elapsed() >= LOGIN_TIMEOUT {
                 return Err(ApiError::Auth(browser_timeout_message(last_stage)));
             }
@@ -311,46 +445,13 @@ async fn wait_for_session_cookie_with_progress(
         progress.report(BrowserProgress::ServiceNowPageDetected);
         last_stage = "ServiceNow session cookies";
         progress.report(BrowserProgress::ReadingSessionCookies);
-        id += 1;
-        let attached = cdp_command(
-            &mut socket,
-            id,
-            "Target.attachToTarget",
-            json!({"targetId": target.target_id, "flatten": true}),
-            None,
-        )
-        .await?;
-        let session_id = attached
-            .pointer("/result/sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::Other("browser did not open the private ServiceNow page session".into())
-            })?
-            .to_string();
-        id += 1;
-        let response = cdp_command(
-            &mut socket,
-            id,
-            "Network.getCookies",
-            json!({"urls": [format!("{site_url}/api/now/")]}),
-            Some(&session_id),
-        )
-        .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                detach_page_session(&mut socket, &mut id, &session_id).await;
-                return Err(error);
-            }
-        };
         let completed_session: Result<Option<BrowserSession>, ApiError> = async {
-            if let Some(cookie) = service_now_cookie_header(&response, host, is_https) {
+            let cookies = probe.cookies(&page, site_url).await?;
+            if let Some(cookie) = service_now_cookie_header(&cookies, host, is_https) {
                 progress.report(BrowserProgress::SessionCookiesDetected);
                 last_stage = "the ServiceNow user token (`g_ck` or `sysparm_ck`)";
                 progress.report(BrowserProgress::ReadingUserToken);
-                if let Some(user_token) =
-                    service_now_user_token(&mut socket, &mut id, &session_id).await?
-                {
+                if let Some(user_token) = probe.user_token(&page).await? {
                     progress.report(BrowserProgress::UserTokenDetected);
                     last_stage = "ServiceNow REST session validation";
                     progress.report(BrowserProgress::ValidatingSession);
@@ -368,7 +469,7 @@ async fn wait_for_session_cookie_with_progress(
             Ok(None)
         }
         .await;
-        detach_page_session(&mut socket, &mut id, &session_id).await;
+        probe.release(page).await;
         if let Some(session) = completed_session? {
             return Ok(session);
         }
@@ -385,41 +486,217 @@ fn browser_timeout_message(stage: &str) -> String {
     )
 }
 
-struct BrowserTarget {
-    target_id: String,
+struct CdpProbe {
+    socket: BrowserSocket,
+    id: u64,
 }
 
-fn service_now_page_target(document: &Value, host: &str) -> Option<BrowserTarget> {
+impl CdpProbe {
+    async fn command(
+        &mut self,
+        method: &str,
+        params: Value,
+        session_id: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        self.id += 1;
+        let mut request = json!({"id": self.id, "method": method, "params": params});
+        if let Some(session_id) = session_id {
+            request["sessionId"] = Value::String(session_id.into());
+        }
+        browser_command(&mut self.socket, self.id, request).await
+    }
+}
+
+impl SessionProbe for CdpProbe {
+    /// The flattened CDP session attached to the ServiceNow page.
+    type Page = String;
+
+    async fn find_page(&mut self, host: &str) -> Result<Option<String>, ApiError> {
+        let targets = self.command("Target.getTargets", json!({}), None).await?;
+        let Some(target_id) = service_now_page_target(&targets, host) else {
+            return Ok(None);
+        };
+        let attached = self
+            .command(
+                "Target.attachToTarget",
+                json!({"targetId": target_id, "flatten": true}),
+                None,
+            )
+            .await?;
+        attached
+            .pointer("/result/sessionId")
+            .and_then(Value::as_str)
+            .map(|session_id| Some(session_id.to_string()))
+            .ok_or_else(|| {
+                ApiError::Other("browser did not open the private ServiceNow page session".into())
+            })
+    }
+
+    async fn cookies(&mut self, page: &String, site_url: &str) -> Result<Value, ApiError> {
+        self.command(
+            "Network.getCookies",
+            json!({"urls": [format!("{site_url}/api/now/")]}),
+            Some(page),
+        )
+        .await
+    }
+
+    async fn user_token(&mut self, page: &String) -> Result<Option<String>, ApiError> {
+        let evaluated = self
+            .command(
+                "Runtime.evaluate",
+                json!({
+                    "expression": USER_TOKEN_EXPRESSION,
+                    "returnByValue": true
+                }),
+                Some(page),
+            )
+            .await?;
+        Ok(evaluated_user_token(&evaluated))
+    }
+
+    async fn release(&mut self, page: String) {
+        let _ = self
+            .command("Target.detachFromTarget", json!({"sessionId": page}), None)
+            .await;
+    }
+}
+
+struct BidiProbe {
+    socket: BrowserSocket,
+    id: u64,
+}
+
+impl BidiProbe {
+    async fn start(socket: BrowserSocket) -> Result<Self, ApiError> {
+        let mut probe = Self { socket, id: 0 };
+        probe
+            .command("session.new", json!({"capabilities": {}}))
+            .await?;
+        Ok(probe)
+    }
+
+    async fn command(&mut self, method: &str, params: Value) -> Result<Value, ApiError> {
+        self.id += 1;
+        let request = json!({"id": self.id, "method": method, "params": params});
+        browser_command(&mut self.socket, self.id, request).await
+    }
+
+    async fn close(mut self) {
+        let _ = self.command("browser.close", json!({})).await;
+    }
+}
+
+impl SessionProbe for BidiProbe {
+    /// The top-level browsing context showing the ServiceNow page.
+    type Page = String;
+
+    async fn find_page(&mut self, host: &str) -> Result<Option<String>, ApiError> {
+        let tree = self.command("browsingContext.getTree", json!({})).await?;
+        Ok(service_now_browsing_context(&tree, host))
+    }
+
+    async fn cookies(&mut self, page: &String, _site_url: &str) -> Result<Value, ApiError> {
+        let response = self
+            .command(
+                "storage.getCookies",
+                json!({"partition": {"type": "context", "context": page}}),
+            )
+            .await?;
+        Ok(bidi_cookie_document(&response))
+    }
+
+    async fn user_token(&mut self, page: &String) -> Result<Option<String>, ApiError> {
+        let evaluated = self
+            .command(
+                "script.evaluate",
+                json!({
+                    "expression": USER_TOKEN_EXPRESSION,
+                    "target": {"context": page},
+                    "awaitPromise": false,
+                    "resultOwnership": "none"
+                }),
+            )
+            .await?;
+        Ok(evaluated_user_token(&evaluated))
+    }
+
+    async fn release(&mut self, _page: String) {}
+}
+
+fn service_now_page_target(document: &Value, host: &str) -> Option<String> {
     document
         .pointer("/result/targetInfos")?
         .as_array()?
         .iter()
         .find_map(|target| {
             let is_page = target.get("type").and_then(Value::as_str) == Some("page");
+            let target_id = target.get("targetId").and_then(Value::as_str)?;
             let url = target.get("url").and_then(Value::as_str)?;
-            let target_host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
-            (is_page && target_host.eq_ignore_ascii_case(host)).then(|| BrowserTarget {
-                target_id: target
-                    .get("targetId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })
+            (is_page && !target_id.is_empty() && url_has_host(url, host))
+                .then(|| target_id.to_string())
         })
-        .filter(|target| !target.target_id.is_empty())
 }
 
-async fn cdp_command(
-    socket: &mut CdpSocket,
+fn service_now_browsing_context(document: &Value, host: &str) -> Option<String> {
+    document
+        .pointer("/result/contexts")?
+        .as_array()?
+        .iter()
+        .find_map(|context| {
+            let id = context.get("context").and_then(Value::as_str)?;
+            let url = context.get("url").and_then(Value::as_str)?;
+            (!id.is_empty() && url_has_host(url, host)).then(|| id.to_string())
+        })
+}
+
+fn url_has_host(url: &str, host: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(|value| value.eq_ignore_ascii_case(host)))
+        .unwrap_or(false)
+}
+
+/// Map a WebDriver BiDi `storage.getCookies` reply onto the CDP cookie shape.
+fn bidi_cookie_document(response: &Value) -> Value {
+    let cookies = response
+        .pointer("/result/cookies")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|cookie| {
+            let value = cookie.get("value")?;
+            if value.get("type").and_then(Value::as_str) != Some("string") {
+                return None;
+            }
+            Some(json!({
+                "name": cookie.get("name")?,
+                "value": value.get("value")?,
+                "domain": cookie.get("domain")?,
+                "path": cookie.get("path").cloned().unwrap_or_else(|| json!("/")),
+                "secure": cookie.get("secure").cloned().unwrap_or(Value::Bool(false)),
+                "expires": cookie.get("expiry").cloned().unwrap_or_else(|| json!(-1)),
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!({"result": {"cookies": cookies}})
+}
+
+/// CDP `Runtime.evaluate` and BiDi `script.evaluate` both place the returned
+/// primitive at `result.result.value`.
+fn evaluated_user_token(evaluated: &Value) -> Option<String> {
+    evaluated
+        .pointer("/result/result/value")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty() && HeaderValue::from_str(token).is_ok())
+        .map(str::to_string)
+}
+
+async fn browser_command(
+    socket: &mut BrowserSocket,
     id: u64,
-    method: &str,
-    params: Value,
-    session_id: Option<&str>,
+    request: Value,
 ) -> Result<Value, ApiError> {
-    let mut request = json!({"id": id, "method": method, "params": params});
-    if let Some(session_id) = session_id {
-        request["sessionId"] = Value::String(session_id.into());
-    }
     socket
         .send(Message::Text(request.to_string().into()))
         .await
@@ -433,9 +710,19 @@ async fn cdp_command(
                     ApiError::Other(format!("browser returned invalid session data: {error}"))
                 })?;
                 if value.get("id").and_then(Value::as_u64) == Some(id) {
-                    if let Some(error) = value.get("error") {
+                    if value.get("error").and_then(Value::as_str) == Some("unknown command") {
                         return Err(ApiError::Other(format!(
-                            "browser rejected the session query: {error}"
+                            "this browser version does not support `{}`, which browser sign-in needs; update the browser or set SERVICENOW_BROWSER to another installed browser",
+                            request["method"].as_str().unwrap_or("a required command")
+                        )));
+                    }
+                    if let Some(error) = value.get("error") {
+                        let detail = match value.get("message").and_then(Value::as_str) {
+                            Some(message) => format!("{error}: {message}"),
+                            None => error.to_string(),
+                        };
+                        return Err(ApiError::Other(format!(
+                            "browser rejected the session query: {detail}"
                         )));
                     }
                     return Ok(value);
@@ -445,54 +732,12 @@ async fn cdp_command(
                 ApiError::Other(format!("browser session channel failed: {error}"))
             })?,
             Message::Close(_) => {
-                return Err(ApiError::Other(
-                    "browser closed its private sign-in channel".into(),
-                ));
+                return Err(ApiError::Other("browser closed its sign-in channel".into()));
             }
             _ => {}
         }
     }
-    Err(ApiError::Other(
-        "browser closed its private sign-in channel".into(),
-    ))
-}
-
-async fn service_now_user_token(
-    socket: &mut CdpSocket,
-    id: &mut u64,
-    session_id: &str,
-) -> Result<Option<String>, ApiError> {
-    *id += 1;
-    let evaluated = cdp_command(
-        socket,
-        *id,
-        "Runtime.evaluate",
-        json!({
-            "expression": USER_TOKEN_EXPRESSION,
-            "returnByValue": true
-        }),
-        Some(session_id),
-    )
-    .await;
-    let evaluated = evaluated?;
-    let token = evaluated
-        .pointer("/result/result/value")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty() && HeaderValue::from_str(token).is_ok())
-        .map(str::to_string);
-    Ok(token)
-}
-
-async fn detach_page_session(socket: &mut CdpSocket, id: &mut u64, session_id: &str) {
-    *id += 1;
-    let _ = cdp_command(
-        socket,
-        *id,
-        "Target.detachFromTarget",
-        json!({"sessionId": session_id}),
-        None,
-    )
-    .await;
+    Err(ApiError::Other("browser closed its sign-in channel".into()))
 }
 
 fn service_now_cookie_header(document: &Value, host: &str, is_https: bool) -> Option<String> {
@@ -609,6 +854,7 @@ enum BrowserAlias {
     Chrome,
     Edge,
     Chromium,
+    Firefox,
     WindowsChrome,
     WindowsEdge,
     WindowsChromium,
@@ -621,6 +867,7 @@ impl BrowserAlias {
             "chrome" => Some(Self::Chrome),
             "edge" => Some(Self::Edge),
             "chromium" => Some(Self::Chromium),
+            "firefox" => Some(Self::Firefox),
             "windows-chrome" => Some(Self::WindowsChrome),
             "windows-edge" => Some(Self::WindowsEdge),
             "windows-chromium" => Some(Self::WindowsChromium),
@@ -630,7 +877,7 @@ impl BrowserAlias {
 
     fn native_variant(self) -> Option<Self> {
         match self {
-            Self::Auto | Self::Chrome | Self::Edge | Self::Chromium => Some(self),
+            Self::Auto | Self::Chrome | Self::Edge | Self::Chromium | Self::Firefox => Some(self),
             Self::WindowsChrome | Self::WindowsEdge | Self::WindowsChromium => None,
         }
     }
@@ -673,7 +920,7 @@ fn select_wsl_browser_backend_with(
                 || preference
                     .as_deref()
                     .and_then(BrowserAlias::parse)
-                    .is_some() =>
+                    .is_some_and(|alias| alias != BrowserAlias::Firefox) =>
         {
             Ok(BrowserBackend::WindowsBridge(preference))
         }
@@ -692,7 +939,7 @@ fn find_native_browser(preference: Option<&OsStr>) -> Result<PathBuf, ApiError> 
             };
             return find_native_browser_alias(alias).ok_or_else(|| {
                 ApiError::InvalidInput(format!(
-                    "SERVICENOW_BROWSER={} was requested, but no matching browser is installed; use chrome, edge, chromium, windows-chrome, windows-edge, or an executable path",
+                    "SERVICENOW_BROWSER={} was requested, but no matching browser is installed; use chrome, edge, chromium, firefox, windows-chrome, windows-edge, or an executable path",
                     preference.to_string_lossy()
                 ))
             });
@@ -705,12 +952,106 @@ fn find_native_browser(preference: Option<&OsStr>) -> Result<PathBuf, ApiError> 
         });
     }
 
-    find_native_browser_alias(BrowserAlias::Auto).ok_or_else(|| {
-        ApiError::InvalidInput(
-            "browser sign-in needs Chrome, Edge, or Chromium; install one or set SERVICENOW_BROWSER to chrome, edge, chromium, or an executable path"
-                .into(),
-        )
-    })
+    default_browser_alias()
+        .and_then(find_native_browser_alias)
+        .or_else(|| find_native_browser_alias(BrowserAlias::Auto))
+        .ok_or_else(|| {
+            ApiError::InvalidInput(
+                "browser sign-in needs Chrome, Edge, Chromium, or Firefox; install one or set SERVICENOW_BROWSER to chrome, edge, chromium, firefox, or an executable path"
+                    .into(),
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn default_browser_alias() -> Option<BrowserAlias> {
+    command_output("xdg-settings", &["get", "default-web-browser"])
+        .and_then(|desktop_id| default_browser_from_desktop_id(&desktop_id))
+}
+
+#[cfg(target_os = "macos")]
+fn default_browser_alias() -> Option<BrowserAlias> {
+    command_output(
+        "defaults",
+        &[
+            "read",
+            "com.apple.LaunchServices/com.apple.launchservices.secure",
+            "LSHandlers",
+        ],
+    )
+    .and_then(|handlers| default_browser_from_launch_services(&handlers))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn default_browser_alias() -> Option<BrowserAlias> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Map an XDG desktop entry such as `firefox_firefox.desktop` to a browser.
+#[cfg(any(target_os = "linux", test))]
+fn default_browser_from_desktop_id(desktop_id: &str) -> Option<BrowserAlias> {
+    let desktop_id = desktop_id.trim().to_ascii_lowercase();
+    if desktop_id.contains("firefox") {
+        Some(BrowserAlias::Firefox)
+    } else if desktop_id.contains("microsoft-edge") || desktop_id.contains("msedge") {
+        Some(BrowserAlias::Edge)
+    } else if desktop_id.contains("chromium") {
+        Some(BrowserAlias::Chromium)
+    } else if desktop_id.contains("google-chrome") {
+        Some(BrowserAlias::Chrome)
+    } else {
+        None
+    }
+}
+
+/// Find the `https` handler in the LaunchServices `LSHandlers` plist dump.
+#[cfg(any(target_os = "macos", test))]
+fn default_browser_from_launch_services(handlers: &str) -> Option<BrowserAlias> {
+    let mut depth = 0_usize;
+    let mut handles_https = false;
+    let mut bundle_id = None;
+    for line in handlers.lines().map(str::trim) {
+        if depth == 2
+            && let Some((key, value)) = line.strip_suffix(';').and_then(|line| line.split_once('='))
+        {
+            let value = value.trim().trim_matches('"');
+            match key.trim() {
+                "LSHandlerURLScheme" => handles_https = value.eq_ignore_ascii_case("https"),
+                "LSHandlerRoleAll" => bundle_id = Some(value.to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+        let closes = line.matches(['}', ')']).count();
+        depth = (depth + line.matches(['{', '(']).count()).saturating_sub(closes);
+        if depth == 1 && closes > 0 {
+            if handles_https {
+                return match bundle_id.as_deref()? {
+                    "com.google.chrome" => Some(BrowserAlias::Chrome),
+                    "com.microsoft.edgemac" => Some(BrowserAlias::Edge),
+                    "org.chromium.chromium" => Some(BrowserAlias::Chromium),
+                    "org.mozilla.firefox" => Some(BrowserAlias::Firefox),
+                    _ => None,
+                };
+            }
+            handles_https = false;
+            bundle_id = None;
+        }
+    }
+    None
 }
 
 fn find_native_browser_alias(alias: BrowserAlias) -> Option<PathBuf> {
@@ -727,6 +1068,10 @@ fn find_native_browser_alias(alias: BrowserAlias) -> Option<PathBuf> {
         (
             BrowserAlias::Chromium,
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ),
+        (
+            BrowserAlias::Firefox,
+            "/Applications/Firefox.app/Contents/MacOS/firefox",
         ),
     ];
     #[cfg(not(target_os = "macos"))]
@@ -747,10 +1092,13 @@ fn find_native_browser_alias(alias: BrowserAlias) -> Option<PathBuf> {
             "microsoft-edge-stable",
             "chromium",
             "chromium-browser",
+            "firefox",
+            "firefox-esr",
         ],
         BrowserAlias::Chrome => &["google-chrome", "google-chrome-stable", "chrome"],
         BrowserAlias::Edge => &["microsoft-edge", "microsoft-edge-stable", "msedge"],
         BrowserAlias::Chromium => &["chromium", "chromium-browser"],
+        BrowserAlias::Firefox => &["firefox", "firefox-esr"],
         BrowserAlias::WindowsChrome | BrowserAlias::WindowsEdge | BrowserAlias::WindowsChromium => {
             return None;
         }
@@ -1097,12 +1445,41 @@ $apiUrl = "$origin/api/now/table/sys_user?sysparm_query=sys_id%3Djavascript%3Ags
 $userTokenExpression = ConvertFrom-HexUtf8 '__USER_TOKEN_EXPRESSION_HEX__'
 $browserPreference = ConvertFrom-HexUtf8 '__BROWSER_HEX__'
 if (-not $browserPreference) { $browserPreference = $env:SERVICENOW_BROWSER }
+function Test-RemoteDebuggingBlocked {
+    param([string]$Kind)
+    $policySubkey = if ($Kind -eq 'edge') {
+        'SOFTWARE\Policies\Microsoft\Edge'
+    } elseif ($Kind -eq 'chromium') {
+        'SOFTWARE\Policies\Chromium'
+    } else {
+        'SOFTWARE\Policies\Google\Chrome'
+    }
+    foreach ($registryRoot in @('HKLM:', 'HKCU:')) {
+        $policy = Get-ItemProperty -LiteralPath ($registryRoot + '\' + $policySubkey) -Name 'RemoteDebuggingAllowed' -ErrorAction SilentlyContinue
+        if ($policy -and $policy.PSObject.Properties['RemoteDebuggingAllowed'] -and [int]$policy.RemoteDebuggingAllowed -eq 0) {
+            return $true
+        }
+    }
+    return $false
+}
+function Get-DefaultBrowserKind {
+    $choice = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice' -Name 'ProgId' -ErrorAction SilentlyContinue
+    if (-not $choice) { return $null }
+    $progId = [string]$choice.ProgId
+    if ($progId -match '^MSEdgeHTM') { return 'edge' }
+    if ($progId -match '^ChromeHTML') { return 'chrome' }
+    if ($progId -match '^Chromium') { return 'chromium' }
+    return $null
+}
 $browser = $null
 $browserKind = $null
 $browserName = $null
+$remoteDebuggingBlocked = $false
 if ($browserPreference -and (Test-Path -LiteralPath $browserPreference)) {
     $browser = $browserPreference
-    if ($browser -match '(?i)edge') {
+    if ($browser -match '(?i)firefox') {
+        throw 'Firefox browser sign-in uses WebDriver BiDi and is only supported for Firefox installed on Linux, macOS, or inside WSL. Set SERVICENOW_BROWSER to edge or chrome.'
+    } elseif ($browser -match '(?i)edge') {
         $browserKind = 'edge'
         $browserName = 'Microsoft Edge'
     } elseif ($browser -match '(?i)chromium') {
@@ -1112,6 +1489,7 @@ if ($browserPreference -and (Test-Path -LiteralPath $browserPreference)) {
         $browserKind = 'chrome'
         $browserName = 'Google Chrome'
     }
+    $remoteDebuggingBlocked = Test-RemoteDebuggingBlocked $browserKind
 }
 if (-not $browser) {
     $requestedBrowser = if ($browserPreference) { $browserPreference.Trim().ToLowerInvariant() } else { 'auto' }
@@ -1120,7 +1498,14 @@ if (-not $browser) {
         '^(edge|msedge|microsoft-edge|windows-edge)$' { $candidateKinds = @('edge'); break }
         '^(chrome|google-chrome|windows-chrome)$' { $candidateKinds = @('chrome'); break }
         '^(chromium|windows-chromium)$' { $candidateKinds = @('chromium'); break }
+        '^firefox$' { throw 'Firefox browser sign-in uses WebDriver BiDi and is only supported for Firefox installed on Linux, macOS, or inside WSL. Set SERVICENOW_BROWSER to edge or chrome.' }
         default { throw "SERVICENOW_BROWSER '$browserPreference' is not a Windows browser path or friendly name. Use chrome, edge, chromium, windows-chrome, or windows-edge." }
+    }
+    if ($candidateKinds.Count -gt 1) {
+        $defaultKind = Get-DefaultBrowserKind
+        if ($defaultKind) {
+            $candidateKinds = @($defaultKind) + @($candidateKinds | Where-Object { $_ -ne $defaultKind })
+        }
     }
     $candidates = foreach ($kind in $candidateKinds) {
         if ($kind -eq 'edge') {
@@ -1137,33 +1522,24 @@ if (-not $browser) {
             [PSCustomObject]@{ Path = "$env:LOCALAPPDATA\Chromium\Application\chrome.exe"; Kind = 'chromium'; Name = 'Chromium' }
         }
     }
-    $selection = $candidates | Where-Object { $_.Path -and (Test-Path -LiteralPath $_.Path) } | Select-Object -First 1
-    if ($selection) {
-        $browser = $selection.Path
-        $browserKind = $selection.Kind
-        $browserName = $selection.Name
-    }
-}
-if (-not $browser) { throw 'Chrome, Edge, or Chromium was not found on Windows. Set SERVICENOW_BROWSER to chrome, edge, chromium, or a Windows executable path.' }
-
-$policySubkey = if ($browserKind -eq 'edge') {
-    'SOFTWARE\Policies\Microsoft\Edge'
-} elseif ($browserKind -eq 'chromium') {
-    'SOFTWARE\Policies\Chromium'
-} else {
-    'SOFTWARE\Policies\Google\Chrome'
-}
-$remoteDebuggingBlocked = $false
-foreach ($registryRoot in @('HKLM:', 'HKCU:')) {
-    $policy = Get-ItemProperty -LiteralPath ($registryRoot + '\' + $policySubkey) -Name 'RemoteDebuggingAllowed' -ErrorAction SilentlyContinue
-    if ($policy -and $policy.PSObject.Properties['RemoteDebuggingAllowed'] -and [int]$policy.RemoteDebuggingAllowed -eq 0) {
-        $remoteDebuggingBlocked = $true
+    # Auto mode moves past browsers whose remote debugging is disabled by policy.
+    foreach ($candidate in @($candidates | Where-Object { $_.Path -and (Test-Path -LiteralPath $_.Path) })) {
+        if (Test-RemoteDebuggingBlocked $candidate.Kind) {
+            if (-not $remoteDebuggingBlocked) { $browserName = $candidate.Name }
+            $remoteDebuggingBlocked = $true
+            continue
+        }
+        $browser = $candidate.Path
+        $browserKind = $candidate.Kind
+        $browserName = $candidate.Name
+        $remoteDebuggingBlocked = $false
         break
     }
 }
 if ($remoteDebuggingBlocked) {
-    throw "$browserName browser sign-in is blocked by the managed RemoteDebuggingAllowed policy. Install Chrome, Edge, or Chromium inside WSL, or set SERVICENOW_BROWSER to another installed browser."
+    throw "$browserName browser sign-in is blocked by the managed RemoteDebuggingAllowed policy. Install Chrome, Edge, Chromium, or Firefox inside WSL, or set SERVICENOW_BROWSER to another installed browser."
 }
+if (-not $browser) { throw 'Chrome, Edge, or Chromium was not found on Windows. Set SERVICENOW_BROWSER to chrome, edge, chromium, or a Windows executable path.' }
 
 $profile = Join-Path $env:TEMP ("servicenow-cli-browser-" + [Guid]::NewGuid().ToString('N'))
 $process = $null
@@ -1439,7 +1815,16 @@ mod tests {
             BrowserAlias::parse(OsStr::new("windows-edge")),
             Some(BrowserAlias::WindowsEdge)
         );
-        assert_eq!(BrowserAlias::parse(OsStr::new("firefox")), None);
+        assert_eq!(
+            BrowserAlias::parse(OsStr::new("Firefox")),
+            Some(BrowserAlias::Firefox)
+        );
+        assert_eq!(BrowserAlias::parse(OsStr::new("safari")), None);
+        assert!(is_firefox(Path::new("/usr/bin/firefox")));
+        assert!(is_firefox(Path::new(
+            "/Applications/Firefox.app/Contents/MacOS/firefox"
+        )));
+        assert!(!is_firefox(Path::new("/usr/bin/google-chrome")));
         assert!(looks_like_windows_browser_preference(OsStr::new(
             "windows-chrome"
         )));
@@ -1478,6 +1863,117 @@ mod tests {
             forced_windows,
             BrowserBackend::WindowsBridge(Some(value)) if value == OsStr::new("windows-edge")
         ));
+    }
+
+    #[test]
+    fn wsl_never_hands_a_firefox_request_to_the_windows_bridge() {
+        let result = select_wsl_browser_backend_with(Some(OsString::from("firefox")), |_| {
+            Err(ApiError::InvalidInput("firefox is not installed".into()))
+        });
+        assert!(
+            matches!(result, Err(ApiError::InvalidInput(message)) if message == "firefox is not installed")
+        );
+    }
+
+    #[test]
+    fn default_browser_is_read_from_xdg_desktop_ids() {
+        for (desktop_id, expected) in [
+            ("firefox.desktop\n", Some(BrowserAlias::Firefox)),
+            ("firefox_firefox.desktop", Some(BrowserAlias::Firefox)),
+            ("google-chrome.desktop", Some(BrowserAlias::Chrome)),
+            ("microsoft-edge.desktop", Some(BrowserAlias::Edge)),
+            ("chromium_chromium.desktop", Some(BrowserAlias::Chromium)),
+            ("chromium-browser.desktop", Some(BrowserAlias::Chromium)),
+            ("wslview.desktop", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                default_browser_from_desktop_id(desktop_id),
+                expected,
+                "{desktop_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_browser_is_read_from_the_launch_services_https_handler() {
+        let handlers = r#"(
+        {
+        LSHandlerContentType = "public.html";
+        LSHandlerRoleAll = "com.apple.safari";
+    },
+        {
+        LSHandlerPreferredVersions =         {
+            LSHandlerRoleAll = "-";
+        };
+        LSHandlerRoleAll = "org.mozilla.firefox";
+        LSHandlerURLScheme = https;
+    },
+        {
+        LSHandlerRoleAll = "com.google.chrome";
+        LSHandlerURLScheme = http;
+    }
+)"#;
+        assert_eq!(
+            default_browser_from_launch_services(handlers),
+            Some(BrowserAlias::Firefox)
+        );
+        assert_eq!(
+            default_browser_from_launch_services(
+                &handlers.replace("org.mozilla.firefox", "com.microsoft.edgemac")
+            ),
+            Some(BrowserAlias::Edge)
+        );
+        assert_eq!(
+            default_browser_from_launch_services(
+                &handlers.replace("org.mozilla.firefox", "com.apple.safari")
+            ),
+            None
+        );
+        assert_eq!(default_browser_from_launch_services(""), None);
+    }
+
+    #[test]
+    fn powershell_bridge_prefers_the_default_browser_and_skips_blocked_ones() {
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("UrlAssociations\\https\\UserChoice"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("'^MSEdgeHTM'"));
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("'^ChromeHTML'"));
+        let skip = WINDOWS_BROWSER_BRIDGE
+            .find("if (Test-RemoteDebuggingBlocked $candidate.Kind)")
+            .unwrap();
+        let next = WINDOWS_BROWSER_BRIDGE[skip..].find("continue").unwrap();
+        assert!(next < WINDOWS_BROWSER_BRIDGE[skip..].find("break").unwrap());
+        assert!(WINDOWS_BROWSER_BRIDGE.contains("'^firefox$'"));
+    }
+
+    #[test]
+    fn bidi_cookies_are_mapped_to_the_cdp_cookie_shape() {
+        let response = json!({"type": "success", "id": 3, "result": {"cookies": [
+            {"name": "JSESSIONID", "value": {"type": "string", "value": "bidi-session"}, "domain": "company.service-now.com", "path": "/", "secure": true, "httpOnly": true, "size": 20},
+            {"name": "expired", "value": {"type": "string", "value": "old"}, "domain": "company.service-now.com", "path": "/", "secure": true, "expiry": 1},
+            {"name": "binary", "value": {"type": "base64", "value": "AAE="}, "domain": "company.service-now.com", "path": "/", "secure": true},
+            {"name": "idp", "value": {"type": "string", "value": "must-not-leak"}, "domain": "login.microsoftonline.com", "path": "/", "secure": true}
+        ]}});
+        let document = bidi_cookie_document(&response);
+        assert_eq!(
+            document.pointer("/result/cookies/0/expires"),
+            Some(&json!(-1))
+        );
+        assert_eq!(
+            service_now_cookie_header(&document, "company.service-now.com", true).as_deref(),
+            Some("JSESSIONID=bidi-session")
+        );
+        assert_eq!(
+            service_now_browsing_context(
+                &json!({"result": {"contexts": [
+                    {"context": "blank", "url": "about:blank", "children": []},
+                    {"context": "sn", "url": "https://Company.service-now.com/now/nav/ui", "children": []}
+                ]}}),
+                "company.service-now.com"
+            )
+            .as_deref(),
+            Some("sn")
+        );
     }
 
     #[test]
@@ -1737,7 +2233,7 @@ mod tests {
             callback: &mut callback,
             reported: HashSet::new(),
         };
-        let session = wait_for_session_cookie_with_progress(
+        let session = wait_for_cdp_session(
             &format!("ws://{address}"),
             &instance.uri(),
             None,
@@ -1765,7 +2261,143 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "opens an installed Chromium browser"]
+    async fn bidi_session_is_validated_and_the_browser_is_closed() {
+        let instance = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .and(header("cookie", "JSESSIONID=bidi-session"))
+            .and(header("x-usertoken", "bidi-user-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": [{"sys_id": "0123456789abcdef0123456789abcdef"}]
+            })))
+            .expect(1)
+            .mount(&instance)
+            .await;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let instance_port = instance.address().port();
+        let bidi = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let mut methods = Vec::new();
+            while let Some(request) = socket.next().await {
+                let request = request.unwrap();
+                let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                let method = request["method"].as_str().unwrap().to_string();
+                let result = match method.as_str() {
+                    "session.new" => json!({"sessionId": "bidi", "capabilities": {}}),
+                    "browsingContext.getTree" => json!({"contexts": [{
+                        "context": "service-now-context",
+                        "url": format!("http://127.0.0.1:{instance_port}/now/nav/ui"),
+                        "children": []
+                    }]}),
+                    "storage.getCookies" => {
+                        assert_eq!(
+                            request["params"]["partition"],
+                            json!({"type": "context", "context": "service-now-context"})
+                        );
+                        json!({"cookies": [{
+                            "name": "JSESSIONID",
+                            "value": {"type": "string", "value": "bidi-session"},
+                            "domain": "127.0.0.1",
+                            "path": "/",
+                            "secure": false
+                        }], "partitionKey": {}})
+                    }
+                    "script.evaluate" => {
+                        assert_eq!(request["params"]["expression"], USER_TOKEN_EXPRESSION);
+                        assert_eq!(
+                            request["params"]["target"]["context"],
+                            "service-now-context"
+                        );
+                        json!({"type": "success", "realm": "page", "result": {
+                            "type": "string",
+                            "value": "bidi-user-token"
+                        }})
+                    }
+                    "browser.close" => json!({}),
+                    method => panic!("unexpected BiDi method: {method}"),
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"type": "success", "id": request["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                methods.push(method);
+                if methods.last().map(String::as_str) == Some("browser.close") {
+                    break;
+                }
+            }
+            methods
+        });
+
+        let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let mut probe = BidiProbe::start(socket).await.unwrap();
+        let mut callback = |_| {};
+        let mut progress = ProgressReporter {
+            callback: &mut callback,
+            reported: HashSet::new(),
+        };
+        let session = wait_for_browser_session(&mut probe, &instance.uri(), None, &mut progress)
+            .await
+            .unwrap();
+        probe.close().await;
+        assert_eq!(session.cookie, "JSESSIONID=bidi-session");
+        assert_eq!(session.user_token, "bidi-user-token");
+        assert_eq!(
+            bidi.await.unwrap(),
+            [
+                "session.new",
+                "browsingContext.getTree",
+                "storage.getCookies",
+                "script.evaluate",
+                "browser.close"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn outdated_bidi_browsers_get_an_actionable_error() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let request = socket.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+            let reply = json!({
+                "type": "error",
+                "id": request["id"],
+                "error": "unknown command",
+                "message": "session.new"
+            });
+            socket
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .unwrap();
+        });
+
+        let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let Err(ApiError::Other(message)) = BidiProbe::start(socket).await else {
+            panic!("an unknown command must be rejected");
+        };
+        assert!(
+            message.contains("does not support `session.new`"),
+            "{message}"
+        );
+        assert!(message.contains("update the browser"), "{message}");
+    }
+
+    #[tokio::test]
+    #[ignore = "opens an installed browser"]
     async fn installed_browser_completes_a_local_session_handoff() {
         if find_native_browser(std::env::var_os("SERVICENOW_BROWSER").as_deref()).is_err() {
             return;

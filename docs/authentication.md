@@ -44,9 +44,15 @@ instances when no OAuth application is available:
 servicenow init --profile work --instance company --method browser
 ```
 
-The CLI launches Edge InPrivate or Chrome/Chromium Incognito with a new
-temporary profile and a localhost-only debugging channel. Complete the normal
-SSO and MFA flow in that window. A managed Windows device can still authenticate
+The CLI launches your default browser when it is supported, otherwise the first
+installed Chrome, Edge, Chromium, or Firefox. Edge opens InPrivate and
+Chrome/Chromium open Incognito, each with a new temporary profile and a
+localhost-only debugging channel. Firefox opens a normal window in a new
+throwaway profile, because Firefox hides private-window cookies from its
+[WebDriver BiDi](https://w3c.github.io/webdriver-bidi/) automation channel; the
+profile is deleted when sign-in finishes. Firefox is supported on Linux, macOS,
+and inside WSL, but not through the Windows bridge. Complete the normal SSO and
+MFA flow in that window. A managed Windows device can still authenticate
 silently through Entra device SSO, even in a private window, so setup displays
 the resolved ServiceNow name and username for confirmation before storing
 anything. The CLI retains only cookies valid for the requested ServiceNow
@@ -84,8 +90,8 @@ must remain available without an interactive browser session.
 
 ## WSL2 and headless Linux
 
-On WSL2, browser sign-in prefers Chrome, Edge, or Chromium installed inside the
-Linux distribution. With WSLg this avoids Windows interop entirely. If no Linux
+On WSL2, browser sign-in prefers Chrome, Edge, Chromium, or Firefox installed
+inside the Linux distribution. With WSLg this avoids Windows interop entirely. If no Linux
 browser is installed, the CLI falls back to Windows Edge or Chrome through
 PowerShell and performs the cookie handoff entirely on the Windows loopback
 interface. The fallback works with both NAT and mirrored WSL networking and does
@@ -98,6 +104,8 @@ not open a debugging port to the LAN.
 SERVICENOW_BROWSER=chrome servicenow auth login --profile work --method browser
 SERVICENOW_BROWSER=edge servicenow auth login --profile work --method browser
 SERVICENOW_BROWSER=chromium servicenow auth login --profile work --method browser
+# Linux, macOS, or WSL only; never falls back to Windows.
+SERVICENOW_BROWSER=firefox servicenow auth login --profile work --method browser
 
 # Explicitly use the Windows bridge.
 SERVICENOW_BROWSER=windows-edge servicenow auth login --profile work --method browser
@@ -107,8 +115,11 @@ SERVICENOW_BROWSER=windows-chrome servicenow auth login --profile work --method 
 For the Windows fallback, the CLI checks the managed
 [`RemoteDebuggingAllowed` Edge policy](https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies/remotedebuggingallowed)
 or [Chrome policy](https://chromeenterprise.google/policies/remote-debugging-allowed/)
-before opening the browser. A disabled policy produces an immediate actionable
-error instead of waiting for the browser channel to time out.
+before opening the browser. Without an explicit choice, the bridge prefers the
+Windows default browser and skips any browser whose policy disables remote
+debugging. When every installed browser is blocked, or an explicitly requested
+one is, the CLI reports an immediate actionable error instead of waiting for the
+browser channel to time out.
 
 To see where an in-progress handoff is waiting, enable safe verbose diagnostics:
 
