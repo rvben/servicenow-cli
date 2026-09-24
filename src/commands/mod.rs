@@ -95,7 +95,7 @@ pub fn print_records_or(
     empty_message: &str,
 ) {
     if records.is_empty() {
-        println!("{empty_message}");
+        crate::outln!("{empty_message}");
         return;
     }
     let fields = requested_fields
@@ -116,7 +116,7 @@ pub fn print_records_or(
 
 pub fn print_record(record: &Value, color: bool) {
     let Some(object) = record.as_object() else {
-        println!("{}", display_value(record));
+        crate::outln!("{}", display_value(record));
         return;
     };
     let rows: Vec<Vec<String>> = object
@@ -207,7 +207,7 @@ fn print_table(headers: &[String], rows: &[Vec<String>], color: bool) {
         });
         table.add_row(cells);
     }
-    println!("{table}");
+    crate::outln!("{table}");
 }
 
 fn header_label(field: &str) -> String {

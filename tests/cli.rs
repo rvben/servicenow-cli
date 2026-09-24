@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
@@ -30,6 +31,48 @@ fn command(config_home: &TempDir) -> Command {
         .env_remove("SERVICENOW_READ_ONLY")
         .env_remove("SERVICENOW_VERBOSE");
     command
+}
+
+/// Runs `args`, closing our end of its stdout pipe before it can write anything, then
+/// returns its stderr and exit status. Reproduces "the reader went away" the same way
+/// `head -c N` does: because the read end is fully closed before the child's first write,
+/// even a small amount of output is enough to trigger a broken pipe.
+fn run_with_stdout_closed_early(
+    config_home: &TempDir,
+    args: &[&str],
+) -> (String, std::process::ExitStatus) {
+    let mut child = command(config_home)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take().unwrap());
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = child.wait().unwrap();
+    (stderr, status)
+}
+
+#[test]
+fn schema_output_survives_a_closed_stdout_pipe() {
+    let config_home = TempDir::new().unwrap();
+    let (stderr, status) = run_with_stdout_closed_early(&config_home, &["schema"]);
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert_eq!(status.code(), Some(0));
+}
+
+#[test]
+fn completions_output_survives_a_closed_stdout_pipe() {
+    let config_home = TempDir::new().unwrap();
+    let (stderr, status) = run_with_stdout_closed_early(&config_home, &["completions", "zsh"]);
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+    assert_eq!(status.code(), Some(0));
 }
 
 #[test]

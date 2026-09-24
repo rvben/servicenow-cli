@@ -1,9 +1,58 @@
 use std::collections::BTreeSet;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 
 use serde_json::Value;
 
 use crate::api::ApiError;
+
+/// Standard output for everything this CLI prints.
+///
+/// When the reader goes away (`servicenow schema | head -c 20`), the process ends quietly
+/// with exit code 0, the way `head` expects a producer to stop. Any other write failure is
+/// reported on stderr and exits with code 1. Neither returns to the caller, so a writer
+/// handed this type (the `csv` writer, `clap_complete`, an attachment download) never sees
+/// an error and never panics on one.
+pub struct Stdout;
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::stdout()
+            .write(buf)
+            .or_else(|error| stdout_failed(error))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout()
+            .flush()
+            .or_else(|error| stdout_failed(error))
+    }
+}
+
+fn stdout_failed(error: std::io::Error) -> ! {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("servicenow: failed to write to stdout: {error}");
+    std::process::exit(exit_codes::GENERAL);
+}
+
+/// `print!` through [`Stdout`].
+#[macro_export]
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::write!($crate::output::Stdout, $($arg)*);
+    }};
+}
+
+/// `println!` through [`Stdout`].
+#[macro_export]
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!($crate::output::Stdout, $($arg)*);
+    }};
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputFormat {
@@ -55,12 +104,12 @@ impl OutputConfig {
 
     pub fn value(&self, value: &Value) {
         match self.format {
-            OutputFormat::Text | OutputFormat::Json => println!(
+            OutputFormat::Text | OutputFormat::Json => crate::outln!(
                 "{}",
                 serde_json::to_string_pretty(value).expect("JSON serialization cannot fail")
             ),
             OutputFormat::JsonLines => print_json_lines(value),
-            OutputFormat::Yaml => print!(
+            OutputFormat::Yaml => crate::out!(
                 "{}",
                 serde_saphyr::to_string(value).expect("YAML serialization cannot fail")
             ),
@@ -97,13 +146,13 @@ impl OutputConfig {
 fn print_json_lines(value: &Value) {
     if let Some(records) = value.get("result").and_then(Value::as_array) {
         for record in records {
-            println!(
+            crate::outln!(
                 "{}",
                 serde_json::to_string(record).expect("JSON serialization cannot fail")
             );
         }
     } else {
-        println!(
+        crate::outln!(
             "{}",
             serde_json::to_string(value).expect("JSON serialization cannot fail")
         );
@@ -128,19 +177,21 @@ fn print_csv(value: &Value) {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let mut writer = csv::Writer::from_writer(std::io::stdout());
+    let mut writer = csv::Writer::from_writer(Stdout);
     writer
         .write_record(&headers)
-        .expect("stdout should accept CSV header");
+        .expect("Stdout handles write failures itself");
     for record in records {
         let row = headers
             .iter()
             .map(|header| record.get(header).map(csv_cell).unwrap_or_default());
         writer
             .write_record(row)
-            .expect("stdout should accept CSV row");
+            .expect("Stdout handles write failures itself");
     }
-    writer.flush().expect("stdout should flush");
+    writer
+        .flush()
+        .expect("Stdout handles write failures itself");
 }
 
 fn csv_cell(value: &Value) -> String {

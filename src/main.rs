@@ -17,8 +17,9 @@ use servicenow_cli::config::{
 use servicenow_cli::credentials::{self, StoredCredential};
 use servicenow_cli::incident;
 use servicenow_cli::metadata::{self, ReferenceKind};
-use servicenow_cli::output::{OutputConfig, OutputFormat, exit_code, print_error};
+use servicenow_cli::output::{self, OutputConfig, OutputFormat, exit_code, print_error};
 use servicenow_cli::record;
+use servicenow_cli::{out, outln};
 
 #[derive(Parser)]
 #[command(
@@ -770,7 +771,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             )
             .await?;
             if authenticated && !output.json {
-                println!("\nNext\n  servicenow doctor\n  servicenow incidents mine");
+                outln!("\nNext\n  servicenow doctor\n  servicenow incidents mine");
             }
             return Ok(());
         }
@@ -820,9 +821,9 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             if output.json {
                 output.value(&value);
             } else if removed {
-                println!("Logged out of profile {profile}.");
+                outln!("Logged out of profile {profile}.");
             } else {
-                println!("Profile {profile} had no stored credential.");
+                outln!("Profile {profile} had no stored credential.");
             }
             return Ok(());
         }
@@ -850,7 +851,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             if output.json {
                 output.value(&serde_json::json!({"activeProfile": name}));
             } else {
-                println!("Now using profile {name}.");
+                outln!("Now using profile {name}.");
             }
             return Ok(());
         }
@@ -877,7 +878,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             if output.json {
                 output.value(&serde_json::json!({"removed": true, "profile": name}));
             } else {
-                println!("Removed profile {name}.");
+                outln!("Removed profile {name}.");
             }
             return Ok(());
         }
@@ -898,7 +899,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         }
         Command::Completions { shell } => {
             let mut command = Cli::command();
-            clap_complete::generate(shell, &mut command, "servicenow", &mut std::io::stdout());
+            clap_complete::generate(shell, &mut command, "servicenow", &mut output::Stdout);
             return Ok(());
         }
         Command::Tui {
@@ -928,16 +929,16 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
                 output.value(&init_document());
             } else {
                 let document = init_document();
-                println!(
+                outln!(
                     "Config path: {}",
                     document["configPath"].as_str().unwrap_or("")
                 );
-                println!(
+                outln!(
                     "\n{}",
                     toml::to_string_pretty(&document["example"])
                         .unwrap_or_else(|_| "[default]\ninstance = \"dev12345\"".into())
                 );
-                println!("Next: {}", document["initCommand"].as_str().unwrap_or(""));
+                outln!("Next: {}", document["initCommand"].as_str().unwrap_or(""));
             }
             return Ok(());
         }
@@ -945,7 +946,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             if output.json {
                 output.value(&serde_json::json!({ "configPath": config_path() }));
             } else {
-                println!("{}", config_path().display());
+                outln!("{}", config_path().display());
             }
             return Ok(());
         }
@@ -1244,7 +1245,7 @@ async fn run_table_schema(
     if output.json {
         output.value(&serde_json::json!({"result": metadata}));
     } else {
-        println!(
+        outln!(
             "{}  {} fields  {} choice fields\n",
             output.heading(&metadata.table),
             metadata.fields.len(),
@@ -1291,7 +1292,7 @@ async fn run_choices(
             "result": choices,
         }));
     } else if choices.is_empty() {
-        println!("No configured choices for {table}.{field}.");
+        outln!("No configured choices for {table}.{field}.");
     } else {
         let records = choices
             .into_iter()
@@ -1394,7 +1395,7 @@ async fn run_auth_login(
                         }));
                     } else {
                         output.success("Setup saved—no credential was stored");
-                        println!(
+                        outln!(
                             "\nWhen your administrator sends the client ID, continue with:\n  {resume_command} --client-id YOUR_CLIENT_ID"
                         );
                     }
@@ -1592,24 +1593,24 @@ async fn run_auth_login(
         output.value(&result);
     } else {
         output.success("Connected to ServiceNow");
-        println!("\n{}", output.heading("Connection"));
-        println!(
+        outln!("\n{}", output.heading("Connection"));
+        outln!(
             "  Profile      {}",
             result["profile"].as_str().unwrap_or("")
         );
-        println!(
+        outln!(
             "  Instance     {}",
             result["instance"].as_str().unwrap_or("")
         );
-        println!(
+        outln!(
             "  User         {}",
             result["username"].as_str().unwrap_or("")
         );
-        println!(
+        outln!(
             "  Auth         {}",
             result["authType"].as_str().unwrap_or("")
         );
-        println!(
+        outln!(
             "  Safety       {}",
             if read_only {
                 "read-only"
@@ -1617,7 +1618,7 @@ async fn run_auth_login(
                 "writes enabled"
             }
         );
-        println!(
+        outln!(
             "  Credentials  {}",
             if file_storage {
                 "config file (plaintext, mode 0600)"
@@ -1920,7 +1921,7 @@ fn render_offline_auth_status(config: &Config, output: &OutputConfig) {
     if output.json {
         output.value(&value);
     } else {
-        println!(
+        outln!(
             "Profile: {}\nStatus: configured (network not checked)\nAuthentication: {}\nCredentials: {}",
             config.profile,
             config.auth_type.as_str(),
@@ -1945,14 +1946,14 @@ fn render_offline_doctor(config: &Config, output: &OutputConfig) {
             "checks": checks
         }));
     } else {
-        println!("ServiceNow connection (offline)\n");
+        outln!("ServiceNow connection (offline)\n");
         for check in checks.as_array().expect("checks are an array") {
             let marker = if check["skipped"].as_bool().unwrap_or(false) {
                 "–"
             } else {
                 "✓"
             };
-            println!(
+            outln!(
                 "  {marker} {:<16} {}",
                 check["name"].as_str().unwrap_or("check"),
                 check["detail"].as_str().unwrap_or("")
@@ -1995,7 +1996,7 @@ async fn run_auth_status(
     if output.json {
         output.value(&value);
     } else {
-        println!(
+        outln!(
             "Authenticated as {} ({}, {})",
             value["identity"].as_str().unwrap_or("unknown"),
             config.auth_type.as_str(),
@@ -2062,15 +2063,15 @@ async fn run_doctor(
     if output.json {
         output.value(&result);
     } else {
-        println!("ServiceNow connection\n");
+        outln!("ServiceNow connection\n");
         for check in result["checks"].as_array().expect("checks are an array") {
-            println!(
+            outln!(
                 "  ✓ {:<16} {}",
                 check["name"].as_str().unwrap_or("check"),
                 check["detail"].as_str().unwrap_or("")
             );
         }
-        println!("\nReady.");
+        outln!("\nReady.");
     }
     Ok(())
 }
@@ -2356,7 +2357,7 @@ async fn run_incidents(
                         "changes": {},
                     }));
                 } else {
-                    println!("No changes to apply.");
+                    outln!("No changes to apply.");
                 }
                 return Ok(());
             }
@@ -2483,7 +2484,7 @@ async fn run_incidents(
                     "url": url,
                 }));
             } else if print || !std::io::stdout().is_terminal() {
-                println!("{url}");
+                outln!("{url}");
             } else {
                 open::that(&url).map_err(|error| {
                     ApiError::Other(format!("failed to open ServiceNow in a browser: {error}"))
@@ -2606,7 +2607,7 @@ fn emit_mutation_plan(
     if output.json {
         output.value(&plan);
     } else {
-        println!("Dry run: {operation} {identifier}\n");
+        outln!("Dry run: {operation} {identifier}\n");
         print_record(&plan["changes"], output.color);
     }
 }
@@ -2626,20 +2627,20 @@ fn emit_watch_event(
         "record": initial,
     });
     match output.format {
-        OutputFormat::Json | OutputFormat::JsonLines => println!(
+        OutputFormat::Json | OutputFormat::JsonLines => outln!(
             "{}",
             serde_json::to_string(&event).expect("watch event is serializable")
         ),
-        OutputFormat::Yaml => print!(
+        OutputFormat::Yaml => out!(
             "---\n{}",
             serde_saphyr::to_string(&event).expect("watch event is serializable")
         ),
         OutputFormat::Text => {
             if let Some(record) = initial {
-                println!("Watching {identifier}. Press Ctrl-C to stop.\n");
+                outln!("Watching {identifier}. Press Ctrl-C to stop.\n");
                 print_record(record, output.color);
             } else {
-                println!("\n{} changed", output.heading(identifier));
+                outln!("\n{} changed", output.heading(identifier));
                 print_records(
                     changes,
                     Some(&["field".into(), "before".into(), "after".into()]),
@@ -2731,7 +2732,7 @@ async fn run_attachments(
                 if output.json {
                     output.value(&plan);
                 } else {
-                    println!("Dry run: upload {file_name} to {table}/{identifier}\n");
+                    outln!("Dry run: upload {file_name} to {table}/{identifier}\n");
                     print_record(&plan, output.color);
                 }
                 return Ok(());
@@ -2755,9 +2756,9 @@ async fn run_attachments(
             let destination =
                 attachment::destination_path(destination.as_deref(), &metadata.file_name)?;
             if destination == std::path::Path::new("-") {
-                let stdout = std::io::stdout();
-                let mut writer = stdout.lock();
-                let bytes = client.download_attachment(&sys_id, &mut writer).await?;
+                let bytes = client
+                    .download_attachment(&sys_id, &mut output::Stdout)
+                    .await?;
                 output.message(&format!(
                     "Downloaded {} ({}) to stdout.",
                     metadata.file_name,
@@ -2825,7 +2826,7 @@ async fn run_attachments(
             if output.json {
                 output.value(&result);
             } else {
-                println!("{}", destination.display());
+                outln!("{}", destination.display());
             }
         }
         AttachmentsCommand::Delete {
@@ -2851,7 +2852,7 @@ async fn run_attachments(
                 if output.json {
                     output.value(&plan);
                 } else {
-                    println!("Dry run: permanently delete {}\n", metadata.file_name);
+                    outln!("Dry run: permanently delete {}\n", metadata.file_name);
                     print_record(&plan, output.color);
                 }
                 return Ok(());
@@ -2889,7 +2890,7 @@ async fn run_attachments(
             if output.json {
                 output.value(&result);
             } else {
-                println!(
+                outln!(
                     "Deleted {}.",
                     result["fileName"].as_str().unwrap_or("attachment")
                 );
@@ -3030,7 +3031,7 @@ async fn run_tables(
             if output.json {
                 output.value(&result);
             } else {
-                println!("Deleted {table}/{sys_id}.");
+                outln!("Deleted {table}/{sys_id}.");
             }
         }
     }
