@@ -356,11 +356,12 @@ The default suite uses mock servers. The ignored PDI lifecycle suite creates
 isolated records, verifies incident and attachment lifecycles, and cleans up
 every record and file it creates.
 
-CI runs formatting, linting, tests on Linux/macOS/Windows, and a RustSec audit.
-Tagged releases produce native archives, Cargo/PyPI packages, SHA-256 checksums,
-a CycloneDX SBOM, and GitHub artifact attestations, then install and execute both
-public packages as a final smoke test. See [SECURITY.md](SECURITY.md),
-[SUPPORT.md](SUPPORT.md), and the [release runbook](docs/releasing.md).
+CI runs formatting, linting, tests on Linux/macOS/Windows, a RustSec audit, and
+an MSRV build. Tagged releases produce native archives, Cargo/PyPI packages,
+SHA-256 checksums, a CycloneDX SBOM, and GitHub artifact attestations, then
+install and execute both public packages as a final smoke test. See
+[SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), and the
+[release runbook](docs/releases.md).
 
 ## Status
 
