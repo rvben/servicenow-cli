@@ -46,12 +46,23 @@ servicenow init --profile work --instance company --method browser
 
 The CLI launches your default browser when it is supported, otherwise the first
 installed Chrome, Edge, Chromium, or Firefox. Edge opens InPrivate and
-Chrome/Chromium open Incognito, each with a new temporary profile and a
-localhost-only debugging channel. Firefox opens a normal window in a new
-throwaway profile, because Firefox hides private-window cookies from its
+Chrome/Chromium open Incognito, each with a new temporary profile readable only
+by the current user. On Linux and macOS, Chrome, Edge, and Chromium are driven
+over Chromium's pipe-based CDP transport (`--remote-debugging-pipe`): the
+debugging channel is a pair of file descriptors inherited by the browser
+process rather than a network port, so no other local process can connect to
+it. Firefox opens a normal window in a new throwaway profile, because Firefox
+hides private-window cookies from its
 [WebDriver BiDi](https://w3c.github.io/webdriver-bidi/) automation channel; the
 profile is deleted when sign-in finishes. Firefox is supported on Linux, macOS,
-and inside WSL, but not through the Windows bridge. Complete the normal SSO and
+and inside WSL, but not through the Windows bridge. Firefox has no pipe
+transport, so its BiDi channel stays a loopback-only WebSocket port for the
+duration of sign-in; another local account on the same machine could in
+principle connect to it during that window. The Windows bridge used from WSL2
+and for the Windows Edge/Chrome fallback (see
+[WSL2 and headless Linux](#wsl2-and-headless-linux) below) keeps the same
+loopback-port exposure, because the pipe transport cannot cross the
+WSL/PowerShell process boundary. Complete the normal SSO and
 MFA flow in that window. A managed Windows device can still authenticate
 silently through Entra device SSO, even in a private window, so setup displays
 the resolved ServiceNow name and username for confirmation before storing

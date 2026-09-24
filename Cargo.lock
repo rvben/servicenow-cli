@@ -3202,6 +3202,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "keyring",
+ "libc",
  "mime_guess",
  "oauth2",
  "open",

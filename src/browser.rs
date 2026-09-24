@@ -66,9 +66,7 @@ impl BrowserProgress {
         match self {
             Self::StartingPrivateBrowser => "starting a private browser".into(),
             Self::PrivateBrowserOpened => "private browser opened".into(),
-            Self::WaitingForBrowserChannel => {
-                "waiting for the localhost-only browser sign-in channel".into()
-            }
+            Self::WaitingForBrowserChannel => "waiting for the browser sign-in channel".into(),
             Self::BrowserChannelReady => "browser sign-in channel is ready".into(),
             Self::WaitingForServiceNowPage => "waiting for an authenticated ServiceNow page".into(),
             Self::ServiceNowPageDetected => "authenticated ServiceNow page detected".into(),
@@ -167,29 +165,58 @@ async fn chromium_browser_cookie(
     progress: &mut ProgressReporter<'_>,
 ) -> Result<BrowserSession, ApiError> {
     let private_mode = private_browsing_argument(browser);
-    let profile = tempfile::tempdir()
+    let profile = throwaway_profile_builder()
+        .tempdir()
         .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
     progress.report(BrowserProgress::StartingPrivateBrowser);
-    let child = spawn_browser(
-        browser,
-        [
-            "--remote-debugging-port=0".into(),
-            "--remote-debugging-address=127.0.0.1".into(),
-            format!("--user-data-dir={}", profile.path().display()),
-            "--no-first-run".into(),
-            "--no-default-browser-check".into(),
-            "--disable-sync".into(),
-            private_mode.into(),
-            "--new-window".into(),
-            login_url(site_url),
-        ],
-    )?;
-    progress.report(BrowserProgress::PrivateBrowserOpened);
-    let mut process = NativeBrowser { child, profile };
-    progress.report(BrowserProgress::WaitingForBrowserChannel);
-    let websocket_url = wait_for_debugger(&mut process).await?;
-    progress.report(BrowserProgress::BrowserChannelReady);
-    wait_for_cdp_session(&websocket_url, site_url, Some(&mut process), progress).await
+
+    #[cfg(unix)]
+    {
+        // The pipe transport never opens a TCP port, so no other local
+        // process can reach this sign-in channel regardless of file or
+        // profile permissions.
+        let (child, pipe) = spawn_browser_with_cdp_pipe(
+            browser,
+            [
+                "--remote-debugging-pipe".into(),
+                format!("--user-data-dir={}", profile.path().display()),
+                "--no-first-run".into(),
+                "--no-default-browser-check".into(),
+                "--disable-sync".into(),
+                private_mode.into(),
+                "--new-window".into(),
+                login_url(site_url),
+            ],
+        )?;
+        progress.report(BrowserProgress::PrivateBrowserOpened);
+        let mut process = NativeBrowser { child, profile };
+        progress.report(BrowserProgress::WaitingForBrowserChannel);
+        progress.report(BrowserProgress::BrowserChannelReady);
+        wait_for_cdp_pipe_session(pipe, site_url, Some(&mut process), progress).await
+    }
+    #[cfg(not(unix))]
+    {
+        let child = spawn_browser(
+            browser,
+            [
+                "--remote-debugging-port=0".into(),
+                "--remote-debugging-address=127.0.0.1".into(),
+                format!("--user-data-dir={}", profile.path().display()),
+                "--no-first-run".into(),
+                "--no-default-browser-check".into(),
+                "--disable-sync".into(),
+                private_mode.into(),
+                "--new-window".into(),
+                login_url(site_url),
+            ],
+        )?;
+        progress.report(BrowserProgress::PrivateBrowserOpened);
+        let mut process = NativeBrowser { child, profile };
+        progress.report(BrowserProgress::WaitingForBrowserChannel);
+        let websocket_url = wait_for_debugger(&mut process).await?;
+        progress.report(BrowserProgress::BrowserChannelReady);
+        wait_for_cdp_session(&websocket_url, site_url, Some(&mut process), progress).await
+    }
 }
 
 /// Firefox exposes WebDriver BiDi instead of CDP. Its BiDi server cannot read
@@ -239,7 +266,7 @@ user_pref("signon.rememberSignons", false);
 /// Snap-packaged Firefox has a private `/tmp`, so its profile must live in the
 /// snap's own home directory to be visible to both processes.
 fn firefox_profile() -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
+    let mut builder = throwaway_profile_builder();
     builder.prefix("servicenow-cli-browser-");
     match dirs::home_dir()
         .map(|home| home.join("snap/firefox/common"))
@@ -248,6 +275,22 @@ fn firefox_profile() -> std::io::Result<tempfile::TempDir> {
         Some(directory) => builder.tempdir_in(directory),
         None => builder.tempdir(),
     }
+}
+
+/// A `tempfile::Builder` for throwaway browser sign-in profiles. On Unix,
+/// `/tmp` is normally shared and world-readable (mode 1777), so the profile
+/// directory is created accessible only to the current user; otherwise any
+/// other local account could read `DevToolsActivePort`,
+/// `WebDriverBiDiServer.json`, or the profile's cookie database while
+/// sign-in is in progress.
+fn throwaway_profile_builder() -> tempfile::Builder<'static, 'static> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder
 }
 
 fn login_url(site_url: &str) -> String {
@@ -270,6 +313,156 @@ fn spawn_browser(
                 browser.display()
             ))
         })
+}
+
+/// Chromium's `--remote-debugging-pipe` CDP transport: a stream of
+/// NUL-terminated JSON messages carried over inherited file descriptors
+/// (3 for the browser to read, 4 for the browser to write) instead of a
+/// WebSocket. Modeled on the framing puppeteer's `PipeTransport` uses.
+#[cfg(unix)]
+struct CdpPipe {
+    sender: tokio::net::unix::pipe::Sender,
+    receiver: tokio::net::unix::pipe::Receiver,
+    buffer: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl CdpPipe {
+    fn new(writer: std::io::PipeWriter, reader: std::io::PipeReader) -> Result<Self, ApiError> {
+        let open_error = |error: std::io::Error| {
+            ApiError::Other(format!("failed to open the browser sign-in pipe: {error}"))
+        };
+        let writer: std::os::fd::OwnedFd = writer.into();
+        let sender =
+            tokio::net::unix::pipe::Sender::from_file(writer.into()).map_err(open_error)?;
+        let reader: std::os::fd::OwnedFd = reader.into();
+        let receiver =
+            tokio::net::unix::pipe::Receiver::from_file(reader.into()).map_err(open_error)?;
+        Ok(Self {
+            sender,
+            receiver,
+            buffer: Vec::new(),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl ProtocolChannel for CdpPipe {
+    async fn send_text(&mut self, text: String) -> Result<(), ApiError> {
+        let mut framed = text.into_bytes();
+        framed.push(0);
+        self.sender
+            .write_all(&framed)
+            .await
+            .map_err(|error| ApiError::Other(format!("failed to query browser session: {error}")))
+    }
+
+    async fn recv_text(&mut self) -> Result<Option<String>, ApiError> {
+        loop {
+            if let Some(end) = self.buffer.iter().position(|byte| *byte == 0) {
+                let message: Vec<u8> = self.buffer.drain(..=end).collect();
+                let text =
+                    String::from_utf8(message[..message.len() - 1].to_vec()).map_err(|error| {
+                        ApiError::Other(format!("browser returned invalid session data: {error}"))
+                    })?;
+                return Ok(Some(text));
+            }
+            let mut chunk = [0_u8; 4096];
+            let read = self.receiver.read(&mut chunk).await.map_err(|error| {
+                ApiError::Other(format!("browser session channel failed: {error}"))
+            })?;
+            if read == 0 {
+                return Ok(None);
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+}
+
+/// Launches `browser` with fds 3 and 4 wired to a fresh pair of OS pipes so
+/// it can speak `--remote-debugging-pipe` CDP, and returns the parent's ends
+/// as a `CdpPipe`. Unlike `--remote-debugging-port`, this never opens a
+/// socket, so no other local process can reach the sign-in session.
+#[cfg(unix)]
+fn spawn_browser_with_cdp_pipe(
+    browser: &Path,
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<(Child, CdpPipe), ApiError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let pipe_error = |error: std::io::Error| {
+        ApiError::Other(format!(
+            "failed to create the browser sign-in pipe: {error}"
+        ))
+    };
+    // The browser reads commands on its fd 3; the parent keeps the write end.
+    let (command_read, command_write) = std::io::pipe().map_err(pipe_error)?;
+    // The browser writes responses and events on its fd 4; the parent keeps
+    // the read end.
+    let (event_read, event_write) = std::io::pipe().map_err(pipe_error)?;
+
+    let command_read_fd = command_read.as_raw_fd();
+    let event_write_fd = event_write.as_raw_fd();
+
+    let mut command = std::process::Command::new(browser);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: this closure runs in the forked child between fork and exec,
+    // and calls only fcntl, dup2 and close on file descriptors this process
+    // owns, all async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            // Both ends are first copied above fd 4, so neither dup2 below can
+            // overwrite the other's source, and every copy lacks the
+            // close-on-exec flag the pipe ends were created with. dup2 onto a
+            // descriptor it already occupies would keep that flag and close
+            // the channel at exec.
+            let command_read = libc::fcntl(command_read_fd, libc::F_DUPFD, 5);
+            let event_write = libc::fcntl(event_write_fd, libc::F_DUPFD, 5);
+            if command_read < 0
+                || event_write < 0
+                || libc::dup2(command_read, 3) < 0
+                || libc::dup2(event_write, 4) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::close(command_read);
+            libc::close(event_write);
+            Ok(())
+        });
+    }
+    let child = command.spawn().map_err(|error| {
+        ApiError::Other(format!(
+            "failed to start browser {}: {error}",
+            browser.display()
+        ))
+    })?;
+
+    // The child now holds its own copies of the read and write ends at fds 3
+    // and 4; the parent only needs the other two ends to talk to it.
+    drop(command_read);
+    drop(event_write);
+    let pipe = CdpPipe::new(command_write, event_read)?;
+    Ok((child, pipe))
+}
+
+/// Chromium's CDP over `spawn_browser_with_cdp_pipe`'s pipe transport.
+#[cfg(unix)]
+async fn wait_for_cdp_pipe_session(
+    pipe: CdpPipe,
+    site_url: &str,
+    process: Option<&mut NativeBrowser>,
+    progress: &mut ProgressReporter<'_>,
+) -> Result<BrowserSession, ApiError> {
+    let mut probe = CdpProbe {
+        channel: pipe,
+        id: 0,
+    };
+    wait_for_browser_session(&mut probe, site_url, process, progress).await
 }
 
 #[cfg(test)]
@@ -330,6 +523,11 @@ impl Drop for NativeBrowser {
     }
 }
 
+/// Discovers Chromium's loopback CDP WebSocket endpoint from the
+/// `DevToolsActivePort` file `--remote-debugging-port=0` writes into the
+/// profile directory. Only used on non-Unix platforms; Unix uses
+/// `spawn_browser_with_cdp_pipe` instead, which never opens a TCP port.
+#[cfg(not(unix))]
 async fn wait_for_debugger(process: &mut NativeBrowser) -> Result<String, ApiError> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -387,6 +585,45 @@ async fn wait_for_bidi_socket(process: &mut NativeBrowser) -> Result<BrowserSock
 
 type BrowserSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// A duplex channel exchanging whole JSON-RPC-shaped protocol messages,
+/// independent of the transport underneath: a loopback WebSocket for
+/// WebDriver BiDi and, on non-Unix platforms, CDP; or Chromium's
+/// NUL-terminated pipe transport for CDP on Unix.
+trait ProtocolChannel {
+    async fn send_text(&mut self, text: String) -> Result<(), ApiError>;
+
+    /// The next inbound protocol message, or `None` once the browser closed
+    /// its half of the channel.
+    async fn recv_text(&mut self) -> Result<Option<String>, ApiError>;
+}
+
+impl ProtocolChannel for BrowserSocket {
+    async fn send_text(&mut self, text: String) -> Result<(), ApiError> {
+        self.send(Message::Text(text.into()))
+            .await
+            .map_err(|error| ApiError::Other(format!("failed to query browser session: {error}")))
+    }
+
+    async fn recv_text(&mut self) -> Result<Option<String>, ApiError> {
+        while let Some(message) = self.next().await {
+            let message = message.map_err(|error| {
+                ApiError::Other(format!("browser session channel failed: {error}"))
+            })?;
+            match message {
+                Message::Text(text) => return Ok(Some(text.to_string())),
+                Message::Ping(data) => {
+                    self.send(Message::Pong(data)).await.map_err(|error| {
+                        ApiError::Other(format!("browser session channel failed: {error}"))
+                    })?;
+                }
+                Message::Close(_) => return Ok(None),
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+}
+
 /// Browser-protocol operations the sign-in loop needs from an open browser.
 trait SessionProbe {
     type Page;
@@ -402,6 +639,12 @@ trait SessionProbe {
     async fn release(&mut self, page: Self::Page);
 }
 
+/// Chromium's CDP over a loopback WebSocket. Used directly on non-Unix
+/// platforms, where the pipe transport is unavailable (see
+/// `spawn_browser_with_cdp_pipe`), and exercised in tests on every platform
+/// since the protocol logic in `CdpProbe` and `browser_command` is shared
+/// with the pipe transport.
+#[cfg(any(test, not(unix)))]
 async fn wait_for_cdp_session(
     websocket_url: &str,
     site_url: &str,
@@ -411,7 +654,10 @@ async fn wait_for_cdp_session(
     let (socket, _) = connect_async(websocket_url)
         .await
         .map_err(|error| ApiError::Other(format!("failed to connect to browser: {error}")))?;
-    let mut probe = CdpProbe { socket, id: 0 };
+    let mut probe = CdpProbe {
+        channel: socket,
+        id: 0,
+    };
     wait_for_browser_session(&mut probe, site_url, process, progress).await
 }
 
@@ -486,12 +732,12 @@ fn browser_timeout_message(stage: &str) -> String {
     )
 }
 
-struct CdpProbe {
-    socket: BrowserSocket,
+struct CdpProbe<C> {
+    channel: C,
     id: u64,
 }
 
-impl CdpProbe {
+impl<C: ProtocolChannel> CdpProbe<C> {
     async fn command(
         &mut self,
         method: &str,
@@ -503,11 +749,11 @@ impl CdpProbe {
         if let Some(session_id) = session_id {
             request["sessionId"] = Value::String(session_id.into());
         }
-        browser_command(&mut self.socket, self.id, request).await
+        browser_command(&mut self.channel, self.id, request).await
     }
 }
 
-impl SessionProbe for CdpProbe {
+impl<C: ProtocolChannel> SessionProbe for CdpProbe<C> {
     /// The flattened CDP session attached to the ServiceNow page.
     type Page = String;
 
@@ -692,49 +938,33 @@ fn evaluated_user_token(evaluated: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn browser_command(
-    socket: &mut BrowserSocket,
+async fn browser_command<C: ProtocolChannel>(
+    channel: &mut C,
     id: u64,
     request: Value,
 ) -> Result<Value, ApiError> {
-    socket
-        .send(Message::Text(request.to_string().into()))
-        .await
-        .map_err(|error| ApiError::Other(format!("failed to query browser session: {error}")))?;
-    while let Some(message) = socket.next().await {
-        match message
-            .map_err(|error| ApiError::Other(format!("browser session channel failed: {error}")))?
-        {
-            Message::Text(text) => {
-                let value: Value = serde_json::from_str(text.as_str()).map_err(|error| {
-                    ApiError::Other(format!("browser returned invalid session data: {error}"))
-                })?;
-                if value.get("id").and_then(Value::as_u64) == Some(id) {
-                    if value.get("error").and_then(Value::as_str) == Some("unknown command") {
-                        return Err(ApiError::Other(format!(
-                            "this browser version does not support `{}`, which browser sign-in needs; update the browser or set SERVICENOW_BROWSER to another installed browser",
-                            request["method"].as_str().unwrap_or("a required command")
-                        )));
-                    }
-                    if let Some(error) = value.get("error") {
-                        let detail = match value.get("message").and_then(Value::as_str) {
-                            Some(message) => format!("{error}: {message}"),
-                            None => error.to_string(),
-                        };
-                        return Err(ApiError::Other(format!(
-                            "browser rejected the session query: {detail}"
-                        )));
-                    }
-                    return Ok(value);
-                }
+    channel.send_text(request.to_string()).await?;
+    while let Some(text) = channel.recv_text().await? {
+        let value: Value = serde_json::from_str(&text).map_err(|error| {
+            ApiError::Other(format!("browser returned invalid session data: {error}"))
+        })?;
+        if value.get("id").and_then(Value::as_u64) == Some(id) {
+            if value.get("error").and_then(Value::as_str) == Some("unknown command") {
+                return Err(ApiError::Other(format!(
+                    "this browser version does not support `{}`, which browser sign-in needs; update the browser or set SERVICENOW_BROWSER to another installed browser",
+                    request["method"].as_str().unwrap_or("a required command")
+                )));
             }
-            Message::Ping(data) => socket.send(Message::Pong(data)).await.map_err(|error| {
-                ApiError::Other(format!("browser session channel failed: {error}"))
-            })?,
-            Message::Close(_) => {
-                return Err(ApiError::Other("browser closed its sign-in channel".into()));
+            if let Some(error) = value.get("error") {
+                let detail = match value.get("message").and_then(Value::as_str) {
+                    Some(message) => format!("{error}: {message}"),
+                    None => error.to_string(),
+                };
+                return Err(ApiError::Other(format!(
+                    "browser rejected the session query: {detail}"
+                )));
             }
-            _ => {}
+            return Ok(value);
         }
     }
     Err(ApiError::Other("browser closed its sign-in channel".into()))
@@ -1706,6 +1936,23 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[cfg(unix)]
+    #[test]
+    fn throwaway_profile_directories_are_private_to_the_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let profile = throwaway_profile_builder().tempdir().unwrap();
+        let mode = std::fs::metadata(profile.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a browser sign-in profile must not be readable by other local accounts"
+        );
+    }
+
     #[test]
     fn cookie_header_is_scoped_to_the_instance_and_api_path() {
         let document = json!({
@@ -2258,6 +2505,124 @@ mod tests {
             ]
         );
         cdp.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cdp_pipe_session_is_validated_and_rotation_is_captured_before_returning() {
+        let instance = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .and(header("cookie", "JSESSIONID=validated-session"))
+            .and(header("x-usertoken", "synthetic-user-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "set-cookie",
+                        "JSESSIONID=rotated-validation-session; Path=/; HttpOnly",
+                    )
+                    .set_body_json(json!({
+                        "result": [{"sys_id": "0123456789abcdef0123456789abcdef"}]
+                    })),
+            )
+            .expect(1)
+            .mount(&instance)
+            .await;
+
+        let (command_read, command_write) = std::io::pipe().unwrap();
+        let (event_read, event_write) = std::io::pipe().unwrap();
+        let pipe = CdpPipe::new(command_write, event_read).unwrap();
+
+        let instance_port = instance.address().port();
+        let browser = tokio::spawn(async move {
+            let command_read: std::os::fd::OwnedFd = command_read.into();
+            let mut command_reader =
+                tokio::net::unix::pipe::Receiver::from_file(command_read.into()).unwrap();
+            let event_write: std::os::fd::OwnedFd = event_write.into();
+            let mut event_writer =
+                tokio::net::unix::pipe::Sender::from_file(event_write.into()).unwrap();
+            let mut pending = Vec::new();
+            loop {
+                let request = loop {
+                    if let Some(end) = pending.iter().position(|byte| *byte == 0) {
+                        let message: Vec<u8> = pending.drain(..=end).collect();
+                        break String::from_utf8(message[..message.len() - 1].to_vec()).unwrap();
+                    }
+                    let mut chunk = [0_u8; 4096];
+                    let read = command_reader.read(&mut chunk).await.unwrap();
+                    assert!(read > 0, "the sign-in loop closed the command pipe early");
+                    pending.extend_from_slice(&chunk[..read]);
+                };
+                let request: Value = serde_json::from_str(&request).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Network.getCookies" => {
+                        assert_eq!(request["sessionId"], "attached-page");
+                        assert_eq!(
+                            request["params"]["urls"][0],
+                            format!("http://127.0.0.1:{instance_port}/api/now/")
+                        );
+                        json!({"cookies": [{
+                            "name": "JSESSIONID",
+                            "value": "validated-session",
+                            "domain": "127.0.0.1",
+                            "path": "/",
+                            "secure": false,
+                            "expires": -1
+                        }]})
+                    }
+                    "Target.getTargets" => json!({"targetInfos": [{
+                        "type": "page",
+                        "url": format!("http://127.0.0.1:{instance_port}/now/nav/ui"),
+                        "targetId": "service-now-page"
+                    }]}),
+                    "Target.attachToTarget" => json!({"sessionId": "attached-page"}),
+                    "Runtime.evaluate" => {
+                        assert_eq!(request["params"]["expression"], USER_TOKEN_EXPRESSION);
+                        json!({"result": {
+                            "type": "string",
+                            "value": "synthetic-user-token"
+                        }})
+                    }
+                    "Target.detachFromTarget" => json!({}),
+                    method => panic!("unexpected CDP method: {method}"),
+                };
+                let mut reply = json!({"id": request["id"], "result": result})
+                    .to_string()
+                    .into_bytes();
+                reply.push(0);
+                event_writer.write_all(&reply).await.unwrap();
+                if request["method"] == "Target.detachFromTarget" {
+                    break;
+                }
+            }
+        });
+
+        let mut events = Vec::new();
+        let mut callback = |progress| events.push(progress);
+        let mut progress = ProgressReporter {
+            callback: &mut callback,
+            reported: HashSet::new(),
+        };
+        let session = wait_for_cdp_pipe_session(pipe, &instance.uri(), None, &mut progress)
+            .await
+            .unwrap();
+        drop(progress);
+        assert_eq!(session.cookie, "JSESSIONID=rotated-validation-session");
+        assert_eq!(session.user_token, "synthetic-user-token");
+        assert_eq!(
+            events,
+            vec![
+                BrowserProgress::WaitingForServiceNowPage,
+                BrowserProgress::ServiceNowPageDetected,
+                BrowserProgress::ReadingSessionCookies,
+                BrowserProgress::SessionCookiesDetected,
+                BrowserProgress::ReadingUserToken,
+                BrowserProgress::UserTokenDetected,
+                BrowserProgress::ValidatingSession,
+                BrowserProgress::SessionValidated,
+            ]
+        );
+        browser.await.unwrap();
     }
 
     #[tokio::test]
