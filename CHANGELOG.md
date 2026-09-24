@@ -9,6 +9,10 @@ All notable changes are documented here. Versions follow Semantic Versioning.
 - **auth**: support Firefox and default-browser selection for browser sign-in ([99bc722](https://github.com/rvben/servicenow-cli/commit/99bc72218cbc4c7017def0303dea8140ed1e0d8b))
 - **tui**: add guarded incident actions ([d1d3680](https://github.com/rvben/servicenow-cli/commit/d1d36807adedf87d97234fa6e990c722b2918899))
 
+### Fixed
+
+- **deps**: update rustls to 0.23.45 for RUSTSEC-2026-0285 ([2ddd82f](https://github.com/rvben/servicenow-cli/commit/2ddd82feae83d622322f03a780d5a946dd4452ef))
+
 ## [0.5.0](https://github.com/rvben/servicenow-cli/compare/v0.4.5...v0.5.0) - 2026-09-03
 
 ### Added
