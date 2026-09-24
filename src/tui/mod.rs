@@ -126,7 +126,6 @@ pub async fn run(
                 app.execute_incident_action(client, config, prepared).await;
             }
             Action::Load => {
-                app.notice = Notice::quiet(format!("Loading {}… Esc cancels.", app.table));
                 terminal
                     .draw(|frame| app.render(frame))
                     .map_err(terminal_error)?;

@@ -254,9 +254,15 @@ impl App {
         }
     }
 
-    pub(super) async fn load(&mut self, client: &ServiceNowClient) -> LoadOutcome {
+    /// Marks the ledger as loading so the next frame shows the loading panel
+    /// instead of rows fetched for a view the operator has just left.
+    fn begin_load(&mut self) {
         self.loading = true;
         self.notice = Notice::quiet(format!("Loading {}… Esc cancels.", self.table));
+    }
+
+    pub(super) async fn load(&mut self, client: &ServiceNowClient) -> LoadOutcome {
+        self.begin_load();
         let fields = (self.table == "incident").then(|| {
             INCIDENT_LIST_FIELDS
                 .iter()
@@ -669,7 +675,19 @@ impl App {
         };
     }
 
+    /// Applies a key press. A key that changes the table, query, or page
+    /// updates the view immediately, so it also starts the load here: the
+    /// frame drawn before the request runs must not pair the new view's
+    /// header with the old view's rows.
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> Action {
+        let action = self.apply_key(key);
+        if action == Action::Load {
+            self.begin_load();
+        }
+        action
+    }
+
+    fn apply_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
@@ -1294,6 +1312,47 @@ mod tests {
             assert!(!app.has_next_page, "{change}");
             assert!(app.notice.text.contains("Cancelled"), "{change}");
         }
+    }
+
+    #[test]
+    fn the_frame_drawn_before_a_load_shows_the_loading_panel_not_the_old_rows() {
+        for change in ["table", "query", "page", "refresh"] {
+            let mut app = app();
+            let action = match change {
+                "table" => {
+                    app.overlay = Overlay::TableInput("cmdb_ci".into());
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                }
+                "query" => {
+                    app.overlay = Overlay::QueryInput("active=false".into());
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                }
+                "page" => {
+                    app.has_next_page = true;
+                    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+                }
+                _ => app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            };
+            assert_eq!(action, Action::Load, "{change}");
+
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let text = rendered_text(terminal.backend().buffer());
+
+            assert!(text.contains("INDEXING RECORDS"), "{change}:\n{text}");
+            assert!(text.contains("Esc cancels"), "{change}:\n{text}");
+            assert!(!text.contains("INC0010001"), "{change}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn keys_that_keep_the_view_do_not_start_a_load() {
+        let mut app = app();
+        let action = app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_ne!(action, Action::Load);
+        assert!(!app.loading);
+        assert_eq!(app.notice.text, "Loaded 1 record");
     }
 
     #[tokio::test]
