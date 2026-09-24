@@ -1,2 +1,5 @@
+[global]
+exclude = ["DESIGN.md", "PRODUCT.md"]
+
 [MD013]
 line-length = 120

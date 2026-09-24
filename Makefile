@@ -19,7 +19,7 @@ lint: lint-md
 	cargo clippy --all-targets -- -D warnings
 
 lint-md:
-	uv run --locked --only-group dev rumdl check .
+	uv run --locked --only-group dev rumdl check $$(git ls-files '*.md')
 
 fmt:
 	cargo fmt
