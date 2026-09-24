@@ -903,20 +903,11 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
             return Ok(());
         }
         Command::Profile(ProfileCommand::Remove { name, yes }) => {
-            let confirmed = yes
-                || (std::io::stdin().is_terminal()
-                    && Confirm::new()
-                        .with_prompt(format!(
-                            "Remove profile '{name}' and its stored credential?"
-                        ))
-                        .default(false)
-                        .interact()
-                        .map_err(|error| ApiError::Other(error.to_string()))?);
-            if !confirmed {
-                return Err(ApiError::InvalidInput(
-                    "profile removal cancelled; use --yes for non-interactive removal".into(),
-                ));
-            }
+            confirm_destructive(
+                yes,
+                format!("Remove profile '{name}' and its stored credential?"),
+                "profile removal cancelled; use --yes for non-interactive removal",
+            )?;
             let credential_removed = delete_stored_credential(&name)?;
             let removed = remove_profile(&name)?;
             if !removed && !credential_removed {
@@ -1943,6 +1934,25 @@ fn credential_detail(config: &Config) -> &'static str {
     }
 }
 
+/// Confirms a destructive, irreversible action the same way at every call site: `--yes`
+/// skips the prompt outright, an interactive terminal gets a dialoguer confirmation
+/// defaulting to "no", and anything else (piped or non-interactive stdin without `--yes`)
+/// is refused rather than silently assumed.
+fn confirm_destructive(yes: bool, prompt: String, cancelled_message: &str) -> Result<(), ApiError> {
+    let confirmed = yes
+        || (std::io::stdin().is_terminal()
+            && Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()
+                .map_err(|error| ApiError::Other(format!("failed to confirm: {error}")))?);
+    if confirmed {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidInput(cancelled_message.into()))
+    }
+}
+
 fn selected_profile(
     profile_override: Option<&str>,
     legacy_profile: Option<String>,
@@ -2904,24 +2914,15 @@ async fn run_attachments(
                 }
                 return Ok(());
             }
-            let confirmed = yes
-                || (std::io::stdin().is_terminal()
-                    && Confirm::new()
-                        .with_prompt(format!(
-                            "Permanently delete '{}' ({})?",
-                            metadata.file_name,
-                            attachment::human_size(&metadata.size_bytes)
-                        ))
-                        .default(false)
-                        .interact()
-                        .map_err(|error| {
-                            ApiError::Other(format!("failed to confirm deletion: {error}"))
-                        })?);
-            if !confirmed {
-                return Err(ApiError::InvalidInput(
-                    "attachment deletion cancelled; use --yes for non-interactive deletion".into(),
-                ));
-            }
+            confirm_destructive(
+                yes,
+                format!(
+                    "Permanently delete '{}' ({})?",
+                    metadata.file_name,
+                    attachment::human_size(&metadata.size_bytes)
+                ),
+                "attachment deletion cancelled; use --yes for non-interactive deletion",
+            )?;
             client.delete_attachment(&sys_id).await?;
             let result = serde_json::json!({
                 "deleted": true,
@@ -3064,11 +3065,11 @@ async fn run_tables(
         }
         TablesCommand::Delete { table, sys_id, yes } => {
             config.require_writable()?;
-            if !yes {
-                return Err(ApiError::InvalidInput(
-                    "deletion is permanent; rerun with --yes to confirm".into(),
-                ));
-            }
+            confirm_destructive(
+                yes,
+                format!("Permanently delete {table}/{sys_id}?"),
+                "table record deletion cancelled; use --yes for non-interactive deletion",
+            )?;
             client.delete_record(&table, &sys_id).await?;
             let result = serde_json::json!({
                 "deleted": true,

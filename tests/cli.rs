@@ -164,6 +164,31 @@ fn empty_csv_result_prints_nothing() {
 }
 
 #[test]
+fn tables_delete_refusal_message_matches_other_delete_commands() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .env("SERVICENOW_INSTANCE", "http://127.0.0.1:9")
+        .env("SERVICENOW_USERNAME", "api-user")
+        .env("SERVICENOW_PASSWORD", "secret")
+        .args([
+            "tables",
+            "delete",
+            "incident",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    let message = error["error"]["message"].as_str().unwrap();
+    // Old behavior unconditionally refused with "rerun with --yes"; the fixed behavior
+    // matches the cancellation wording `profile remove` and `attachments delete` already
+    // use for a non-interactive refusal.
+    assert!(message.contains("cancelled"), "message: {message}");
+    assert!(message.contains("non-interactive"), "message: {message}");
+}
+
+#[test]
 fn auth_login_help_advertises_secret_free_verbose_progress() {
     let config_home = TempDir::new().unwrap();
     command(&config_home)
