@@ -1,0 +1,23 @@
+# Dependency policy for `upd`. Auto-discovered from the repository root, so it
+# applies to the weekly dependency-health workflow and to any local run.
+
+# dtolnay/rust-toolchain publishes no versioned releases: its only tag is the
+# floating `v1` alias, so no exact release tag can name the pinned commit and
+# the SHA pin can never carry the version comment upd needs to keep it
+# updateable. The pin tracks the commit `v1` currently names and moves by hand,
+# verified against https://github.com/dtolnay/rust-toolchain/tags.
+ignore = [
+    "dtolnay/rust-toolchain",
+]
+
+# The actions below (actions/attest, actions/upload-artifact,
+# actions/download-artifact, PyO3/maturin-action, rust-lang/crates-io-auth-action,
+# pypa/gh-action-pypi-publish, actions/setup-python) run only in release.yml's
+# publish path: attest, upload/download-artifact, crates-io-auth, setup-python,
+# and maturin steps that build and ship binaries, wheels, and the crates.io and
+# PyPI packages. CI never exercises that path, so a bad bump to any of them
+# passes every CI run and fails only after a release tag is pushed, when the
+# failure is public. They stay out of `ignore` so upd keeps proposing updates
+# (each pin already carries a `# vX.Y.Z` comment for upd to update in place),
+# but a bump to one of them should be verified with a dry-run release
+# (`workflow_dispatch` with `dry_run: true`) before it reaches a real tag.
