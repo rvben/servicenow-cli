@@ -2799,7 +2799,11 @@ async fn run_attachments(
                 .await?;
             output.success(&format!(
                 "Uploaded {file_name} ({}) to {table}/{identifier}.",
-                attachment::human_size(&uploaded.size_bytes)
+                uploaded
+                    .size_bytes
+                    .as_deref()
+                    .map(attachment::human_size)
+                    .unwrap_or_else(|| "n/a".into())
             ));
             emit_attachment(output, uploaded)?;
         }
@@ -2810,15 +2814,16 @@ async fn run_attachments(
         } => {
             let sys_id = record::attachment_sys_id(client.site_url(), &identifier)?;
             let metadata = client.get_attachment(&sys_id).await?;
-            let destination =
-                attachment::destination_path(destination.as_deref(), &metadata.file_name)?;
+            let file_name = metadata.file_name.as_deref().ok_or_else(|| {
+                ApiError::Other("ServiceNow attachment response omitted file_name".into())
+            })?;
+            let destination = attachment::destination_path(destination.as_deref(), file_name)?;
             if destination == std::path::Path::new("-") {
                 let bytes = client
                     .download_attachment(&sys_id, &mut output::Stdout)
                     .await?;
                 output.message(&format!(
-                    "Downloaded {} ({}) to stdout.",
-                    metadata.file_name,
+                    "Downloaded {file_name} ({}) to stdout.",
                     attachment::human_size(&bytes.to_string())
                 ));
                 return Ok(());
@@ -2909,7 +2914,10 @@ async fn run_attachments(
                 if output.json {
                     output.value(&plan);
                 } else {
-                    outln!("Dry run: permanently delete {}\n", metadata.file_name);
+                    outln!(
+                        "Dry run: permanently delete {}\n",
+                        metadata.file_name.as_deref().unwrap_or("n/a")
+                    );
                     print_record(&plan, output.color);
                 }
                 return Ok(());
@@ -2918,8 +2926,12 @@ async fn run_attachments(
                 yes,
                 format!(
                     "Permanently delete '{}' ({})?",
-                    metadata.file_name,
-                    attachment::human_size(&metadata.size_bytes)
+                    metadata.file_name.as_deref().unwrap_or("n/a"),
+                    metadata
+                        .size_bytes
+                        .as_deref()
+                        .map(attachment::human_size)
+                        .unwrap_or_else(|| "n/a".into())
                 ),
                 "attachment deletion cancelled; use --yes for non-interactive deletion",
             )?;
@@ -2968,8 +2980,9 @@ fn emit_attachments(
                     .get("size_bytes")
                     .and_then(Value::as_str)
                     .map(attachment::human_size)
-                    .unwrap_or_else(|| "-".into());
+                    .unwrap_or_else(|| "n/a".into());
                 object.insert("size".into(), Value::String(size));
+                render_missing_attachment_fields_as_na(object);
             }
         }
         let fields = [
@@ -2989,11 +3002,28 @@ fn emit_attachment(
     output: &OutputConfig,
     attachment: servicenow_cli::api::AttachmentMetadata,
 ) -> Result<(), ApiError> {
-    let record = serde_json::to_value(attachment).map_err(|error| {
+    let mut record = serde_json::to_value(attachment).map_err(|error| {
         ApiError::Other(format!("failed to encode attachment metadata: {error}"))
     })?;
+    if !output.json
+        && let Some(object) = record.as_object_mut()
+    {
+        render_missing_attachment_fields_as_na(object);
+    }
     emit_record(output, record);
     Ok(())
+}
+
+/// Renders fields ServiceNow omitted (deserialized as `None`, serialized as
+/// `Value::Null`) as the text "n/a" instead of the generic record printer's
+/// placeholder for missing values, so the difference is visible without
+/// changing how JSON output represents them (as `null`).
+fn render_missing_attachment_fields_as_na(object: &mut serde_json::Map<String, Value>) {
+    for value in object.values_mut() {
+        if value.is_null() {
+            *value = Value::String("n/a".into());
+        }
+    }
 }
 
 async fn run_tables(

@@ -442,10 +442,10 @@ async fn attachment_lifecycle_uses_the_supported_attachment_api() {
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].file_name, "diagnostic.txt");
+    assert_eq!(listed[0].file_name.as_deref(), Some("diagnostic.txt"));
 
     let fetched = client.get_attachment(attachment_id).await.unwrap();
-    assert_eq!(fetched.content_type, "text/plain");
+    assert_eq!(fetched.content_type.as_deref(), Some("text/plain"));
 
     let mut downloaded = Vec::new();
     let bytes = client
@@ -456,4 +456,31 @@ async fn attachment_lifecycle_uses_the_supported_attachment_api() {
     assert_eq!(downloaded, b"hello world");
 
     client.delete_attachment(attachment_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn attachment_metadata_omitted_fields_deserialize_to_none() {
+    let server = MockServer::start().await;
+    let attachment_id = "fedcba9876543210fedcba9876543210";
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/attachment/{attachment_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": attachment_id
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let metadata = client(&server).get_attachment(attachment_id).await.unwrap();
+    assert_eq!(metadata.sys_id, attachment_id);
+    assert_eq!(metadata.file_name, None);
+    assert_eq!(metadata.content_type, None);
+    assert_eq!(metadata.size_bytes, None);
+    assert_eq!(metadata.table_name, None);
+    assert_eq!(metadata.table_sys_id, None);
+    assert_eq!(metadata.download_link, None);
+    assert_eq!(metadata.sys_created_by, None);
+    assert_eq!(metadata.sys_created_on, None);
 }

@@ -60,26 +60,23 @@ struct Envelope<T> {
     result: T,
 }
 
+/// ServiceNow attachment metadata as returned by the Attachment API.
+///
+/// Only `sys_id` is guaranteed present; deserialization fails clearly if it
+/// is missing. Every other field can legitimately be absent (most often an
+/// ACL hiding it), which is distinct from being present and empty, so those
+/// fields are `Option<String>` rather than defaulting to `""`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttachmentMetadata {
-    #[serde(default)]
     pub sys_id: String,
-    #[serde(default)]
-    pub file_name: String,
-    #[serde(default)]
-    pub content_type: String,
-    #[serde(default)]
-    pub size_bytes: String,
-    #[serde(default)]
-    pub table_name: String,
-    #[serde(default)]
-    pub table_sys_id: String,
-    #[serde(default)]
-    pub download_link: String,
-    #[serde(default)]
-    pub sys_created_by: String,
-    #[serde(default)]
-    pub sys_created_on: String,
+    pub file_name: Option<String>,
+    pub content_type: Option<String>,
+    pub size_bytes: Option<String>,
+    pub table_name: Option<String>,
+    pub table_sys_id: Option<String>,
+    pub download_link: Option<String>,
+    pub sys_created_by: Option<String>,
+    pub sys_created_on: Option<String>,
 }
 
 pub struct ServiceNowClient {

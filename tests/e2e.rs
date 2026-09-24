@@ -413,9 +413,9 @@ async fn pdi_attachment_lifecycle() {
     let attachment_id = uploaded.sys_id.clone();
 
     let verification: Result<(), ApiError> = async {
-        if uploaded.file_name != file_name
-            || uploaded.table_name != "incident"
-            || uploaded.table_sys_id != incident_id
+        if uploaded.file_name.as_deref() != Some(file_name.as_str())
+            || uploaded.table_name.as_deref() != Some("incident")
+            || uploaded.table_sys_id.as_deref() != Some(incident_id.as_str())
         {
             return Err(ApiError::Other(format!(
                 "unexpected uploaded attachment metadata: {uploaded:?}"
@@ -432,7 +432,9 @@ async fn pdi_attachment_lifecycle() {
         }
 
         let metadata = client.get_attachment(&attachment_id).await?;
-        if metadata.file_name != file_name || metadata.content_type != "text/plain" {
+        if metadata.file_name.as_deref() != Some(file_name.as_str())
+            || metadata.content_type.as_deref() != Some("text/plain")
+        {
             return Err(ApiError::Other(format!(
                 "unexpected fetched attachment metadata: {metadata:?}"
             )));

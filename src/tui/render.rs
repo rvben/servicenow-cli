@@ -118,23 +118,28 @@ pub(super) fn attachment_lines(
             lines.push(Line::raw(""));
             for attachment in attachments {
                 lines.push(Line::styled(
-                    safe_text(&attachment.file_name),
+                    safe_text(attachment.file_name.as_deref().unwrap_or("n/a")),
                     theme.field(),
                 ));
+                let size = attachment
+                    .size_bytes
+                    .as_deref()
+                    .map(human_size)
+                    .unwrap_or_else(|| "n/a".into());
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!(
                             "{}  ·  {}",
-                            safe_text(&human_size(&attachment.size_bytes)),
-                            safe_text(&attachment.content_type)
+                            safe_text(&size),
+                            safe_text(attachment.content_type.as_deref().unwrap_or("n/a"))
                         ),
                         theme.body(),
                     ),
                     Span::styled(
                         format!(
                             "  ·  {}  ·  {}",
-                            safe_text(&attachment.sys_created_on),
-                            safe_text(&attachment.sys_created_by)
+                            safe_text(attachment.sys_created_on.as_deref().unwrap_or("n/a")),
+                            safe_text(attachment.sys_created_by.as_deref().unwrap_or("n/a"))
                         ),
                         theme.muted(),
                     ),
@@ -1682,25 +1687,25 @@ mod tests {
             items: vec![
                 AttachmentMetadata {
                     sys_id: "fedcba9876543210fedcba9876543210".into(),
-                    file_name: "gateway-diagnostics.txt".into(),
-                    content_type: "text/plain".into(),
-                    size_bytes: "1536".into(),
-                    table_name: "incident".into(),
-                    table_sys_id: "0123456789abcdef0123456789abcdef".into(),
-                    download_link: String::new(),
-                    sys_created_by: "avery.stone".into(),
-                    sys_created_on: "2026-08-25 10:25:00".into(),
+                    file_name: Some("gateway-diagnostics.txt".into()),
+                    content_type: Some("text/plain".into()),
+                    size_bytes: Some("1536".into()),
+                    table_name: Some("incident".into()),
+                    table_sys_id: Some("0123456789abcdef0123456789abcdef".into()),
+                    download_link: None,
+                    sys_created_by: Some("avery.stone".into()),
+                    sys_created_on: Some("2026-08-25 10:25:00".into()),
                 },
                 AttachmentMetadata {
                     sys_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                    file_name: "malformed-size.txt".into(),
-                    content_type: "text/plain".into(),
-                    size_bytes: "not-a-size\u{1b}[31m".into(),
-                    table_name: "incident".into(),
-                    table_sys_id: "0123456789abcdef0123456789abcdef".into(),
-                    download_link: String::new(),
-                    sys_created_by: "system".into(),
-                    sys_created_on: "2026-08-25 10:26:00".into(),
+                    file_name: Some("malformed-size.txt".into()),
+                    content_type: Some("text/plain".into()),
+                    size_bytes: Some("not-a-size\u{1b}[31m".into()),
+                    table_name: Some("incident".into()),
+                    table_sys_id: Some("0123456789abcdef0123456789abcdef".into()),
+                    download_link: None,
+                    sys_created_by: Some("system".into()),
+                    sys_created_on: Some("2026-08-25 10:26:00".into()),
                 },
             ],
             truncated: false,
