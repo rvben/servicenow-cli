@@ -57,7 +57,7 @@ cargo install --path .
 ## Two-minute start
 
 ```sh
-# Detects SSO and opens a private browser window; no OAuth app is required.
+# Detects SSO and opens a browser sign-in window in a throwaway profile; no OAuth app is required.
 servicenow init --profile work --instance company
 
 # Managed OAuth remains available when your organization provides a client ID:

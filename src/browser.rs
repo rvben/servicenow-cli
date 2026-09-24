@@ -47,6 +47,8 @@ const USER_TOKEN_EXPRESSION: &str = r#"(() => {
 pub enum BrowserProgress {
     StartingPrivateBrowser,
     PrivateBrowserOpened,
+    StartingBrowserProfile,
+    BrowserProfileOpened,
     WaitingForBrowserChannel,
     BrowserChannelReady,
     WaitingForServiceNowPage,
@@ -66,6 +68,8 @@ impl BrowserProgress {
         match self {
             Self::StartingPrivateBrowser => "starting a private browser".into(),
             Self::PrivateBrowserOpened => "private browser opened".into(),
+            Self::StartingBrowserProfile => "starting a throwaway browser profile".into(),
+            Self::BrowserProfileOpened => "browser profile opened".into(),
             Self::WaitingForBrowserChannel => "waiting for the browser sign-in channel".into(),
             Self::BrowserChannelReady => "browser sign-in channel is ready".into(),
             Self::WaitingForServiceNowPage => "waiting for an authenticated ServiceNow page".into(),
@@ -231,7 +235,7 @@ async fn firefox_browser_cookie(
         .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
     std::fs::write(profile.path().join("user.js"), FIREFOX_PREFERENCES)
         .map_err(|error| ApiError::Other(format!("failed to create browser profile: {error}")))?;
-    progress.report(BrowserProgress::StartingPrivateBrowser);
+    progress.report(BrowserProgress::StartingBrowserProfile);
     let child = spawn_browser(
         browser,
         [
@@ -242,7 +246,7 @@ async fn firefox_browser_cookie(
             login_url(site_url),
         ],
     )?;
-    progress.report(BrowserProgress::PrivateBrowserOpened);
+    progress.report(BrowserProgress::BrowserProfileOpened);
     let mut process = NativeBrowser { child, profile };
     progress.report(BrowserProgress::WaitingForBrowserChannel);
     let socket = wait_for_bidi_socket(&mut process).await?;
