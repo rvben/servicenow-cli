@@ -1669,3 +1669,41 @@ fn attachment_delete_is_blocked_by_read_only_mode_before_network_access() {
             .contains("read-only")
     );
 }
+
+#[tokio::test]
+async fn a_conflict_response_exits_with_the_conflict_code() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": {"message": "Duplicate key", "detail": "Record already exists"}
+        })))
+        .mount(&server)
+        .await;
+
+    authenticated_command(&config_home, &server)
+        .args(["incidents", "list", "--limit", "1"])
+        .assert()
+        .code(7)
+        .stderr(predicate::str::contains("Record already exists"));
+}
+
+#[tokio::test]
+async fn a_rate_limited_response_exits_with_the_rate_limit_code() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/incident"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "error": {"message": "Rate limit exceeded", "detail": "Too many requests"}
+        })))
+        .mount(&server)
+        .await;
+
+    authenticated_command(&config_home, &server)
+        .args(["incidents", "list", "--limit", "1"])
+        .assert()
+        .code(6)
+        .stderr(predicate::str::contains("rate limit"));
+}

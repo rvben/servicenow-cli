@@ -295,6 +295,58 @@ async fn api_error_body_is_mapped_to_typed_error() {
 }
 
 #[tokio::test]
+async fn conflict_response_is_mapped_to_typed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+        ))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": {"message": "Duplicate key", "detail": "Record already exists"}
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .get_record(
+            "incident",
+            "0123456789abcdef0123456789abcdef",
+            None,
+            DisplayValue::False,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ApiError::Conflict(message) if message.contains("Record already exists"))
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_response_is_mapped_to_typed_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+        ))
+        .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "error": {"message": "Rate limit exceeded", "detail": "Too many requests"}
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .get_record(
+            "incident",
+            "0123456789abcdef0123456789abcdef",
+            None,
+            DisplayValue::False,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::RateLimit));
+}
+
+#[tokio::test]
 async fn rejects_path_injection_before_sending_request() {
     let server = MockServer::start().await;
     let error = client(&server)
