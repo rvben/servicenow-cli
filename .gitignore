@@ -5,3 +5,5 @@
 /ROADMAP.md
 *.swp
 .DS_Store
+/.uvlazy
+/.venv

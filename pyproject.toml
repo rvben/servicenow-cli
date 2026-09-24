@@ -18,6 +18,11 @@ Homepage = "https://github.com/rvben/servicenow-cli"
 Repository = "https://github.com/rvben/servicenow-cli"
 Issues = "https://github.com/rvben/servicenow-cli/issues"
 
+[dependency-groups]
+dev = [
+    "rumdl>=0.2.73; python_version >= '3.9'",
+]
+
 [tool.maturin]
 bindings = "bin"
 strip = true

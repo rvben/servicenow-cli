@@ -1,4 +1,4 @@
-.PHONY: build test test-e2e lint fmt check release install clean release-patch release-minor release-major
+.PHONY: build test test-e2e lint lint-md fmt check release install clean release-patch release-minor release-major
 
 build:
 	cargo build
@@ -14,9 +14,12 @@ test-e2e:
 	set +a; \
 	cargo test --test e2e -- --ignored --test-threads=1
 
-lint:
+lint: lint-md
 	cargo fmt -- --check
 	cargo clippy --all-targets -- -D warnings
+
+lint-md:
+	uv run --locked --only-group dev rumdl check .
 
 fmt:
 	cargo fmt
