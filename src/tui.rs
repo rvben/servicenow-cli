@@ -6,6 +6,8 @@
 // FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
 
 use std::collections::BTreeSet;
+use std::fmt;
+use std::future::Future;
 use std::io::{self, IsTerminal};
 use std::time::Duration;
 
@@ -211,6 +213,132 @@ struct PreparedIncidentAction {
     preview: Vec<(String, String)>,
 }
 
+/// Failure of a step that prepares an incident action: either ServiceNow
+/// rejected a call, or the operator cancelled while one was in flight. Kept
+/// distinct from `ApiError` because cancellation is not a ServiceNow error.
+#[derive(Debug)]
+enum ActionPrepError {
+    Api(ApiError),
+    Cancelled,
+}
+
+impl fmt::Display for ActionPrepError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Api(error) => write!(f, "{error}"),
+            Self::Cancelled => write!(f, "Cancelled."),
+        }
+    }
+}
+
+impl From<ApiError> for ActionPrepError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+/// Outcome of racing a network call against the operator's cancel key.
+enum RequestOutcome<T> {
+    Completed(T),
+    Cancelled,
+}
+
+/// Awaits `fut` unless `cancel` resolves first. Cancelling drops `fut`
+/// immediately, aborting whatever request it held; for a write that may
+/// already have reached the server, the caller must treat the outcome as
+/// unknown rather than as success or failure.
+async fn run_cancellable<T>(
+    fut: impl Future<Output = T>,
+    cancel: impl Future<Output = ()>,
+) -> RequestOutcome<T> {
+    tokio::select! {
+        result = fut => RequestOutcome::Completed(result),
+        () = cancel => RequestOutcome::Cancelled,
+    }
+}
+
+/// Awaits an API call, mapping a cancel to `ActionPrepError::Cancelled` so
+/// preparation steps can keep using `?`.
+async fn cancellable_api<T>(
+    fut: impl Future<Output = Result<T, ApiError>>,
+) -> Result<T, ActionPrepError> {
+    match run_cancellable(fut, wait_for_cancel_key()).await {
+        RequestOutcome::Completed(result) => Ok(result?),
+        RequestOutcome::Cancelled => Err(ActionPrepError::Cancelled),
+    }
+}
+
+#[cfg(not(test))]
+fn is_cancel_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Waits for the operator to press Esc or Ctrl-C, polling the terminal from a
+/// blocking task so the async runtime stays responsive while a request is in
+/// flight. Raced against a network call via `run_cancellable`.
+///
+/// The blocking task only peeks for input and the key is read here instead.
+/// A blocking task cannot be stopped once started, so if it read keys itself,
+/// one still polling after the request completed would swallow the next key
+/// meant for the main loop.
+///
+/// Every other key pressed while the request runs is read and discarded
+/// rather than replayed afterwards: the request usually replaces the rows and
+/// selection those keys were aimed at, so replaying them could move to or act
+/// on a different record than the operator saw.
+#[cfg(not(test))]
+async fn wait_for_cancel_key() {
+    loop {
+        let ready =
+            tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(50)).unwrap_or(false))
+                .await
+                .unwrap_or(false);
+        if ready
+            && let Ok(Event::Key(key)) = event::read()
+            && key.kind == KeyEventKind::Press
+            && is_cancel_key(key)
+        {
+            return;
+        }
+    }
+}
+
+// Real terminal polling can't run against the fake stdin in `cargo test`, so
+// tests arm a delay through `arm_test_cancel` and this resolves after it
+// elapses; with no delay armed it never resolves, matching "no cancel key
+// pressed" for every test that does not opt in.
+#[cfg(test)]
+thread_local! {
+    static TEST_CANCEL_DELAY: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct TestCancelGuard;
+
+#[cfg(test)]
+impl Drop for TestCancelGuard {
+    fn drop(&mut self) {
+        TEST_CANCEL_DELAY.with(|cell| cell.set(None));
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+fn arm_test_cancel(delay: Duration) -> TestCancelGuard {
+    TEST_CANCEL_DELAY.with(|cell| cell.set(Some(delay)));
+    TestCancelGuard
+}
+
+#[cfg(test)]
+async fn wait_for_cancel_key() {
+    let delay = TEST_CANCEL_DELAY.with(std::cell::Cell::get);
+    match delay {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending().await,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum NoticeKind {
     Quiet,
@@ -311,6 +439,24 @@ impl IncidentTab {
     }
 }
 
+/// How a load request ended. A cancelled load is neither a success nor a
+/// failure: the previous state stays on screen, so a caller must not describe
+/// it as current.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadOutcome {
+    Loaded,
+    Failed,
+    Cancelled,
+}
+
+/// The table, encoded query, and page a set of ledger rows was loaded for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LedgerView {
+    table: String,
+    query: Option<String>,
+    offset: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 enum PanelState<T> {
     #[default]
@@ -332,6 +478,7 @@ struct App {
     page_size: usize,
     offset: usize,
     records: Vec<Value>,
+    records_view: Option<LedgerView>,
     detail_record: Option<Value>,
     detail_record_sys_id: Option<String>,
     overview_error: Option<String>,
@@ -374,6 +521,7 @@ impl App {
             page_size: options.page_size,
             offset: 0,
             records: Vec::new(),
+            records_view: None,
             detail_record: None,
             detail_record_sys_id: None,
             overview_error: None,
@@ -402,9 +550,9 @@ impl App {
         }
     }
 
-    async fn load(&mut self, client: &ServiceNowClient) {
+    async fn load(&mut self, client: &ServiceNowClient) -> LoadOutcome {
         self.loading = true;
-        self.notice = Notice::quiet(format!("Loading {}…", self.table));
+        self.notice = Notice::quiet(format!("Loading {}… Esc cancels.", self.table));
         let fields = (self.table == "incident").then(|| {
             INCIDENT_LIST_FIELDS
                 .iter()
@@ -419,11 +567,17 @@ impl App {
             display_value: DisplayValue::All,
             ..ListOptions::default()
         };
-        match client.list_records(&self.table, &options).await {
-            Ok(mut records) => {
+        let outcome = match run_cancellable(
+            client.list_records(&self.table, &options),
+            wait_for_cancel_key(),
+        )
+        .await
+        {
+            RequestOutcome::Completed(Ok(mut records)) => {
                 self.has_next_page = records.len() > self.page_size;
                 records.truncate(self.page_size);
                 self.records = records;
+                self.records_view = Some(self.ledger_view());
                 self.clear_detail_record();
                 self.columns = infer_columns(&self.records, &self.table);
                 let visible_records = self.visible_record_count();
@@ -448,9 +602,11 @@ impl App {
                         if self.records.len() == 1 { "" } else { "s" }
                     ))
                 };
+                LoadOutcome::Loaded
             }
-            Err(error) => {
+            RequestOutcome::Completed(Err(error)) => {
                 self.records.clear();
+                self.records_view = Some(self.ledger_view());
                 self.columns.clear();
                 self.table_state.select(None);
                 self.has_next_page = false;
@@ -461,48 +617,80 @@ impl App {
                 } else {
                     Notice::error(format!("{error}. Press r to retry."))
                 };
+                LoadOutcome::Failed
             }
-        }
+            RequestOutcome::Cancelled => {
+                // A table, query, or page change selects the new view before
+                // loading it, so the rows on screen would otherwise sit under
+                // a view they were not loaded for.
+                if self.records_view.as_ref() != Some(&self.ledger_view()) {
+                    self.records.clear();
+                    self.records_view = None;
+                    self.columns.clear();
+                    self.clear_detail_record();
+                    self.table_state.select(None);
+                    self.has_next_page = false;
+                }
+                self.notice = Notice::quiet("Cancelled. Press r to retry.");
+                LoadOutcome::Cancelled
+            }
+        };
         self.loading = false;
+        outcome
     }
 
-    async fn load_detail(&mut self, client: &ServiceNowClient) {
+    async fn load_detail(&mut self, client: &ServiceNowClient) -> LoadOutcome {
         let Some(sys_id) = self
             .selected_record()
             .and_then(record_sys_id)
             .map(str::to_string)
         else {
             self.notice = Notice::error("This record has no usable sys_id.");
-            return;
+            return LoadOutcome::Failed;
         };
         self.detail_loading = true;
         self.overview_error = None;
-        self.notice = Notice::quiet("Reading the complete record sheet…");
-        match client
-            .get_record(&self.table, &sys_id, None, DisplayValue::All)
-            .await
+        self.notice = Notice::quiet("Reading the complete record sheet… Esc cancels.");
+        let outcome = match run_cancellable(
+            client.get_record(&self.table, &sys_id, None, DisplayValue::All),
+            wait_for_cancel_key(),
+        )
+        .await
         {
-            Ok(record) => {
+            RequestOutcome::Completed(Ok(record)) => {
                 self.detail_record = Some(record);
                 self.detail_record_sys_id = Some(sys_id);
                 self.overview_error = None;
                 self.notice = Notice::success("Complete record loaded.");
+                LoadOutcome::Loaded
             }
-            Err(error) => {
+            RequestOutcome::Completed(Err(error)) => {
                 self.detail_record = None;
                 self.detail_record_sys_id = None;
                 let message = format!("Could not load the complete record: {error}");
                 self.overview_error = Some(message.clone());
                 self.notice = Notice::error(format!("{message}. Showing index fields only."));
+                LoadOutcome::Failed
             }
-        }
+            RequestOutcome::Cancelled => {
+                self.detail_record = None;
+                self.detail_record_sys_id = None;
+                self.overview_error = None;
+                self.notice = Notice::quiet("Cancelled. The complete record was not loaded.");
+                LoadOutcome::Cancelled
+            }
+        };
         self.detail_loading = false;
+        outcome
     }
 
-    async fn load_incident_tab(&mut self, client: &ServiceNowClient, tab: IncidentTab) {
+    async fn load_incident_tab(
+        &mut self,
+        client: &ServiceNowClient,
+        tab: IncidentTab,
+    ) -> LoadOutcome {
         if tab == IncidentTab::Overview {
-            self.load_detail(client).await;
-            return;
+            return self.load_detail(client).await;
         }
         let Some(sys_id) = self
             .selected_record()
@@ -519,7 +707,7 @@ impl App {
                 IncidentTab::Slas => self.slas = PanelState::Failed(message.clone()),
             }
             self.notice = Notice::error(message);
-            return;
+            return LoadOutcome::Failed;
         };
         match tab {
             IncidentTab::Overview => unreachable!(),
@@ -544,8 +732,13 @@ impl App {
                     display_value: DisplayValue::All,
                     ..ListOptions::default()
                 };
-                match client.list_records("sys_journal_field", &options).await {
-                    Ok(entries) => {
+                match run_cancellable(
+                    client.list_records("sys_journal_field", &options),
+                    wait_for_cancel_key(),
+                )
+                .await
+                {
+                    RequestOutcome::Completed(Ok(entries)) => {
                         self.activity = bounded_panel(entries);
                         let count = panel_count(&self.activity).unwrap_or(0);
                         self.notice = related_loaded_notice(
@@ -554,20 +747,29 @@ impl App {
                             "activity entry",
                             "activity entries",
                         );
+                        LoadOutcome::Loaded
                     }
-                    Err(error) => {
+                    RequestOutcome::Completed(Err(error)) => {
                         let message = format!("Could not load incident activity: {error}");
                         self.activity = PanelState::Failed(message.clone());
                         self.notice = Notice::error(message);
+                        LoadOutcome::Failed
+                    }
+                    RequestOutcome::Cancelled => {
+                        self.activity = PanelState::Idle;
+                        self.notice = Notice::quiet("Cancelled. Activity was not loaded.");
+                        LoadOutcome::Cancelled
                     }
                 }
             }
             IncidentTab::Attachments => {
-                match client
-                    .list_attachments("incident", &sys_id, RELATED_VIEW_LIMIT + 1, false)
-                    .await
+                match run_cancellable(
+                    client.list_attachments("incident", &sys_id, RELATED_VIEW_LIMIT + 1, false),
+                    wait_for_cancel_key(),
+                )
+                .await
                 {
-                    Ok(attachments) => {
+                    RequestOutcome::Completed(Ok(attachments)) => {
                         self.attachments = bounded_panel(attachments);
                         let count = panel_count(&self.attachments).unwrap_or(0);
                         self.notice = related_loaded_notice(
@@ -576,11 +778,18 @@ impl App {
                             "attachment",
                             "attachments",
                         );
+                        LoadOutcome::Loaded
                     }
-                    Err(error) => {
+                    RequestOutcome::Completed(Err(error)) => {
                         let message = format!("Could not load incident attachments: {error}");
                         self.attachments = PanelState::Failed(message.clone());
                         self.notice = Notice::error(message);
+                        LoadOutcome::Failed
+                    }
+                    RequestOutcome::Cancelled => {
+                        self.attachments = PanelState::Idle;
+                        self.notice = Notice::quiet("Cancelled. Attachments were not loaded.");
+                        LoadOutcome::Cancelled
                     }
                 }
             }
@@ -609,8 +818,13 @@ impl App {
                     display_value: DisplayValue::All,
                     ..ListOptions::default()
                 };
-                match client.list_records("task_sla", &options).await {
-                    Ok(slas) => {
+                match run_cancellable(
+                    client.list_records("task_sla", &options),
+                    wait_for_cancel_key(),
+                )
+                .await
+                {
+                    RequestOutcome::Completed(Ok(slas)) => {
                         self.slas = bounded_panel(slas);
                         let count = panel_count(&self.slas).unwrap_or(0);
                         self.notice = related_loaded_notice(
@@ -619,11 +833,18 @@ impl App {
                             "SLA",
                             "SLAs",
                         );
+                        LoadOutcome::Loaded
                     }
-                    Err(error) => {
+                    RequestOutcome::Completed(Err(error)) => {
                         let message = format!("Could not load incident SLAs: {error}");
                         self.slas = PanelState::Failed(message.clone());
                         self.notice = Notice::error(message);
+                        LoadOutcome::Failed
+                    }
+                    RequestOutcome::Cancelled => {
+                        self.slas = PanelState::Idle;
+                        self.notice = Notice::quiet("Cancelled. SLAs were not loaded.");
+                        LoadOutcome::Cancelled
                     }
                 }
             }
@@ -749,7 +970,7 @@ impl App {
         client: &ServiceNowClient,
         form: IncidentActionForm,
     ) {
-        self.notice = Notice::quiet(form.kind.progress());
+        self.notice = Notice::quiet(format!("{} Esc cancels.", form.kind.progress()));
         let prepared = self
             .build_prepared_incident_action(client, form.clone())
             .await;
@@ -759,7 +980,11 @@ impl App {
                 self.action_review_scroll = 0;
                 self.overlay = Overlay::IncidentActionReview(prepared);
             }
-            Err(error) => {
+            Err(ActionPrepError::Cancelled) => {
+                self.notice = Notice::quiet("Cancelled.");
+                self.overlay = Overlay::IncidentActionForm(form);
+            }
+            Err(error @ ActionPrepError::Api(_)) => {
                 self.notice = Notice::error(error.to_string());
                 self.overlay = Overlay::IncidentActionForm(form);
             }
@@ -770,7 +995,7 @@ impl App {
         &mut self,
         client: &ServiceNowClient,
         form: IncidentActionForm,
-    ) -> Result<PreparedIncidentAction, ApiError> {
+    ) -> Result<PreparedIncidentAction, ActionPrepError> {
         let (body, preview) = match form.kind {
             IncidentActionKind::Note => {
                 let note = form.fields[0].value.clone();
@@ -784,19 +1009,31 @@ impl App {
                 let mut body = Map::new();
                 let mut preview = Vec::new();
                 if let Some(value) = assignee {
-                    let record =
-                        metadata::resolve_reference(client, ReferenceKind::User, value).await?;
+                    let record = cancellable_api(metadata::resolve_reference(
+                        client,
+                        ReferenceKind::User,
+                        value,
+                    ))
+                    .await?;
                     let sys_id = record_sys_id(&record).ok_or_else(|| {
-                        ApiError::Other("resolved user has no usable sys_id".into())
+                        ActionPrepError::Api(ApiError::Other(
+                            "resolved user has no usable sys_id".into(),
+                        ))
                     })?;
                     body.insert("assigned_to".into(), Value::String(sys_id.into()));
                     preview.push(("ASSIGNEE".into(), record_title(&record)));
                 }
                 if let Some(value) = group {
-                    let record =
-                        metadata::resolve_reference(client, ReferenceKind::Group, value).await?;
+                    let record = cancellable_api(metadata::resolve_reference(
+                        client,
+                        ReferenceKind::Group,
+                        value,
+                    ))
+                    .await?;
                     let sys_id = record_sys_id(&record).ok_or_else(|| {
-                        ApiError::Other("resolved group has no usable sys_id".into())
+                        ActionPrepError::Api(ApiError::Other(
+                            "resolved group has no usable sys_id".into(),
+                        ))
                     })?;
                     body.insert("assignment_group".into(), Value::String(sys_id.into()));
                     preview.push(("ASSIGNMENT GROUP".into(), record_title(&record)));
@@ -812,21 +1049,20 @@ impl App {
                 } else if let Some(metadata) = metadata::load(&self.profile, "incident")? {
                     metadata
                 } else {
-                    metadata::sync_table(client, &self.profile, "incident").await?
+                    cancellable_api(metadata::sync_table(client, &self.profile, "incident")).await?
                 };
                 self.incident_metadata = Some(metadata.clone());
                 let body = incident::resolution_body(&metadata, code, notes.clone(), None)?;
                 let resolved_state = body["state"]
                     .as_str()
                     .expect("resolution state is a string");
-                let current = client
-                    .get_record(
-                        "incident",
-                        &form.target.sys_id,
-                        Some(&["sys_id".into(), "number".into(), "state".into()]),
-                        DisplayValue::All,
-                    )
-                    .await?;
+                let current = cancellable_api(client.get_record(
+                    "incident",
+                    &form.target.sys_id,
+                    Some(&["sys_id".into(), "number".into(), "state".into()]),
+                    DisplayValue::All,
+                ))
+                .await?;
                 incident::require_resolvable(&current, resolved_state, &metadata)?;
                 let resolution_code = body["close_code"]
                     .as_str()
@@ -886,40 +1122,81 @@ impl App {
                     )
                     .await?;
                 incident::require_resolvable(&current, resolved_state, metadata)
+            };
+            match run_cancellable(recheck, wait_for_cancel_key()).await {
+                RequestOutcome::Completed(Ok(())) => {}
+                RequestOutcome::Completed(Err(error)) => {
+                    self.notice = Notice::error(format!(
+                        "Could not apply resolution after rechecking the incident: {error}"
+                    ));
+                    self.overlay = Overlay::IncidentActionReview(prepared);
+                    return;
+                }
+                RequestOutcome::Cancelled => {
+                    self.notice = Notice::quiet("Cancelled. The resolution was not applied.");
+                    self.overlay = Overlay::IncidentActionReview(prepared);
+                    return;
+                }
             }
-            .await;
-            if let Err(error) = recheck {
+        }
+        self.notice = Notice::quiet(format!(
+            "Applying {}… Esc cancels.",
+            prepared.form.kind.label()
+        ));
+        // A cancelled write may or may not have already reached ServiceNow, so
+        // its outcome is unknown rather than a failure: fall through to refresh
+        // the ledger instead of returning, and never claim success or failure
+        // for this action below.
+        let write_cancelled = match run_cancellable(
+            client.update_record("incident", &prepared.form.target.sys_id, &prepared.body),
+            wait_for_cancel_key(),
+        )
+        .await
+        {
+            RequestOutcome::Completed(Ok(_)) => false,
+            RequestOutcome::Completed(Err(error)) => {
                 self.notice = Notice::error(format!(
-                    "Could not apply resolution after rechecking the incident: {error}"
+                    "Could not apply {}: {error}",
+                    prepared.form.kind.label().to_ascii_lowercase()
                 ));
                 self.overlay = Overlay::IncidentActionReview(prepared);
                 return;
             }
-        }
-        self.notice = Notice::quiet(format!("Applying {}…", prepared.form.kind.label()));
-        if let Err(error) = client
-            .update_record("incident", &prepared.form.target.sys_id, &prepared.body)
-            .await
-        {
-            self.notice = Notice::error(format!(
-                "Could not apply {}: {error}",
-                prepared.form.kind.label().to_ascii_lowercase()
-            ));
-            self.overlay = Overlay::IncidentActionReview(prepared);
-            return;
-        }
+            RequestOutcome::Cancelled => true,
+        };
 
         let success = prepared.form.kind.success(&prepared.form.target.title);
         let target_sys_id = prepared.form.target.sys_id.clone();
         let return_tab = prepared.form.target.return_tab;
+        let unknown_outcome = format!(
+            "Cancelled while applying {}. ServiceNow may or may not have received the update \
+             before the connection was cancelled, so the outcome is unknown.",
+            prepared.form.kind.label().to_ascii_lowercase()
+        );
         self.overlay = Overlay::None;
-        self.load(client).await;
-        if self.load_failed {
-            self.notice = Notice::error(format!(
-                "{success} The ledger refresh failed; press r to retry."
-            ));
-            return;
+        match self.load(client).await {
+            LoadOutcome::Loaded => {}
+            LoadOutcome::Failed => {
+                self.notice = Notice::error(if write_cancelled {
+                    format!("{unknown_outcome} The ledger refresh also failed; press r to retry.")
+                } else {
+                    format!("{success} The ledger refresh failed; press r to retry.")
+                });
+                return;
+            }
+            LoadOutcome::Cancelled => {
+                self.notice = Notice::quiet(if write_cancelled {
+                    format!(
+                        "{unknown_outcome} The ledger refresh was also cancelled; press r to reload."
+                    )
+                } else {
+                    format!("{success} The ledger refresh was cancelled; press r to reload.")
+                });
+                return;
+            }
         }
+        let unknown_outcome_current_ledger =
+            format!("{unknown_outcome} The ledger below reflects the current state.");
 
         let selected = self.matching_record_indices().position(|record_index| {
             self.records
@@ -929,21 +1206,29 @@ impl App {
         });
         let Some(selected) = selected else {
             self.table_state.select(None);
-            self.notice =
-                Notice::success(format!("{success} It no longer matches this ledger view."));
+            self.notice = if write_cancelled {
+                Notice::quiet(unknown_outcome_current_ledger)
+            } else {
+                Notice::success(format!("{success} It no longer matches this ledger view."))
+            };
             return;
         };
         self.table_state.select(Some(selected));
 
+        if write_cancelled {
+            self.notice = Notice::quiet(unknown_outcome_current_ledger);
+            return;
+        }
+
         if let Some(tab) = return_tab {
             self.overlay = Overlay::Detail;
             self.detail_loading = true;
-            self.load_detail(client).await;
+            let mut reload = self.load_detail(client).await;
             let overview_error = self.overview_error.clone();
-            if tab != IncidentTab::Overview {
+            if tab != IncidentTab::Overview && reload != LoadOutcome::Cancelled {
                 self.incident_tab = tab;
                 self.detail_scroll = 0;
-                self.load_incident_tab(client, tab).await;
+                reload = self.load_incident_tab(client, tab).await;
             }
             // An error from load_detail must survive a later successful
             // load_incident_tab call, which otherwise overwrites self.notice
@@ -951,6 +1236,12 @@ impl App {
             if let Some(overview_error) = overview_error {
                 self.notice = Notice::error(format!(
                     "{success} {overview_error}. Showing index fields only."
+                ));
+                return;
+            }
+            if reload == LoadOutcome::Cancelled {
+                self.notice = Notice::quiet(format!(
+                    "{success} The incident reload was cancelled, so it may be out of date."
                 ));
                 return;
             }
@@ -1272,7 +1563,8 @@ impl App {
                         Action::None
                     } else {
                         self.detail_loading = true;
-                        self.notice = Notice::quiet("Reading the complete record sheet…");
+                        self.notice =
+                            Notice::quiet("Reading the complete record sheet… Esc cancels.");
                         Action::LoadDetail
                     }
                 }
@@ -1354,6 +1646,14 @@ impl App {
         }
     }
 
+    fn ledger_view(&self) -> LedgerView {
+        LedgerView {
+            table: self.table.clone(),
+            query: self.query.clone(),
+            offset: self.offset,
+        }
+    }
+
     fn clear_detail_record(&mut self) {
         self.detail_record = None;
         self.detail_record_sys_id = None;
@@ -1380,19 +1680,19 @@ impl App {
         match tab {
             IncidentTab::Overview => {
                 self.detail_loading = true;
-                self.notice = Notice::quiet("Reading the complete record sheet…");
+                self.notice = Notice::quiet("Reading the complete record sheet… Esc cancels.");
             }
             IncidentTab::Activity => {
                 self.activity = PanelState::Loading;
-                self.notice = Notice::quiet("Reading comments and work notes…");
+                self.notice = Notice::quiet("Reading comments and work notes… Esc cancels.");
             }
             IncidentTab::Attachments => {
                 self.attachments = PanelState::Loading;
-                self.notice = Notice::quiet("Reading incident attachments…");
+                self.notice = Notice::quiet("Reading incident attachments… Esc cancels.");
             }
             IncidentTab::Slas => {
                 self.slas = PanelState::Loading;
-                self.notice = Notice::quiet("Reading incident SLAs…");
+                self.notice = Notice::quiet("Reading incident SLAs… Esc cancels.");
             }
         }
         Action::LoadIncidentTab(tab)
@@ -2517,20 +2817,24 @@ pub async fn run(
                 app.open_incident_actions(return_to_detail);
             }
             Action::PrepareIncident(form) => {
-                app.notice = Notice::quiet(form.kind.progress());
+                app.notice = Notice::quiet(format!("{} Esc cancels.", form.kind.progress()));
                 terminal
                     .draw(|frame| app.render(frame))
                     .map_err(terminal_error)?;
                 app.prepare_incident_action(client, form).await;
             }
             Action::ExecuteIncident(prepared) => {
-                app.notice = Notice::quiet(format!("Applying {}…", prepared.form.kind.label()));
+                app.notice = Notice::quiet(format!(
+                    "Applying {}… Esc cancels.",
+                    prepared.form.kind.label()
+                ));
                 terminal
                     .draw(|frame| app.render(frame))
                     .map_err(terminal_error)?;
                 app.execute_incident_action(client, config, prepared).await;
             }
             Action::Load => {
+                app.notice = Notice::quiet(format!("Loading {}… Esc cancels.", app.table));
                 terminal
                     .draw(|frame| app.render(frame))
                     .map_err(terminal_error)?;
@@ -3533,6 +3837,7 @@ mod tests {
             "sys_updated_on": {"value": "2026-08-25 10:15:00", "display_value": "2026-08-25 10:15:00"},
             "u_api_token": "never-rendered"
         })];
+        app.records_view = Some(app.ledger_view());
         app.columns = infer_columns(&app.records, &app.table);
         app.table_state.select(Some(0));
         app.notice = Notice::success("Loaded 1 record");
@@ -3705,6 +4010,67 @@ mod tests {
         assert_eq!(form.fields[0].value, "Solved (Permanently)");
         assert_eq!(form.fields[1].value, "Corrected the mail gateway");
         assert_eq!(form.target.return_tab, Some(IncidentTab::Overview));
+    }
+
+    async fn cancel_a_slow_load(app: &mut App) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({"result": []})),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let _cancel = arm_test_cancel(Duration::from_millis(50));
+        let outcome = app.load(&client).await;
+        assert_eq!(outcome, LoadOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_refresh_of_the_same_view_keeps_its_rows() {
+        let mut app = app();
+
+        cancel_a_slow_load(&mut app).await;
+
+        assert_eq!(app.records.len(), 1);
+        assert_eq!(app.table_state.selected(), Some(0));
+        assert!(app.selected_record().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_load_for_a_new_view_drops_rows_from_the_old_one() {
+        for change in ["table", "query", "page"] {
+            let mut app = app();
+            let action = match change {
+                "table" => {
+                    app.overlay = Overlay::TableInput("cmdb_ci".into());
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                }
+                "query" => {
+                    app.overlay = Overlay::QueryInput("active=false".into());
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                }
+                _ => {
+                    app.has_next_page = true;
+                    app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+                }
+            };
+            assert_eq!(action, Action::Load, "{change}");
+
+            cancel_a_slow_load(&mut app).await;
+
+            assert!(
+                app.records.is_empty(),
+                "rows loaded for the previous {change} must not be shown under the new one"
+            );
+            assert!(app.selected_record().is_none(), "{change}");
+            assert!(!app.has_next_page, "{change}");
+            assert!(app.notice.text.contains("Cancelled"), "{change}");
+        }
     }
 
     #[tokio::test]
@@ -4048,6 +4414,300 @@ mod tests {
             app.notice
         );
         assert!(app.notice.text.contains("Detail lookup failed"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_read_returns_promptly_with_a_cancelled_notice() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({"result": []})),
+            )
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let mut app = app();
+        let _cancel = arm_test_cancel(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        app.load(&client).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancellation should return well before the mocked 5s delay, took {elapsed:?}"
+        );
+        assert_eq!(app.notice.kind, NoticeKind::Quiet);
+        assert!(app.notice.text.contains("Cancelled"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_write_reports_an_unknown_outcome_and_refreshes_the_ledger() {
+        let server = MockServer::start().await;
+        let body = incident::work_note_body("Investigating the gateway".into()).unwrap();
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({
+                        "result": {"sys_id": "0123456789abcdef0123456789abcdef"}
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": [{
+                    "sys_id": "0123456789abcdef0123456789abcdef",
+                    "number": "INC0010001",
+                    "state": {"value": "2", "display_value": "In Progress"}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let config = Config::for_test(&server.uri(), false);
+        let mut app = app();
+        let prepared = PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Note, None),
+            body,
+            preview: vec![("WORK NOTE".into(), "Investigating the gateway".into())],
+        };
+        let _cancel = arm_test_cancel(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        app.execute_incident_action(&client, &config, prepared)
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancellation should return well before the mocked 5s delay, took {elapsed:?}"
+        );
+        assert_eq!(app.notice.kind, NoticeKind::Quiet);
+        assert!(
+            app.notice.text.contains("unknown"),
+            "a cancelled write must say the outcome is unknown, got: {:?}",
+            app.notice.text
+        );
+        assert!(
+            !app.notice.text.contains("Added a work note"),
+            "a cancelled write must not claim success, got: {:?}",
+            app.notice.text
+        );
+        assert!(
+            !app.notice.text.to_lowercase().contains("failed"),
+            "a cancelled write must not claim failure, got: {:?}",
+            app.notice.text
+        );
+        assert!(
+            app.notice.text.contains("reflects the current state"),
+            "a completed refresh after a cancelled write vouches for the ledger, got: {:?}",
+            app.notice.text
+        );
+    }
+
+    async fn mount_note_patch(server: &MockServer, delay: Duration) {
+        Mock::given(method("PATCH"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_json(
+                serde_json::json!({
+                    "result": {"sys_id": "0123456789abcdef0123456789abcdef"}
+                }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_ledger(server: &MockServer, delay: Duration) {
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_json(
+                serde_json::json!({
+                    "result": [{
+                        "sys_id": "0123456789abcdef0123456789abcdef",
+                        "number": "INC0010001",
+                        "state": {"value": "6", "display_value": "Resolved"}
+                    }]
+                }),
+            ))
+            .mount(server)
+            .await;
+    }
+
+    fn ledger_state(app: &App) -> &str {
+        app.records[0]["state"]["display_value"]
+            .as_str()
+            .unwrap_or_default()
+    }
+
+    async fn run_note_action(server: &MockServer, return_tab: Option<IncidentTab>) -> App {
+        let client =
+            ServiceNowClient::new(&server.uri(), Some("api-user"), "secret", AuthType::Basic)
+                .unwrap();
+        let config = Config::for_test(&server.uri(), false);
+        let mut app = app();
+        let prepared = PreparedIncidentAction {
+            form: action_form(IncidentActionKind::Note, return_tab),
+            body: incident::work_note_body("Investigating the gateway".into()).unwrap(),
+            preview: vec![("WORK NOTE".into(), "Investigating the gateway".into())],
+        };
+        let _cancel = arm_test_cancel(Duration::from_millis(50));
+        app.execute_incident_action(&client, &config, prepared)
+            .await;
+        app
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_refresh_after_a_write_does_not_claim_a_current_ledger() {
+        let server = MockServer::start().await;
+        mount_note_patch(&server, Duration::ZERO).await;
+        mount_ledger(&server, Duration::from_secs(5)).await;
+
+        let app = run_note_action(&server, None).await;
+
+        assert_eq!(
+            ledger_state(&app),
+            "In Progress",
+            "the refresh was cancelled"
+        );
+        assert_ne!(
+            app.notice.kind,
+            NoticeKind::Success,
+            "a bare success notice hides that the ledger is stale, got: {:?}",
+            app.notice
+        );
+        assert!(
+            app.notice.text.contains("Added a work note to INC0010001."),
+            "the write itself completed, got: {:?}",
+            app.notice.text
+        );
+        assert!(
+            app.notice.text.contains("refresh was cancelled"),
+            "the notice must say the ledger was not refreshed, got: {:?}",
+            app.notice.text
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_both_the_write_and_the_refresh_keeps_the_outcome_unknown() {
+        let server = MockServer::start().await;
+        mount_note_patch(&server, Duration::from_secs(5)).await;
+        mount_ledger(&server, Duration::from_secs(5)).await;
+
+        let app = run_note_action(&server, None).await;
+
+        assert_eq!(
+            ledger_state(&app),
+            "In Progress",
+            "the refresh was cancelled"
+        );
+        assert_eq!(app.notice.kind, NoticeKind::Quiet);
+        assert!(
+            app.notice.text.contains("unknown"),
+            "a cancelled write must say the outcome is unknown, got: {:?}",
+            app.notice.text
+        );
+        assert!(
+            !app.notice.text.contains("reflects the current state"),
+            "an unrefreshed ledger must not be described as current, got: {:?}",
+            app.notice.text
+        );
+        assert!(
+            app.notice.text.contains("refresh was also cancelled"),
+            "the notice must say the ledger was not refreshed, got: {:?}",
+            app.notice.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_after_a_cancelled_write_is_reported_as_an_error() {
+        let server = MockServer::start().await;
+        mount_note_patch(&server, Duration::from_secs(5)).await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/incident"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {"message": "Ledger lookup failed"}
+            })))
+            .mount(&server)
+            .await;
+
+        let app = run_note_action(&server, None).await;
+
+        assert_eq!(
+            app.notice.kind,
+            NoticeKind::Error,
+            "a refresh that failed outright is an error, got: {:?}",
+            app.notice
+        );
+        assert!(
+            app.notice.text.contains("unknown") && app.notice.text.contains("also failed"),
+            "the notice must keep the unknown write outcome and the refresh failure, got: {:?}",
+            app.notice.text
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_incident_reload_after_a_write_skips_the_tab_and_says_so() {
+        let server = MockServer::start().await;
+        mount_note_patch(&server, Duration::ZERO).await;
+        mount_ledger(&server, Duration::ZERO).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/now/table/incident/0123456789abcdef0123456789abcdef",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({"result": {}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_journal_field"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let app = run_note_action(&server, Some(IncidentTab::Activity)).await;
+
+        assert_eq!(
+            ledger_state(&app),
+            "Resolved",
+            "the ledger refresh completed"
+        );
+        assert_ne!(
+            app.notice.kind,
+            NoticeKind::Success,
+            "a bare success notice hides that the incident was not reloaded, got: {:?}",
+            app.notice
+        );
+        assert!(
+            app.notice.text.contains("Added a work note to INC0010001."),
+            "the write itself completed, got: {:?}",
+            app.notice.text
+        );
+        assert!(
+            app.notice.text.contains("reload was cancelled"),
+            "the notice must say the incident was not reloaded, got: {:?}",
+            app.notice.text
+        );
     }
 
     #[test]
