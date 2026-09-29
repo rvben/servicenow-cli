@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.5.3](https://github.com/rvben/servicenow-cli/compare/v0.5.2...v0.5.3) - 2026-09-29
+
+### Fixed
+
+- **auth**: streamline browser login on WSL2 ([651ea8e](https://github.com/rvben/servicenow-cli/commit/651ea8e30edd5c13dd38a63de129954becc48cb1))
+
 ## [0.5.2](https://github.com/rvben/servicenow-cli/compare/v0.5.1...v0.5.2) - 2026-09-24
 
 ### Added
