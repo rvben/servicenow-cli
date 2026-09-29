@@ -64,10 +64,10 @@ and for the Windows Edge/Chrome fallback (see
 loopback-port exposure, because the pipe transport cannot cross the
 WSL/PowerShell process boundary. Complete the normal SSO and
 MFA flow in that window. A managed Windows device can still authenticate
-silently through Entra device SSO, even in a private window, so setup displays
-the resolved ServiceNow name and username for confirmation before storing
-anything. The CLI retains only cookies valid for the requested ServiceNow
-hostname and API path, validates them against the Table API, closes the private
+silently through Entra device SSO, even in a private window. Setup displays
+the resolved ServiceNow name and username after verifying the session. The CLI
+retains only cookies valid for the requested ServiceNow hostname and API path,
+validates them against the Table API, closes the private
 browser, and removes its temporary profile. Identity-provider cookies—including
 Microsoft Entra cookies—are never retained by the CLI. The resulting ServiceNow
 cookie and anti-CSRF user token are protected like any other credential. This uses
@@ -143,13 +143,12 @@ status codes. It never includes URLs, cookies, tokens, usernames, executable
 paths, PowerShell output, or browser page content.
 
 WSL2 and minimal Linux installations often have no Secret Service provider.
-After browser authentication succeeds, setup explains the problem and offers to
-store the credential in the CLI config file instead. The file is created with
-mode `0600` on Unix, but the credential is plaintext, so setup asks before
-writing it. Cancelling or failing browser sign-in writes nothing and does not
-show the storage prompt.
+After authentication succeeds, setup automatically stores the credential in the
+CLI config file and warns where it was saved. The file is created with mode
+`0600` on Unix, but the credential is plaintext. Cancelling or failing browser
+sign-in writes nothing.
 
-For non-interactive setup, opt in explicitly:
+To select file storage explicitly:
 
 ```sh
 servicenow init --profile work --insecure-storage \

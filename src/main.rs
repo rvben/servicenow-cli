@@ -1566,21 +1566,7 @@ async fn run_auth_login(
     }
     if matches!(method, AuthType::Browser) {
         let identity = browser_identity.unwrap_or_else(|| "your ServiceNow account".into());
-        if output.format == OutputFormat::Text && std::io::stdin().is_terminal() {
-            let accepted = Confirm::new()
-                .with_prompt(format!("Continue as {identity}?"))
-                .default(true)
-                .interact()
-                .map_err(|error| {
-                    ApiError::Other(format!("failed to confirm browser identity: {error}"))
-                })?;
-            if !accepted {
-                return Err(ApiError::InvalidInput(
-                    "browser sign-in cancelled; no credential was stored. To use another account, set SERVICENOW_BROWSER to a browser without automatic work-account sign-in and retry"
-                        .into(),
-                ));
-            }
-        } else if output.format == OutputFormat::Text {
+        if output.format == OutputFormat::Text {
             output.success(&format!("Browser sign-in complete as {identity}"));
         }
         if let Some(cookie) = client.refreshed_browser_cookie()
@@ -1845,32 +1831,13 @@ fn choose_credential_storage(insecure_storage: bool) -> Result<bool, ApiError> {
     }
     match credentials::available() {
         Ok(()) => Ok(false),
-        Err(error) if std::io::stdin().is_terminal() => {
-            eprintln!("warning: {error}");
-            let confirmed = Confirm::new()
-                .with_prompt(format!(
-                    "Store the credential in plaintext in {} (mode 0600) instead?",
-                    config_path().display()
-                ))
-                .default(false)
-                .interact()
-                .map_err(|prompt_error| {
-                    ApiError::Other(format!(
-                        "failed to choose credential storage: {prompt_error}"
-                    ))
-                })?;
-            if confirmed {
-                Ok(true)
-            } else {
-                Err(ApiError::InvalidInput(
-                    "credential storage was cancelled; start a Secret Service provider or use environment variables"
-                        .into(),
-                ))
-            }
+        Err(error) => {
+            eprintln!(
+                "warning: {error}; storing the credential in plaintext in {} (protected with mode 0600 on Unix)",
+                config_path().display()
+            );
+            Ok(true)
         }
-        Err(error) => Err(ApiError::InvalidInput(format!(
-            "{error}; rerun with --insecure-storage to use the protected config file, or use environment variables"
-        ))),
     }
 }
 

@@ -64,7 +64,8 @@ servicenow init --profile work --instance company
 servicenow auth login --profile work --instance company --method oauth \
   --client-id YOUR_CLIENT_ID
 
-# On headless Linux/WSL2, choose the permission-locked file fallback directly:
+# On headless Linux/WSL2, the CLI uses a protected file if no keychain is available.
+# You can also select file storage directly:
 servicenow init --profile work --instance company --insecure-storage
 
 servicenow auth status
