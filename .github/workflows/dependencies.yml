@@ -21,7 +21,8 @@ jobs:
       max-bump: minor
       prepare-command: >-
         rustup toolchain install 1.98.1 --profile minimal --component clippy,rustfmt &&
-        rustup default 1.98.1
+        rustup default 1.98.1 &&
+        pipx install uv==0.12.21
       validation-command: make check
       fail-on-blocked: false
       branch: deps/upd
