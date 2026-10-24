@@ -36,6 +36,16 @@ $ servicenow incidents mine
 
 ## Install
 
+### Homebrew
+
+```sh
+brew install rvben/tap/servicenow-cli
+```
+
+Homebrew installs native binaries on macOS and builds from source on Linux.
+
+### Other installation methods
+
 Both packages install the `servicenow` and `servicenow-cli` binaries:
 
 ```sh
