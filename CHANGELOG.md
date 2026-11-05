@@ -2,6 +2,13 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.1](https://github.com/rvben/servicenow-cli/compare/v0.6.0...v0.6.1) - 2026-11-05
+
+### Fixed
+
+- **api**: report HTTP 403 as a permission error ([a1df845](https://github.com/rvben/servicenow-cli/commit/a1df84529813106fa13b48513d44cef43d39654b))
+- **catalog**: order items whose multi-row variable sets are optional and empty ([ef776ed](https://github.com/rvben/servicenow-cli/commit/ef776ed76b0c7495087179e43d6f84523960a4e3))
+
 ## [0.6.0](https://github.com/rvben/servicenow-cli/compare/v0.5.3...v0.6.0) - 2026-11-05
 
 ### Added
