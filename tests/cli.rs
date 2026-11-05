@@ -1854,6 +1854,139 @@ async fn catalog_order_names_custom_widgets_it_cannot_fill() {
     assert!(plan["variables"].get("cost_center_picker").is_none());
 }
 
+/// The AWS item with an optional multi-row variable set added.
+async fn mount_aws_item_with_multi_row_set(server: &MockServer, mandatory: bool) {
+    let mut item = catalog_fixture("aws_account_request");
+    item["result"]["variables"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "extra_users",
+            "label": "Extra users",
+            "friendly_type": "sc_multi_row",
+            "type": "sc_multi_row",
+            "mandatory": mandatory,
+            "children": []
+        }));
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn catalog_order_leaves_an_optional_multi_row_set_empty() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let request_id = "b54ae46e1b181310b97aa975624bcbf2";
+    mount_aws_item_with_multi_row_set(&server, false).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/order_now"
+        )))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "sysparm_quantity": "1",
+            "variables": {
+                "division": "IT",
+                "environment": "Dev",
+                "describe_briefly_the_purpose_of_this_account": "Sandbox"
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": request_id,
+                "number": "REQ0010001",
+                "request_number": "REQ0010001",
+                "request_id": request_id,
+                "table": "sc_request"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{"number": "RITM0010001", "sys_id": "0123456789abcdef0123456789abcdef"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: extra_users: optional multi-row variable set left empty"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_refuses_a_mandatory_multi_row_set_without_posting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item_with_multi_row_set(&server, true).await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--dry-run"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("mandatory multi-row variable set (extra_users)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("/sp?id=sc_cat_item&sys_id="), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_order_refuses_rows_for_a_multi_row_set_without_posting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item_with_multi_row_set(&server, false).await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes"])
+        .args(AWS_VARS)
+        .args(["--var", "extra_users=[]"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("extra_users: multi-row variable sets cannot be filled by the CLI"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_show_names_optional_multi_row_sets_left_empty() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item_with_multi_row_set(&server, false).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "show", AWS_ITEM, "--output", "text"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("these optional ones are left empty when ordering: extra_users."),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Not orderable"), "{stdout}");
+}
+
 #[tokio::test]
 async fn catalog_order_is_blocked_by_read_only_mode() {
     let config_home = TempDir::new().unwrap();

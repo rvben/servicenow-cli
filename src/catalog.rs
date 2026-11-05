@@ -237,13 +237,15 @@ impl CatalogItem {
                 self.class
             )));
         }
+        // An optional set is left empty, as the portal submits it when no row
+        // is added; a mandatory one cannot be satisfied without rows.
         if let Some(set) = self
             .variables
             .iter()
-            .find(|variable| variable.kind == VariableKind::MultiRowSet)
+            .find(|variable| variable.kind == VariableKind::MultiRowSet && variable.mandatory)
         {
             return Err(ApiError::InvalidInput(format!(
-                "\"{}\" has a multi-row variable set ({}), which the CLI does not support; use the portal: {portal}",
+                "\"{}\" has a mandatory multi-row variable set ({}), which the CLI cannot fill; use the portal: {portal}",
                 self.name, set.name
             )));
         }
@@ -593,6 +595,19 @@ pub fn validate_locally(
         let problems_before = result.problems.len();
         match inputs.get(&variable.name) {
             Some(input) => validate_value(variable, input, ValueSource::Supplied, &mut result),
+            None if variable.kind == VariableKind::MultiRowSet => {
+                // order_now enforces only static mandatory flags, so a set
+                // that client logic makes required is accepted without rows.
+                let client_logic = if item.has_client_logic {
+                    "; the item's client logic may require rows, which the server does not check"
+                } else {
+                    ""
+                };
+                result.warnings.push(format!(
+                    "{}: optional multi-row variable set left empty{client_logic}",
+                    variable.name
+                ));
+            }
             None => {
                 if let Some(default) = &variable.default_value
                     && submits_value(&variable.kind)
@@ -758,9 +773,10 @@ fn validate_value(
         VariableKind::Attachment => {
             Err("attachment variables are not supported; use the portal".into())
         }
-        VariableKind::MultiRowSet => {
-            Err("multi-row variable sets are not supported; use the portal".into())
-        }
+        VariableKind::MultiRowSet => Err(
+            "multi-row variable sets cannot be filled by the CLI; remove it, or use the portal to fill it"
+                .into(),
+        ),
         VariableKind::Unknown => {
             result.warnings.push(format!(
                 "{name}: variable type '{}' is not recognised; sent unchecked",
@@ -1515,24 +1531,96 @@ mod tests {
     }
 
     #[test]
-    fn multi_row_sets_make_an_item_unorderable() {
+    fn an_optional_multi_row_set_does_not_block_ordering() {
         let item = fixture("mobile_devices_bulk");
-        let error = item
+        assert!(!item.variable("mobile_devices_set").unwrap().mandatory);
+        assert!(item.ensure_orderable("https://x").is_ok());
+    }
+
+    #[test]
+    fn mandatory_multi_row_sets_make_an_item_unorderable() {
+        let mut item = fixture("mobile_devices_bulk");
+        item.variable_mut_for_test("mobile_devices_set").mandatory = true;
+        let message = item
             .ensure_orderable("https://example.service-now.com")
-            .unwrap_err();
-        let message = error.to_string();
+            .unwrap_err()
+            .to_string();
         assert!(
-            message.contains("multi-row variable set (mobile_devices_set)"),
+            message.contains("mandatory multi-row variable set (mobile_devices_set)"),
             "{message}"
         );
         assert!(
             message.contains("/sp?id=sc_cat_item&sys_id=e56a7ffe41011300964ff05369414ebd"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn an_empty_optional_multi_row_set_is_not_sent_and_is_named_in_a_warning() {
+        let mut item = fixture("mobile_devices_bulk");
+        item.has_client_logic = false;
+        let result = validate_locally(
+            &item,
+            &inputs(&[("business_justification", "New starters")]),
+            1,
+            false,
+        );
+        assert!(!result.variables.contains_key("mobile_devices_set"));
         assert!(
-            fixture("aws_account_request")
-                .ensure_orderable("https://x")
-                .is_ok()
+            !result
+                .problems
+                .iter()
+                .any(|problem| problem.contains("mobile_devices_set")),
+            "{:?}",
+            result.problems
+        );
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("mobile_devices_set"))
+                .collect::<Vec<_>>(),
+            ["mobile_devices_set: optional multi-row variable set left empty"]
+        );
+    }
+
+    #[test]
+    fn an_empty_multi_row_set_warns_that_client_logic_may_require_it() {
+        let mut item = fixture("mobile_devices_bulk");
+        item.has_client_logic = true;
+        let result = validate_locally(&item, &inputs(&[]), 1, false);
+        assert!(
+            result.warnings.iter().any(|warning| warning.starts_with(
+                "mobile_devices_set: optional multi-row variable set left empty; the item's client logic may require rows"
+            )),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn a_value_for_a_multi_row_set_is_refused() {
+        let item = fixture("mobile_devices_bulk");
+        let result = validate_locally(
+            &item,
+            &inputs(&[("mobile_devices_set", "[{\"model\":\"x\"}]")]),
+            1,
+            false,
+        );
+        assert!(!result.variables.contains_key("mobile_devices_set"));
+        assert!(
+            result.problems.iter().any(|problem| problem
+                == "mobile_devices_set: multi-row variable sets cannot be filled by the CLI; remove it, or use the portal to fill it"),
+            "{:?}",
+            result.problems
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("left empty")),
+            "{:?}",
+            result.warnings
         );
     }
 

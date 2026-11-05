@@ -269,8 +269,10 @@ reorder does not bring back a default that was cleared.
 check `catalog requests mine` before ordering again.
 
 Items that need the portal are refused with a link to it: record producers,
-order guides, items with a mandatory attachment, and items with multi-row
-variable sets. UI policies, client scripts and custom widgets do not run
+order guides, items with a mandatory attachment, and items with a mandatory
+multi-row variable set. The CLI cannot fill multi-row variable sets: an
+optional one is left empty, as the portal submits it when no row is added, and
+`--dry-run` lists it under warnings. UI policies, client scripts and custom widgets do not run
 outside the browser; `catalog show` and `catalog order` say when an item has
 them. Values of masked
 and secret-looking variables are never echoed, and they are refused with

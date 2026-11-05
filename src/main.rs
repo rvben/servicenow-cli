@@ -3076,6 +3076,20 @@ fn emit_catalog_item(output: &OutputConfig, item: &CatalogItem, site_url: &str) 
             "Note: this item has client-side logic (UI policies or client scripts) the CLI does not run.\n"
         );
     }
+    let empty_sets: Vec<&str> = item
+        .variables
+        .iter()
+        .filter(|variable| {
+            variable.kind == catalog::VariableKind::MultiRowSet && !variable.mandatory
+        })
+        .map(|variable| variable.name.as_str())
+        .collect();
+    if orderable.is_ok() && !empty_sets.is_empty() {
+        outln!(
+            "Note: the CLI cannot fill multi-row variable sets; these optional ones are left empty when ordering: {}.\n",
+            empty_sets.join(", ")
+        );
+    }
     if !item.custom_widgets.is_empty() {
         outln!(
             "Note: this item has custom widgets the CLI cannot show or fill: {}.\n",
