@@ -101,6 +101,9 @@ async fn pdi_incident_crud_lifecycle() {
         .expect("clock is after Unix epoch")
         .as_nanos();
     let marker = format!("servicenow-cli-e2e-{unique}");
+    let flows_before = unreclaimable_flows(&client)
+        .await
+        .expect("read running flows");
 
     let created = client
         .create_record(
@@ -191,12 +194,8 @@ async fn pdi_incident_crud_lifecycle() {
     }
     .await;
 
-    let cleanup = client.delete_record("incident", &sys_id).await;
-    if let Err(error) = verification {
-        cleanup.expect("cleanup after failed verification");
-        panic!("PDI lifecycle verification failed: {error}");
-    }
-    cleanup.expect("delete test incident");
+    let cleanup = delete_fixture(&client, &mut Fixture::incident(&sys_id), &flows_before).await;
+    conclude(verification, cleanup);
 
     let deleted = client
         .get_record("incident", &sys_id, None, DisplayValue::False)
@@ -241,6 +240,9 @@ async fn pdi_incident_resolution_lifecycle() {
         .as_nanos();
     let marker = format!("servicenow-cli-resolution-e2e-{unique}");
     let resolution_notes = format!("Resolved by the isolated CLI lifecycle test {marker}");
+    let flows_before = unreclaimable_flows(&client)
+        .await
+        .expect("read running flows");
 
     let created = client
         .create_record(
@@ -327,12 +329,8 @@ async fn pdi_incident_resolution_lifecycle() {
     }
     .await;
 
-    let cleanup = client.delete_record("incident", &sys_id).await;
-    if let Err(error) = verification {
-        cleanup.expect("cleanup after failed resolution verification");
-        panic!("PDI resolution lifecycle verification failed: {error}");
-    }
-    cleanup.expect("delete resolution test incident");
+    let cleanup = delete_fixture(&client, &mut Fixture::incident(&sys_id), &flows_before).await;
+    conclude(verification, cleanup);
 
     let deleted = client
         .get_record("incident", &sys_id, None, DisplayValue::False)
@@ -372,6 +370,9 @@ async fn pdi_attachment_lifecycle() {
     let marker = format!("servicenow-cli-attachment-e2e-{unique}");
     let file_name = format!("{marker}.txt");
     let contents = format!("temporary attachment created by {marker}").into_bytes();
+    let flows_before = unreclaimable_flows(&client)
+        .await
+        .expect("read running flows");
 
     let incident = client
         .create_record(
@@ -404,11 +405,10 @@ async fn pdi_attachment_lifecycle() {
     {
         Ok(uploaded) => uploaded,
         Err(error) => {
-            client
-                .delete_record("incident", &incident_id)
-                .await
-                .expect("cleanup incident after failed attachment upload");
-            panic!("upload test attachment: {error}");
+            let cleanup =
+                delete_fixture(&client, &mut Fixture::incident(&incident_id), &flows_before).await;
+            conclude(Err(format!("upload test attachment: {error}")), cleanup);
+            unreachable!("conclude panics on a failed verification");
         }
     };
     let attachment_id = uploaded.sys_id.clone();
@@ -454,15 +454,19 @@ async fn pdi_attachment_lifecycle() {
     }
     .await;
 
+    // Deleted through the Attachment API first, which also removes the stored
+    // content; the incident cleanup then deletes any row this left behind.
     let attachment_cleanup = client.delete_attachment(&attachment_id).await;
-    let incident_cleanup = client.delete_record("incident", &incident_id).await;
-    if let Err(error) = verification {
-        attachment_cleanup.expect("cleanup attachment after failed verification");
-        incident_cleanup.expect("cleanup incident after failed verification");
-        panic!("PDI attachment verification failed: {error}");
-    }
-    attachment_cleanup.expect("delete test attachment");
-    incident_cleanup.expect("delete attachment test incident");
+    let incident_cleanup =
+        delete_fixture(&client, &mut Fixture::incident(&incident_id), &flows_before).await;
+    let cleanup = match (attachment_cleanup, incident_cleanup) {
+        (Ok(()), incident) => incident,
+        (Err(attachment), Ok(())) => Err(attachment),
+        (Err(attachment), Err(incident)) => {
+            Err(ApiError::Other(format!("{attachment}; {incident}")))
+        }
+    };
+    conclude(verification, cleanup);
 
     let deleted = client.get_attachment(&attachment_id).await;
     assert!(matches!(deleted, Err(ApiError::NotFound(_))));
@@ -479,16 +483,88 @@ fn fixture_body_has_stable_keys() {
     assert!(body.contains_key("impact"));
 }
 
-/// Every record an order spawns, by table, in deletion order (children first).
+/// Records the suite deletes, by table, in deletion order (children first).
+type Inventory = Vec<(&'static str, Vec<String>)>;
+
+/// Flow states the instance's own table cleanup reclaims, with every record
+/// that hangs off the flow.
+const FINISHED_FLOW_STATES: &str = "COMPLETE,CANCELLED,ERROR,PRESUMED_INTERRUPTED";
+
+/// Tables whose records start the flows and workflows a test fixture triggers:
+/// SLA flows on incidents, request and approval flows on orders, and their
+/// subflows.
+const FLOW_SOURCE_TABLES: &str =
+    "incident,task_sla,sc_request,sc_req_item,sc_task,sysapproval_approver,sys_flow_context";
+
+/// A record a test creates, together with everything the instance creates
+/// for it, so cleanup removes the whole fixture.
+///
+/// Flow and workflow contexts are not deleted. The instance owns their
+/// lifecycle: it purges finished contexts together with their logs, values
+/// and bindings, while a Table API deletion removes only the context row and
+/// orphans the rest, some of it (flow logs) beyond what any ACL lets the API
+/// delete. Cleanup instead requires every flow the fixture started to have
+/// finished, which [`unreclaimable_flows`] checks.
+///
+/// Catalog orders also leave a `catalog_channel_analytics` row. Deleting one
+/// requires the `maint` role, which no PDI account has, so those rows stay.
+enum Fixture {
+    Incident {
+        sys_id: String,
+        /// SLAs attached to the incident, kept across cleanup passes since
+        /// they can no longer be found from it once it is deleted.
+        slas: BTreeSet<String>,
+    },
+    CatalogOrder {
+        request_id: String,
+        known: OrderParents,
+    },
+}
+
+impl Fixture {
+    fn incident(sys_id: &str) -> Self {
+        Self::Incident {
+            sys_id: sys_id.to_string(),
+            slas: BTreeSet::new(),
+        }
+    }
+
+    fn catalog_order(request_id: &str) -> Self {
+        Self::CatalogOrder {
+            request_id: request_id.to_string(),
+            known: OrderParents::default(),
+        }
+    }
+
+    /// The record the fixture hangs off, deleted even when no inventory
+    /// could be read.
+    fn root(&self) -> Inventory {
+        match self {
+            Self::Incident { sys_id, .. } => vec![("incident", vec![sys_id.clone()])],
+            Self::CatalogOrder { request_id, .. } => {
+                vec![("sc_request", vec![request_id.clone()])]
+            }
+        }
+    }
+
+    async fn inventory(&mut self, client: &ServiceNowClient) -> Result<Inventory, ApiError> {
+        match self {
+            Self::Incident { sys_id, slas } => incident_inventory(client, sys_id, slas).await,
+            Self::CatalogOrder { request_id, known } => {
+                catalog_order_inventory(client, request_id, known).await
+            }
+        }
+    }
+}
+
 /// Ids of an order's records that others hang off, kept across cleanup
-/// passes: once a requested item, task, approval or flow is deleted it can no
+/// passes: once a requested item, task or approval is deleted it can no
 /// longer be found from the request, but late notifications can still name it.
 #[derive(Default)]
 struct OrderParents {
     ritms: BTreeSet<String>,
     tasks: BTreeSet<String>,
     approvals: BTreeSet<String>,
-    flows: BTreeSet<String>,
     /// Variable values, which are found only through their links; once a
     /// link is deleted, a value that survived is found by its id.
     options: BTreeSet<String>,
@@ -498,50 +574,107 @@ fn id_list<'a>(ids: impl IntoIterator<Item = &'a String>) -> String {
     ids.into_iter().cloned().collect::<Vec<_>>().join(",")
 }
 
+/// The non-empty values of `field` across the records `query` matches.
+async fn record_ids(
+    client: &ServiceNowClient,
+    table: &str,
+    query: String,
+    field: &str,
+) -> Result<Vec<String>, ApiError> {
+    let records = client
+        .list_records(
+            table,
+            &ListOptions {
+                query: Some(query),
+                fields: Some(vec![field.to_string()]),
+                limit: 500,
+                display_value: DisplayValue::False,
+                ..ListOptions::default()
+            },
+        )
+        .await?;
+    Ok(records
+        .iter()
+        .filter_map(|record| {
+            let cell = record.get(field)?;
+            cell.get("value")
+                .or(Some(cell))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .collect())
+}
+
+/// Journal entries, attachments and notifications about any of `parents`.
+async fn records_about(client: &ServiceNowClient, parents: &str) -> Result<Inventory, ApiError> {
+    Ok(vec![
+        (
+            "sys_journal_field",
+            record_ids(
+                client,
+                "sys_journal_field",
+                format!("element_idIN{parents}"),
+                "sys_id",
+            )
+            .await?,
+        ),
+        (
+            "sys_attachment",
+            record_ids(
+                client,
+                "sys_attachment",
+                format!("table_sys_idIN{parents}"),
+                "sys_id",
+            )
+            .await?,
+        ),
+        (
+            "sys_email",
+            record_ids(
+                client,
+                "sys_email",
+                format!("instanceIN{parents}"),
+                "sys_id",
+            )
+            .await?,
+        ),
+    ])
+}
+
+async fn incident_inventory(
+    client: &ServiceNowClient,
+    sys_id: &str,
+    slas: &mut BTreeSet<String>,
+) -> Result<Inventory, ApiError> {
+    let current_slas = record_ids(client, "task_sla", format!("task={sys_id}"), "sys_id").await?;
+    slas.extend(current_slas.iter().cloned());
+    let parents = std::iter::once(sys_id.to_string())
+        .chain(slas.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut inventory = records_about(client, &parents).await?;
+    inventory.push(("task_sla", current_slas));
+    inventory.push((
+        "incident",
+        record_ids(client, "incident", format!("sys_id={sys_id}"), "sys_id").await?,
+    ));
+    Ok(inventory)
+}
+
 async fn catalog_order_inventory(
     client: &ServiceNowClient,
     request_id: &str,
     known: &mut OrderParents,
-) -> Result<Vec<(&'static str, Vec<String>)>, ApiError> {
-    async fn ids(
-        client: &ServiceNowClient,
-        table: &str,
-        query: String,
-        field: &str,
-    ) -> Result<Vec<String>, ApiError> {
-        let records = client
-            .list_records(
-                table,
-                &ListOptions {
-                    query: Some(query),
-                    fields: Some(vec![field.to_string()]),
-                    limit: 500,
-                    display_value: DisplayValue::False,
-                    ..ListOptions::default()
-                },
-            )
-            .await?;
-        Ok(records
-            .iter()
-            .filter_map(|record| {
-                let cell = record.get(field)?;
-                cell.get("value")
-                    .or(Some(cell))
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            })
-            .collect())
-    }
-
-    let request = ids(
+) -> Result<Inventory, ApiError> {
+    let request = record_ids(
         client,
         "sc_request",
         format!("sys_id={request_id}"),
         "sys_id",
     )
     .await?;
-    let ritms = ids(
+    let ritms = record_ids(
         client,
         "sc_req_item",
         format!("request={request_id}"),
@@ -555,7 +688,7 @@ async fn catalog_order_inventory(
     } else {
         let query = format!("request_itemIN{ritm_list}");
         known.options.extend(
-            ids(
+            record_ids(
                 client,
                 "sc_item_option_mtom",
                 query.clone(),
@@ -563,12 +696,12 @@ async fn catalog_order_inventory(
             )
             .await?,
         );
-        ids(client, "sc_item_option_mtom", query, "sys_id").await?
+        record_ids(client, "sc_item_option_mtom", query, "sys_id").await?
     };
     let options = if known.options.is_empty() {
         Vec::new()
     } else {
-        ids(
+        record_ids(
             client,
             "sc_item_option",
             format!("sys_idIN{}", id_list(&known.options)),
@@ -579,7 +712,7 @@ async fn catalog_order_inventory(
     let tasks = if known.ritms.is_empty() {
         Vec::new()
     } else {
-        ids(
+        record_ids(
             client,
             "sc_task",
             format!("request_itemIN{ritm_list}"),
@@ -588,45 +721,14 @@ async fn catalog_order_inventory(
         .await?
     };
     known.tasks.extend(tasks.iter().cloned());
-    // Every record a flow, approval, journal entry, attachment or email can
-    // hang off: the request, its requested items, and their tasks.
+    // Every record an approval, journal entry, attachment or email can hang
+    // off: the request, its requested items, and their tasks.
     let parents = std::iter::once(request_id.to_string())
         .chain(known.ritms.iter().cloned())
         .chain(known.tasks.iter().cloned())
         .collect::<Vec<_>>()
         .join(",");
-    // Approval subflows are flow contexts whose source is their parent flow
-    // context, not the request, so follow them level by level. Deeper levels
-    // come first in the result so children are deleted before their parents.
-    let mut flow_levels = vec![
-        ids(
-            client,
-            "sys_flow_context",
-            format!("source_recordIN{parents}"),
-            "sys_id",
-        )
-        .await?,
-    ];
-    // Flows deleted by an earlier pass still seed the search for subflows.
-    let mut frontier: BTreeSet<String> = flow_levels[0].iter().cloned().collect();
-    frontier.extend(known.flows.iter().cloned());
-    while !frontier.is_empty() {
-        let query = format!(
-            "source_table=sys_flow_context^source_recordIN{}",
-            id_list(&frontier)
-        );
-        let next = ids(client, "sys_flow_context", query, "sys_id").await?;
-        frontier = next
-            .iter()
-            .filter(|id| !known.flows.contains(*id))
-            .cloned()
-            .collect();
-        known.flows.extend(next.iter().cloned());
-        flow_levels.push(next);
-    }
-    let flow_contexts: Vec<String> = flow_levels.into_iter().rev().flatten().collect();
-    known.flows.extend(flow_contexts.iter().cloned());
-    let approvals = ids(
+    let approvals = record_ids(
         client,
         "sysapproval_approver",
         format!("sysapprovalIN{parents}"),
@@ -635,70 +737,93 @@ async fn catalog_order_inventory(
     .await?;
     known.approvals.extend(approvals.iter().cloned());
     // Notifications about an approval are keyed by the approval record.
-    let notified = std::iter::once(parents.clone())
+    let notified = std::iter::once(parents)
         .chain(known.approvals.iter().cloned())
         .collect::<Vec<_>>()
         .join(",");
-    Ok(vec![
-        ("sys_flow_context", flow_contexts),
-        (
-            "wf_context",
-            ids(client, "wf_context", format!("idIN{parents}"), "sys_id").await?,
-        ),
-        ("sysapproval_approver", approvals),
-        (
-            "sys_journal_field",
-            ids(
-                client,
-                "sys_journal_field",
-                format!("element_idIN{notified}"),
-                "sys_id",
-            )
-            .await?,
-        ),
-        (
-            "sys_attachment",
-            ids(
-                client,
-                "sys_attachment",
-                format!("table_sys_idIN{notified}"),
-                "sys_id",
-            )
-            .await?,
-        ),
-        (
-            "sys_email",
-            ids(
-                client,
-                "sys_email",
-                format!("instanceIN{notified}"),
-                "sys_id",
-            )
-            .await?,
-        ),
+    let mut inventory = vec![("sysapproval_approver", approvals)];
+    inventory.extend(records_about(client, &notified).await?);
+    inventory.extend([
         ("sc_task", tasks),
         ("sc_item_option_mtom", mtom),
         ("sc_item_option", options),
         ("sc_req_item", ritms),
         ("sc_request", request),
-    ])
+    ]);
+    Ok(inventory)
 }
 
-async fn delete_catalog_order(client: &ServiceNowClient, request_id: &str) -> Result<(), ApiError> {
+/// Flow and workflow contexts on fixture tables that the instance will never
+/// purge: still running, or marked to skip the scheduled cleanup.
+async fn unreclaimable_flows(client: &ServiceNowClient) -> Result<BTreeSet<String>, ApiError> {
+    let flows = record_ids(
+        client,
+        "sys_flow_context",
+        format!(
+            "source_tableIN{FLOW_SOURCE_TABLES}^stateNOT IN{FINISHED_FLOW_STATES}^NQsource_tableIN{FLOW_SOURCE_TABLES}^skip_schedule_cleanup=true"
+        ),
+        "sys_id",
+    )
+    .await?;
+    let workflows = record_ids(
+        client,
+        "wf_context",
+        format!("tableIN{FLOW_SOURCE_TABLES}^state=executing"),
+        "sys_id",
+    )
+    .await?;
+    Ok(flows
+        .into_iter()
+        .map(|id| format!("sys_flow_context {id}"))
+        .chain(workflows.into_iter().map(|id| format!("wf_context {id}")))
+        .collect())
+}
+
+/// Deletes a fixture and requires that every flow it started has finished.
+///
+/// `flows_before` is [`unreclaimable_flows`] read before the fixture was
+/// created, so flows that were already running on the instance are not
+/// blamed on the test.
+async fn delete_fixture(
+    client: &ServiceNowClient,
+    fixture: &mut Fixture,
+    flows_before: &BTreeSet<String>,
+) -> Result<(), ApiError> {
+    delete_records(client, fixture).await?;
+    // Deleting a record cancels its flows asynchronously.
+    let mut left = BTreeSet::new();
+    for _ in 0..6 {
+        match unreclaimable_flows(client).await {
+            Ok(current) => {
+                left = current.difference(flows_before).cloned().collect();
+                if left.is_empty() {
+                    return Ok(());
+                }
+            }
+            Err(error) => left = BTreeSet::from([format!("(flow read failed: {error})")]),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    Err(ApiError::Other(format!(
+        "the fixture left flows the instance will not purge (still running or exempt from cleanup):\n{}",
+        left.into_iter().collect::<Vec<_>>().join("\n")
+    )))
+}
+
+async fn delete_records(client: &ServiceNowClient, fixture: &mut Fixture) -> Result<(), ApiError> {
     // The instance writes notifications from its event queue, so emails about
-    // the order can appear after a deletion pass. Each pass is followed by a
-    // pause before the leftover check, and records that arrived meanwhile
+    // the fixture can appear after a deletion pass. Each pass is followed by
+    // a pause before the leftover check, and records that arrived meanwhile
     // are deleted by the next pass.
     // A failed read never ends the cleanup: the first pass falls back to the
-    // request itself, and a later one keeps the previous inventory, since
-    // giving up leaves the whole order behind.
-    let mut known = OrderParents::default();
+    // fixture's root record, and a later one keeps the previous inventory,
+    // since giving up leaves the whole fixture behind.
     let mut read_error = None;
-    let mut inventory = match read_inventory(client, request_id, &mut known).await {
+    let mut inventory = match read_inventory(client, fixture).await {
         Ok(inventory) => inventory,
         Err(error) => {
             read_error = Some(error.to_string());
-            vec![("sc_request", vec![request_id.to_string()])]
+            fixture.root()
         }
     };
     let mut failures = Vec::new();
@@ -716,7 +841,7 @@ async fn delete_catalog_order(client: &ServiceNowClient, request_id: &str) -> Re
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        match read_inventory(client, request_id, &mut known).await {
+        match read_inventory(client, fixture).await {
             Ok(current) => {
                 read_error = None;
                 inventory = current;
@@ -743,26 +868,38 @@ async fn delete_catalog_order(client: &ServiceNowClient, request_id: &str) -> Re
         })
         .unwrap_or_default();
     Err(ApiError::Other(format!(
-        "catalog order cleanup left records behind:\n{}{refused}{unread}",
+        "cleanup left records behind:\n{}{refused}{unread}",
         leftover.join("\n")
     )))
 }
 
-/// Reads the order's records, retrying transient failures.
+/// Reads the fixture's records, retrying transient failures.
 async fn read_inventory(
     client: &ServiceNowClient,
-    request_id: &str,
-    known: &mut OrderParents,
-) -> Result<Vec<(&'static str, Vec<String>)>, ApiError> {
+    fixture: &mut Fixture,
+) -> Result<Inventory, ApiError> {
     let mut attempt = 1;
     loop {
-        match catalog_order_inventory(client, request_id, known).await {
+        match fixture.inventory(client).await {
             Ok(inventory) => return Ok(inventory),
             Err(error) if attempt == 3 => return Err(error),
             Err(_) => {
                 attempt += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
+        }
+    }
+}
+
+/// Fails the test with the verification error, the cleanup error, or both,
+/// so a cleanup failure never hides why the verification failed.
+fn conclude(verification: Result<(), impl std::fmt::Display>, cleanup: Result<(), ApiError>) {
+    match (verification, cleanup) {
+        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) => panic!("verification failed: {error}"),
+        (Ok(()), Err(cleanup_error)) => panic!("cleanup failed: {cleanup_error}"),
+        (Err(error), Err(cleanup_error)) => {
+            panic!("verification failed: {error}; cleanup also failed: {cleanup_error}")
         }
     }
 }
@@ -837,32 +974,6 @@ async fn request_for_marker(
     first("sc_req_item", format!("sys_id={ritm}"), "request").await
 }
 
-async fn subflow_contexts(client: &ServiceNowClient) -> Vec<String> {
-    let mut ids: Vec<String> = client
-        .list_records(
-            "sys_flow_context",
-            &ListOptions {
-                query: Some("source_table=sys_flow_context".into()),
-                fields: Some(vec!["sys_id".into()]),
-                limit: 1000,
-                display_value: DisplayValue::False,
-                ..ListOptions::default()
-            },
-        )
-        .await
-        .expect("list subflow contexts")
-        .iter()
-        .filter_map(|record| {
-            record
-                .get("sys_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
-    ids.sort();
-    ids
-}
-
 fn run_catalog_cli(pdi: &Pdi, home: &TempDir, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_servicenow"))
         .env("SERVICENOW_INSTANCE", &pdi.instance)
@@ -907,6 +1018,9 @@ async fn pdi_catalog_reorder_round_trips_date_times() {
     let start = "2027-03-01 10:00:00";
     let end = "2027-03-01 11:30:00";
     let start_var = format!("select_webinar_start_time={start}");
+    let flows_before = unreclaimable_flows(&client)
+        .await
+        .expect("read running flows");
     let end_var = format!("select_webinar_end_time={end}");
     let order = run_catalog_cli(
         &pdi,
@@ -982,14 +1096,13 @@ async fn pdi_catalog_reorder_round_trips_date_times() {
     }
     .await;
 
-    let cleanup = delete_catalog_order(&client, &request_id).await;
-    if let Err(error) = verification {
-        match cleanup {
-            Ok(()) => panic!("{error}"),
-            Err(cleanup_error) => panic!("{error}; cleanup also failed: {cleanup_error}"),
-        }
-    }
-    cleanup.expect("delete every record the catalog order created");
+    let cleanup = delete_fixture(
+        &client,
+        &mut Fixture::catalog_order(&request_id),
+        &flows_before,
+    )
+    .await;
+    conclude(verification, cleanup);
 }
 
 #[tokio::test]
@@ -1022,9 +1135,9 @@ async fn pdi_catalog_order_lifecycle() {
     assert_eq!(plan["dryRun"], true);
     assert_eq!(plan["variables"]["division"], "IT");
 
-    // Checked independently of the cleanup inventory, which cannot report
-    // records it does not know how to find.
-    let subflows_before = subflow_contexts(&client).await;
+    let flows_before = unreclaimable_flows(&client)
+        .await
+        .expect("read running flows");
     let order = run(&[&order_args[..], &["--yes"]].concat());
     let ordered = serde_json::from_slice::<Value>(&order.stdout).unwrap_or(Value::Null);
     let reported = ordered["request"]["request_id"]
@@ -1082,17 +1195,11 @@ async fn pdi_catalog_order_lifecycle() {
     }
     .await;
 
-    let cleanup = delete_catalog_order(&client, &request_id).await;
-    if let Err(error) = verification {
-        match cleanup {
-            Ok(()) => panic!("{error}"),
-            Err(cleanup_error) => panic!("{error}; cleanup also failed: {cleanup_error}"),
-        }
-    }
-    cleanup.expect("delete every record the catalog order created");
-    assert_eq!(
-        subflow_contexts(&client).await,
-        subflows_before,
-        "the order left approval subflow contexts behind"
-    );
+    let cleanup = delete_fixture(
+        &client,
+        &mut Fixture::catalog_order(&request_id),
+        &flows_before,
+    )
+    .await;
+    conclude(verification, cleanup);
 }

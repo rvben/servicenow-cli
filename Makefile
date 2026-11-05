@@ -7,12 +7,15 @@ test:
 	cargo test --locked --all-targets
 
 # Runs the ignored lifecycle suite against a Personal Developer Instance.
-# Put credentials in .env.e2e (see .env.e2e.example).
+# Put credentials in .env.e2e (see .env.e2e.example). Afterwards, scans the
+# records created during the run for references to records the suite deleted.
 test-e2e:
 	@set -a; \
 	if [ -f .env.e2e ]; then . ./.env.e2e; fi; \
 	set +a; \
-	cargo test --test e2e -- --ignored --test-threads=1
+	export SERVICENOW_E2E_SINCE=$$(date +%s); \
+	cargo test --test e2e -- --ignored --test-threads=1 && \
+	cargo test --test e2e_leftovers -- --ignored --nocapture
 
 lint: lint-md
 	cargo fmt -- --check
