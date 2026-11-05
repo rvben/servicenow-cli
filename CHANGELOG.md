@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.2](https://github.com/rvben/servicenow-cli/compare/v0.6.1...v0.6.2) - 2026-11-05
+
+### Fixed
+
+- **catalog**: report an order that only fills a cart as not ordered ([12975be](https://github.com/rvben/servicenow-cli/commit/12975beacac60ca774bf758f886a23cdda1bdd9c))
+
 ## [0.6.1](https://github.com/rvben/servicenow-cli/compare/v0.6.0...v0.6.1) - 2026-11-05
 
 ### Fixed
