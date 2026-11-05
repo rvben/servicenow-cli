@@ -11,10 +11,15 @@ use std::fmt;
 pub enum ApiError {
     InvalidInput(String),
     Auth(String),
+    /// The credentials were accepted, but an ACL or missing role refused the operation.
+    Permission(String),
     NotFound(String),
     Conflict(String),
     RateLimit,
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+    },
     Http(reqwest::Error),
     Other(String),
 }
@@ -24,6 +29,7 @@ impl fmt::Display for ApiError {
         match self {
             Self::InvalidInput(message) => write!(f, "{message}"),
             Self::Auth(message) => write!(f, "authentication failed: {message}"),
+            Self::Permission(message) => write!(f, "permission denied: {message}"),
             Self::NotFound(message) => write!(f, "not found: {message}"),
             Self::Conflict(message) => write!(f, "conflict: {message}"),
             Self::RateLimit => write!(f, "ServiceNow rate limit exceeded; wait and retry"),

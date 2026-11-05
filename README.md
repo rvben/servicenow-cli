@@ -372,7 +372,7 @@ their normal text to stdout with exit code 0.
 | 0 | Success |
 | 1 | Unexpected or transport error |
 | 2 | Invalid input or configuration |
-| 3 | Authentication or authorization failure |
+| 3 | Authentication (`kind: auth`) or permission (`kind: permission`) failure |
 | 4 | Record not found |
 | 5 | Other ServiceNow API error |
 | 6 | Rate limited |

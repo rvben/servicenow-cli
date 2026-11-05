@@ -784,6 +784,76 @@ async fn rejected_basic_auth_on_federated_instance_recommends_browser_sign_in() 
     .stderr(predicate::str::contains("servicenow auth login").not());
 }
 
+async fn delete_answered_with(status: u16, message: &str) -> (Option<i32>, serde_json::Value) {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(
+            "/api/now/table/sys_flow_log/0123456789abcdef0123456789abcdef",
+        ))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                "error": {"message": message, "detail": null},
+                "status": "failure"
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = command(&config_home)
+        .env("SERVICENOW_INSTANCE", server.uri())
+        .env("SERVICENOW_USERNAME", "admin")
+        .env("SERVICENOW_PASSWORD", "secret")
+        .args([
+            "table",
+            "delete",
+            "sys_flow_log",
+            "0123456789abcdef0123456789abcdef",
+            "--yes",
+        ])
+        .output()
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    (output.status.code(), envelope)
+}
+
+#[tokio::test]
+async fn forbidden_responses_are_permission_errors_not_credential_problems() {
+    let (code, envelope) = delete_answered_with(
+        403,
+        "Operation Failed: ACL Exception Delete Failed due to security constraints",
+    )
+    .await;
+
+    assert_eq!(code, Some(3), "{envelope}");
+    let error = &envelope["error"];
+    assert_eq!(error["kind"], "permission", "{envelope}");
+    assert_eq!(
+        error["message"],
+        "permission denied: Operation Failed: ACL Exception Delete Failed due to security constraints"
+    );
+    let remediation = error["remediation"].as_str().unwrap_or_default();
+    assert!(remediation.contains("role or ACL"), "{envelope}");
+    assert!(!remediation.contains("auth login"), "{envelope}");
+}
+
+#[tokio::test]
+async fn unauthorized_responses_remain_credential_problems() {
+    let (code, envelope) = delete_answered_with(401, "User Not Authenticated").await;
+
+    assert_eq!(code, Some(3), "{envelope}");
+    let error = &envelope["error"];
+    assert_eq!(error["kind"], "auth", "{envelope}");
+    assert_eq!(
+        error["message"],
+        "authentication failed: User Not Authenticated"
+    );
+    assert_eq!(
+        error["remediation"],
+        "run `servicenow auth login` to refresh your credentials"
+    );
+}
+
 #[tokio::test]
 async fn auth_login_resumes_a_saved_profile_without_reasking_for_the_instance() {
     let config_home = TempDir::new().unwrap();

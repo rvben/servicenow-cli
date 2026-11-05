@@ -291,7 +291,10 @@ async fn api_error_body_is_mapped_to_typed_error() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ApiError::Auth(message) if message.contains("Required ACL missing")));
+    assert!(
+        matches!(error, ApiError::Permission(ref message) if message.contains("Required ACL missing")),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

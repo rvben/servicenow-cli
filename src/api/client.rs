@@ -873,7 +873,8 @@ async fn map_response_error(
         }
     };
     match status {
-        401 | 403 => ApiError::Auth(message),
+        401 => ApiError::Auth(message),
+        403 => ApiError::Permission(message),
         404 => ApiError::NotFound(message),
         409 => ApiError::Conflict(message),
         429 => ApiError::RateLimit,

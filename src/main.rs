@@ -3978,7 +3978,7 @@ fn command_document(command: &clap::Command, selected_path: Option<&str>) -> Val
             "errorEnvelope": {"error": {"kind": "string", "message": "string", "remediation": "string|null"}},
             "streams": {"stdout": "data", "stderr": "status and errors"},
             "exitCodes": {
-                "0": "success", "1": "unexpected", "2": "invalid_input", "3": "auth",
+                "0": "success", "1": "unexpected", "2": "invalid_input", "3": "auth or permission",
                 "4": "not_found", "5": "api_error", "6": "rate_limit", "7": "conflict"
             }
         }),

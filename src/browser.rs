@@ -1070,7 +1070,7 @@ async fn validate_session(
         }
         return match status {
             status if waiting => Ok(SessionValidation::Waiting(status)),
-            403 => Err(ApiError::Auth(
+            403 => Err(ApiError::Permission(
                 "browser sign-in succeeded, but this account is not allowed to use the ServiceNow Table API"
                     .into(),
             )),
@@ -1465,7 +1465,7 @@ async fn windows_browser_cookie(
         });
     }
     if stdout.lines().any(|line| line == "SERVICENOW_FORBIDDEN") {
-        return Err(ApiError::Auth(
+        return Err(ApiError::Permission(
             "browser sign-in succeeded, but this account is not allowed to use the ServiceNow Table API"
                 .into(),
         ));
@@ -1939,6 +1939,25 @@ mod tests {
     use tokio_tungstenite::accept_async;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn signed_in_session_refused_by_the_table_api_is_a_permission_error() {
+        let instance = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/now/table/sys_user"))
+            .respond_with(ResponseTemplate::new(403).insert_header("X-Is-Logged-In", "true"))
+            .mount(&instance)
+            .await;
+
+        let Err(error) = validate_session(&instance.uri(), "glide_user_route=abc", "token").await
+        else {
+            panic!("a 403 from a signed-in session must not validate");
+        };
+        assert!(
+            matches!(error, ApiError::Permission(ref message) if message.contains("not allowed to use the ServiceNow Table API")),
+            "{error:?}"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

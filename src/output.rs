@@ -228,6 +228,7 @@ pub fn error_kind(error: &ApiError) -> &'static str {
     match error {
         ApiError::InvalidInput(_) => "invalid_input",
         ApiError::Auth(_) => "auth",
+        ApiError::Permission(_) => "permission",
         ApiError::NotFound(_) => "not_found",
         ApiError::Conflict(_) => "conflict",
         ApiError::RateLimit => "rate_limit",
@@ -239,7 +240,7 @@ pub fn error_kind(error: &ApiError) -> &'static str {
 pub fn exit_code(error: &ApiError) -> i32 {
     match error {
         ApiError::InvalidInput(_) => exit_codes::INPUT,
-        ApiError::Auth(_) => exit_codes::AUTH,
+        ApiError::Auth(_) | ApiError::Permission(_) => exit_codes::AUTH,
         ApiError::NotFound(_) => exit_codes::NOT_FOUND,
         ApiError::Conflict(_) => exit_codes::CONFLICT,
         ApiError::RateLimit => exit_codes::RATE_LIMIT,
@@ -290,6 +291,9 @@ fn error_remediation(error: &ApiError) -> Option<&'static str> {
                 Some("run `servicenow auth login --method browser` to sign in again")
             }
             ApiError::Auth(_) => Some("run `servicenow auth login` to refresh your credentials"),
+            ApiError::Permission(_) => Some(
+                "your credentials work, but this account lacks the role or ACL the operation needs; ask a ServiceNow administrator, or use an account that has it",
+            ),
             ApiError::RateLimit => Some("wait briefly, then retry the command"),
             _ => None,
         }
