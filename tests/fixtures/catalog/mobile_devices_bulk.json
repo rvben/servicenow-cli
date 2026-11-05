@@ -1,0 +1,132 @@
+{
+  "result": {
+    "short_description": "Request for mobile devices for your department",
+    "legacy": false,
+    "kb_article": "",
+    "availability": "on_both",
+    "mandatory_attachment": false,
+    "request_method": "",
+    "type": "catalog_item",
+    "visible_standalone": true,
+    "sys_class_name": "sc_cat_item",
+    "sys_id": "e56a7ffe41011300964ff05369414ebd",
+    "content_type": "",
+    "order": 0,
+    "hide_sp": false,
+    "make_item_non_conversational": false,
+    "owner": "",
+    "show_price": false,
+    "show_quantity": true,
+    "url": "",
+    "catalogs": [
+      {
+        "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+        "active": true,
+        "title": "Service Catalog"
+      }
+    ],
+    "name": "Corporate Mobile Devices - Bulk Orders",
+    "show_wishlist": true,
+    "category": {
+      "sys_id": "109f0438c6112276003ae8ac13e7009d",
+      "title": "Services"
+    },
+    "turn_off_nowassist_conversation": false,
+    "show_delivery_time": true,
+    "categories": [
+      {
+        "sys_id": "109cdff8c6112276003b17991a09ad65",
+        "active": true,
+        "category": {
+          "sys_id": "109f0438c6112276003ae8ac13e7009d",
+          "active": true,
+          "title": "Services"
+        },
+        "title": "Office"
+      }
+    ],
+    "variables": [
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Department",
+        "dynamic_value_field": "",
+        "type": 8,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "reference",
+        "display_type": "Reference",
+        "reference": "cmn_department",
+        "render_label": true,
+        "ref_qualifier": "",
+        "read_only": false,
+        "conversational_label": "",
+        "name": "department",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "f03b373241411300964ff05369414e67",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "Please indicate which department you belong to",
+        "max_length": 0,
+        "order": 100
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Business Justification",
+        "dynamic_value_field": "",
+        "type": 2,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "multi_line_text",
+        "display_type": "Multi Line Text",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "business_justification",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "b7ef3b7241411300964ff05369414ed8",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 200
+      },
+      {
+        "containerSplitId": null,
+        "type": "sc_multi_row",
+        "mandatory": false,
+        "friendly_type": "sc_multi_row",
+        "read_only": false,
+        "children": [],
+        "conversational_label": null,
+        "hasSplit": false,
+        "containerEndId": null,
+        "id": "e84d3f3241411300964ff05369414e3e",
+        "value": null,
+        "dynamic_value_dot_walk_path": "",
+        "max_length": 0,
+        "order": -1,
+        "disable_initial_slot_fill": false,
+        "containerType": "one_to_many",
+        "active": false,
+        "label": "Mobile Devices Set",
+        "dynamic_value_field": "",
+        "columnCount": 1,
+        "displayvalue": "",
+        "layout": "2down",
+        "render_label": true,
+        "name": "mobile_devices_set",
+        "attributes": "edge_encryption_enabled=true",
+        "help_text": ""
+      }
+    ],
+    "ui_policy": [],
+    "client_script": {
+      "onChange": [],
+      "onSubmit": [],
+      "onLoad": []
+    },
+    "data_lookup": []
+  }
+}

@@ -226,6 +226,66 @@ Server-provided file names are reduced to a safe local basename, downloads use
 a temporary file plus atomic persistence, and replacing a local file requires
 `--force`. Upload and delete operations honor profile-level read-only mode.
 
+## Service Catalog requests
+
+Order catalog items through the Service Catalog API, the same path the portal
+uses, so approvals, flows, and fulfillment tasks run as usual:
+
+```sh
+# Find an item and see the variables it takes
+servicenow catalog search "aws account"
+servicenow catalog show "AWS account request"
+
+# Validate the order without submitting anything
+servicenow catalog order "AWS account request" \
+  --var division=IT --var environment=Dev \
+  --var describe_briefly_the_purpose_of_this_account="Sandbox" --dry-run
+
+# Submit it; variables can also come from a JSON or YAML file (or - for stdin)
+servicenow catalog order "AWS account request" --vars-file request.yaml --yes
+
+# Track what you ordered and read back the submitted values
+servicenow catalog requests mine --open
+servicenow catalog requests vars RITM0010001
+```
+
+ServiceNow accepts unknown variable names, invalid choices, and wrongly
+formatted dates without complaint and then drops or stores them silently. The
+CLI checks every variable against the item before ordering, so a typo or an
+unlisted choice fails with the valid options instead of producing a broken
+request. Item defaults are checked the same way. Reference variables accept a
+`sys_id`, and user or group variables also accept a name or email. `order`
+requires the exact item name or `sys_id`.
+
+Dates are sent as `yyyy-MM-dd` and times as `HH:mm:ss`. The instance reads them
+in your user's formats, so an order with date variables is refused when your
+formats differ. It is also refused when your formats cannot be read, unless you
+pass `--allow-unverified-formats`. `catalog requests vars --json` prints an
+object you can pass back to `--vars-file`, without sensitive or read-only
+variables. It keeps empty values for variables that have a default, so a
+reorder does not bring back a default that was cleared.
+
+`catalog order` sends one request and never retries it: if a response is lost,
+check `catalog requests mine` before ordering again.
+
+Items that need the portal are refused with a link to it: record producers,
+order guides, items with a mandatory attachment, and items with multi-row
+variable sets. UI policies, client scripts and custom widgets do not run
+outside the browser; `catalog show` and `catalog order` say when an item has
+them. Values of masked
+and secret-looking variables are never echoed, and they are refused with
+`--var`, which lands in shell history: pass them through `--vars-file`.
+`--vars-file -` reads standard input, which then cannot answer the
+confirmation prompt, so add `--yes` (after a `--dry-run` to check the plan). When an order with such a value fails,
+the instance's error message is shown with the value replaced. An error page,
+or a message with escaped, HTML-encoded or URL-encoded text that could quote
+the value in another form, is withheld, leaving the HTTP status. Orders honor read-only
+profiles, and `--dry-run` works even in read-only mode.
+
+To create requests, always use `catalog order`. Creating `sc_req_item`
+records directly with `tables create` skips the catalog engine, so no
+variables, approvals, or fulfillment flows are attached.
+
 ## Discover your instance
 
 ServiceNow tables, choices, and custom fields vary by instance. The CLI can

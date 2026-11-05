@@ -6,6 +6,7 @@ use dialoguer::{Confirm, Editor, Input, Password, Select};
 use serde_json::{Map, Value};
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::attachment;
+use servicenow_cli::catalog::{self, CatalogItem};
 use servicenow_cli::commands::{
     INCIDENT_HUMAN_FIELDS, INCIDENT_LIST_FIELDS, build_body, parse_fields, print_record,
     print_records, print_records_or, record_sys_id,
@@ -152,6 +153,10 @@ enum Command {
     /// List, upload, download, and delete record attachments
     #[command(subcommand, visible_alias = "attachment")]
     Attachments(AttachmentsCommand),
+
+    /// Search, inspect, and order Service Catalog items
+    #[command(subcommand, visible_alias = "cat")]
+    Catalog(CatalogCommand),
 
     /// Perform generic CRUD operations through the Table API
     #[command(subcommand, visible_alias = "table")]
@@ -613,6 +618,103 @@ enum AttachmentsCommand {
 }
 
 #[derive(Subcommand)]
+enum CatalogCommand {
+    /// Search catalog items, including record producers and order guides
+    Search {
+        /// Text to search for; omit to list the catalog
+        text: Option<String>,
+
+        /// Maximum items to return
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+
+        /// Skip the first N items
+        #[arg(long, default_value = "0")]
+        offset: usize,
+    },
+
+    /// Show a catalog item and the variables its form accepts
+    Show {
+        /// Item sys_id, exact name, or a search term matching one item
+        item: String,
+    },
+
+    /// Order a catalog item ("order now") after validating its variables
+    #[command(
+        after_help = "The instance accepts invalid choices, references to the wrong table, and unknown\nvariable names without complaint, so the CLI validates every value first.\nSensitive values belong in --vars-file, not --var. --vars-file - reads them from\nstandard input, which then cannot answer the confirmation prompt: add --yes."
+    )]
+    Order {
+        /// Item sys_id or exact name
+        item: String,
+
+        /// Variable value as name=value (repeatable; overrides --vars-file)
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        vars: Vec<String>,
+
+        /// JSON or YAML object of variable values, or - for stdin
+        #[arg(long, value_name = "PATH")]
+        vars_file: Option<std::path::PathBuf>,
+
+        /// Quantity to order
+        #[arg(long, default_value = "1")]
+        quantity: u32,
+
+        /// User the request is for (user name, email, name, sys_id, or @me)
+        #[arg(long)]
+        requested_for: Option<String>,
+
+        /// Warn about, and do not send, variables the item does not define
+        #[arg(long)]
+        allow_unknown_vars: bool,
+
+        /// Order even when your date and time formats cannot be read, so date
+        /// variables may be mis-read
+        #[arg(long)]
+        allow_unverified_formats: bool,
+
+        /// Validate and show the order without submitting it
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Submit without prompting
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Track requested items
+    #[command(subcommand, visible_alias = "request")]
+    Requests(CatalogRequestsCommand),
+}
+
+#[derive(Subcommand)]
+enum CatalogRequestsCommand {
+    /// List requested items you requested or opened, newest first
+    Mine {
+        /// Maximum records to return
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+
+        /// Return only items that are still open
+        #[arg(long)]
+        open: bool,
+
+        /// Return raw values, display values, or both
+        #[arg(long, value_enum)]
+        display_value: Option<DisplayValue>,
+    },
+
+    /// Print a requested item's variables in the form `catalog order --vars-file` accepts
+    Vars {
+        /// RITM number or sys_id
+        identifier: String,
+
+        /// Include variables without a value
+        #[arg(long)]
+        include_empty: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TablesCommand {
     /// List records from a table
     List {
@@ -1040,6 +1142,7 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
         Command::Tui { .. } => unreachable!("TUI commands return before shared client setup"),
         Command::Incidents(command) => run_incidents(command, &client, &config, &output).await,
         Command::Attachments(command) => run_attachments(command, &client, &config, &output).await,
+        Command::Catalog(command) => run_catalog(command, &client, &config, &output).await,
         Command::Tables(command) => run_tables(command, &client, &config, &output).await,
         Command::Schema {
             table: Some(table),
@@ -1070,8 +1173,14 @@ async fn run(cli: Cli) -> Result<(), ApiError> {
     };
     if command_result.is_ok()
         && let Some(cookie) = client.refreshed_browser_cookie()
+        && let Err(error) = config.persist_browser_cookie(&cookie)
     {
-        config.persist_browser_cookie(&cookie)?;
+        // The command itself succeeded. Reporting a completed write as a
+        // failure invites a retry, which for `catalog order` orders twice.
+        // Printed even with --quiet, since later commands may need a login.
+        eprintln!(
+            "warning: the command succeeded, but the refreshed browser session could not be saved ({error}); run `servicenow auth login` if later commands fail"
+        );
     }
     command_result
 }
@@ -2596,6 +2705,666 @@ async fn resolve_reference_id(
     Ok(Some(record_sys_id(&record)?.to_string()))
 }
 
+const RITM_LIST_FIELDS: &[&str] = &[
+    "number",
+    "cat_item",
+    "stage",
+    "state",
+    "quantity",
+    "requested_for",
+    "request",
+    "sys_created_on",
+    "sys_id",
+];
+
+async fn run_catalog(
+    command: CatalogCommand,
+    client: &ServiceNowClient,
+    config: &Config,
+    output: &OutputConfig,
+) -> Result<(), ApiError> {
+    match command {
+        CatalogCommand::Search {
+            text,
+            limit,
+            offset,
+        } => {
+            let items = client
+                .search_catalog_items(text.as_deref(), limit, offset)
+                .await?;
+            let rows: Vec<Value> = items.iter().map(catalog_search_row).collect();
+            let fields: Vec<String> = ["name", "kind", "short_description", "sys_id"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            emit_records_or(output, rows, Some(&fields), "No catalog items found.");
+        }
+        CatalogCommand::Show { item } => {
+            let item = resolve_catalog_item(client, &item, true).await?;
+            emit_catalog_item(output, &item, client.site_url());
+        }
+        CatalogCommand::Order {
+            item,
+            vars,
+            vars_file,
+            quantity,
+            requested_for,
+            allow_unknown_vars,
+            allow_unverified_formats,
+            dry_run,
+            yes,
+        } => {
+            let file_values = match vars_file {
+                Some(path) => {
+                    catalog::parse_vars_document(&read_file_or_stdin(&path, "catalog variables")?)?
+                }
+                None => Default::default(),
+            };
+            let command_line = vars
+                .iter()
+                .map(|assignment| catalog::parse_var_assignment(assignment))
+                .collect::<Result<Vec<_>, _>>()?;
+            let inputs = catalog::merge_inputs(file_values, command_line);
+            let item = resolve_catalog_item(client, &item, false).await?;
+            item.ensure_orderable(client.site_url())?;
+            let requested_for =
+                resolve_reference_id(client, ReferenceKind::User, requested_for).await?;
+            let unverified_formats = if allow_unverified_formats {
+                catalog::UnverifiedFormats::Allow
+            } else if dry_run {
+                catalog::UnverifiedFormats::Preview
+            } else {
+                catalog::UnverifiedFormats::Refuse
+            };
+            let plan = catalog::prepare_order(
+                client,
+                &item,
+                &inputs,
+                &catalog::OrderOptions {
+                    quantity,
+                    requested_for,
+                    allow_unknown_vars,
+                    unverified_formats,
+                },
+            )
+            .await?;
+            for warning in &plan.warnings {
+                output.message(&format!("warning: {warning}"));
+            }
+            if item.has_client_logic {
+                output.message(
+                    "warning: this item has catalog UI policies or client scripts that the CLI does not run",
+                );
+            }
+            if !item.custom_widgets.is_empty() {
+                output.message(&format!(
+                    "warning: this item has custom widgets the CLI cannot show or fill ({}); if the order is rejected or incomplete, use the portal",
+                    item.custom_widgets.join(", ")
+                ));
+            }
+            let plan_json = plan.plan_json();
+            if dry_run {
+                emit_plan(
+                    output,
+                    &format!("order \"{}\" (quantity {})", plan.item_name, plan.quantity),
+                    &plan_json,
+                    "variables",
+                );
+                return Ok(());
+            }
+            config.require_writable()?;
+            if !yes && !output.json {
+                outln!(
+                    "Order \"{}\" (quantity {})\n",
+                    plan.item_name,
+                    plan.quantity
+                );
+                print_record(&plan_json["variables"], output.color);
+            }
+            confirm_destructive(
+                yes,
+                format!(
+                    "Submit order for \"{}\" ({} variable(s))?",
+                    plan.item_name,
+                    plan.variables.len()
+                ),
+                "order cancelled; rerun with --yes to submit without prompting",
+            )?;
+            let scrubber = plan.error_scrubber();
+            let request = client
+                .order_catalog_item(
+                    &plan.item_sys_id,
+                    &plan.request_body(),
+                    scrubber
+                        .as_ref()
+                        .map(|scrub| scrub as &dyn Fn(&str) -> String),
+                )
+                .await?;
+            emit_order_result(client, output, &plan.item_name, request).await?;
+        }
+        CatalogCommand::Requests(CatalogRequestsCommand::Mine {
+            limit,
+            open,
+            display_value,
+        }) => {
+            let mut query =
+                "requested_for=javascript:gs.getUserID()^ORopened_by=javascript:gs.getUserID()"
+                    .to_string();
+            if open {
+                query.push_str("^active=true");
+            }
+            query.push_str("^ORDERBYDESCsys_created_on");
+            let records = client
+                .list_records(
+                    "sc_req_item",
+                    &ListOptions {
+                        query: Some(query),
+                        fields: Some(
+                            RITM_LIST_FIELDS
+                                .iter()
+                                .map(|field| (*field).into())
+                                .collect(),
+                        ),
+                        limit,
+                        display_value: display_value.unwrap_or_else(|| {
+                            if output.format == OutputFormat::Text {
+                                DisplayValue::True
+                            } else {
+                                DisplayValue::False
+                            }
+                        }),
+                        ..ListOptions::default()
+                    },
+                )
+                .await?;
+            let human_fields: Vec<String> =
+                ["number", "cat_item", "stage", "state", "sys_created_on"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+            emit_records_or(
+                output,
+                records,
+                Some(&human_fields),
+                "No requested items found.",
+            );
+        }
+        CatalogCommand::Requests(CatalogRequestsCommand::Vars {
+            identifier,
+            include_empty,
+        }) => {
+            let ritm = resolve_requested_item(client, &identifier).await?;
+            let ritm_sys_id = record_sys_id(&ritm)?.to_string();
+            let item_sys_id = ritm
+                .get("cat_item")
+                .and_then(|cell| cell.get("value").or(Some(cell)))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::InvalidInput(format!(
+                        "{identifier} has no catalog item, so its variables cannot be listed"
+                    ))
+                })?
+                .to_string();
+            let item = CatalogItem::from_api(&client.get_catalog_item(&item_sys_id).await?)?;
+            let names = catalog::readable_variable_names(&item);
+            let variables = if names.is_empty() {
+                Vec::new()
+            } else {
+                let fields: Vec<String> = names
+                    .iter()
+                    .map(|name| format!("variables.{name}"))
+                    .collect();
+                let record = client
+                    .get_record(
+                        "sc_req_item",
+                        &ritm_sys_id,
+                        Some(&fields),
+                        DisplayValue::All,
+                    )
+                    .await?;
+                catalog::ritm_variables(&item, &record)
+            };
+            emit_ritm_variables(output, &identifier, &variables, include_empty);
+        }
+    }
+    Ok(())
+}
+
+fn catalog_search_row(item: &Value) -> Value {
+    let class = item
+        .get("sys_class_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    serde_json::json!({
+        "sys_id": item.get("sys_id").cloned().unwrap_or(Value::Null),
+        "name": item.get("name").cloned().unwrap_or(Value::Null),
+        "short_description": item.get("short_description").cloned().unwrap_or(Value::Null),
+        "class": class,
+        "kind": catalog::kind_label(class),
+        "orderable": catalog::is_orderable_class(class),
+        "category": item.get("category").and_then(|category| category.get("title")).cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// Resolves an item by sys_id or exact (case-insensitive) name. With
+/// `allow_search`, a search that returns exactly one item also counts; an
+/// order never accepts that, so a fuzzy hit cannot place an order.
+async fn resolve_catalog_item(
+    client: &ServiceNowClient,
+    identifier: &str,
+    allow_search: bool,
+) -> Result<CatalogItem, ApiError> {
+    let identifier = identifier.trim();
+    if servicenow_cli::api::validate_sys_id(identifier).is_ok() {
+        return CatalogItem::from_api(
+            &client
+                .get_catalog_item(&identifier.to_ascii_lowercase())
+                .await?,
+        );
+    }
+    // Every page is read: a second item with the same name on a later page
+    // would otherwise go unnoticed and the first one be ordered.
+    const PAGE: usize = 100;
+    const MAX_RESULTS: usize = 1000;
+    let mut hits = Vec::new();
+    loop {
+        let page = client
+            .search_catalog_items(Some(identifier), PAGE, hits.len())
+            .await?;
+        let full = page.len() == PAGE;
+        hits.extend(page);
+        if !full {
+            break;
+        }
+        if hits.len() >= MAX_RESULTS {
+            return Err(ApiError::Conflict(format!(
+                "more than {MAX_RESULTS} catalog items match \"{identifier}\", so the name cannot be checked for uniqueness; use the sys_id"
+            )));
+        }
+    }
+    let exact: Vec<&Value> = hits
+        .iter()
+        .filter(|hit| {
+            hit.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(identifier))
+        })
+        .collect();
+    let candidates = |items: &[&Value]| {
+        items
+            .iter()
+            .take(10)
+            .map(|item| {
+                format!(
+                    "{} ({}, {})",
+                    item.get("name").and_then(Value::as_str).unwrap_or("?"),
+                    catalog::kind_label(
+                        item.get("sys_class_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    ),
+                    item.get("sys_id").and_then(Value::as_str).unwrap_or("?"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
+    let chosen = match exact.as_slice() {
+        [item] => *item,
+        [] if allow_search && hits.len() == 1 => &hits[0],
+        [] if hits.is_empty() => {
+            return Err(ApiError::NotFound(format!(
+                "no catalog item matches \"{identifier}\""
+            )));
+        }
+        [] => {
+            let all: Vec<&Value> = hits.iter().collect();
+            let hint = if allow_search {
+                "use a more specific name or the sys_id"
+            } else {
+                "orders need the exact item name or sys_id"
+            };
+            return Err(ApiError::NotFound(format!(
+                "no catalog item is named \"{identifier}\"; {hint}. Matches:\n  {}",
+                candidates(&all)
+            )));
+        }
+        several => {
+            return Err(ApiError::Conflict(format!(
+                "{} catalog items are named \"{identifier}\"; use the sys_id:\n  {}",
+                several.len(),
+                candidates(several)
+            )));
+        }
+    };
+    let sys_id = chosen
+        .get("sys_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::Other("catalog search result omitted sys_id".into()))?;
+    CatalogItem::from_api(&client.get_catalog_item(sys_id).await?)
+}
+
+fn emit_catalog_item(output: &OutputConfig, item: &CatalogItem, site_url: &str) {
+    let item = &item.redacted();
+    let portal_url = item.portal_url(site_url);
+    let orderable = item.ensure_orderable(site_url);
+    if output.json {
+        let mut value = serde_json::to_value(item).expect("catalog item is serializable");
+        value["kind"] = catalog::kind_label(&item.class).into();
+        value["orderable"] = orderable.is_ok().into();
+        value["portal_url"] = portal_url.into();
+        output.value(&serde_json::json!({ "result": value }));
+        return;
+    }
+    outln!("{}", output.heading(&item.name));
+    if !item.short_description.is_empty() {
+        outln!("{}", item.short_description);
+    }
+    outln!(
+        "{} ({}) {}\n{}\n",
+        catalog::kind_label(&item.class),
+        item.class,
+        item.sys_id,
+        portal_url
+    );
+    if let Err(reason) = &orderable {
+        outln!("Not orderable from the CLI: {reason}\n");
+    }
+    if item.has_client_logic {
+        outln!(
+            "Note: this item has client-side logic (UI policies or client scripts) the CLI does not run.\n"
+        );
+    }
+    if !item.custom_widgets.is_empty() {
+        outln!(
+            "Note: this item has custom widgets the CLI cannot show or fill: {}.\n",
+            item.custom_widgets.join(", ")
+        );
+    }
+    let rows: Vec<Value> = item
+        .variables
+        .iter()
+        .map(|variable| {
+            let options = if !variable.choices.is_empty() {
+                variable
+                    .choices
+                    .iter()
+                    .map(|choice| choice.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else if let Some(table) = &variable.reference_table {
+                format!("→ {table}")
+            } else {
+                String::new()
+            };
+            serde_json::json!({
+                "name": variable.name,
+                "label": variable.label,
+                "type": variable.type_name,
+                "required": if variable.mandatory { "yes" } else { "" },
+                "default": variable.default_value.clone().unwrap_or_default(),
+                "options": options,
+            })
+        })
+        .collect();
+    let fields: Vec<String> = ["name", "label", "type", "required", "default", "options"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    print_records_or(
+        &rows,
+        Some(&fields),
+        output.color,
+        "This item has no variables.",
+    );
+}
+
+async fn emit_order_result(
+    client: &ServiceNowClient,
+    output: &OutputConfig,
+    item_name: &str,
+    request: Value,
+) -> Result<(), ApiError> {
+    let request_id = request
+        .get("request_id")
+        .or_else(|| request.get("sys_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let request_number = request
+        .get("request_number")
+        .or_else(|| request.get("number"))
+        .and_then(Value::as_str)
+        .unwrap_or("the request")
+        .to_string();
+    // The order is already placed, so a failed follow-up lookup must not turn
+    // into an error exit: a retry would place a second order.
+    let requested_items = match request_id
+        .as_deref()
+        .filter(|id| servicenow_cli::api::validate_sys_id(id).is_ok())
+    {
+        Some(request_id) => match client
+            .list_records(
+                "sc_req_item",
+                &ListOptions {
+                    query: Some(format!("request={request_id}")),
+                    fields: Some(
+                        RITM_LIST_FIELDS
+                            .iter()
+                            .map(|field| (*field).into())
+                            .collect(),
+                    ),
+                    limit: 100,
+                    display_value: DisplayValue::False,
+                    ..ListOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(items) => Some(items),
+            Err(error) => {
+                output.message(&format!(
+                    "warning: the order was placed, but its requested items could not be read ({error}); do not reorder, check `servicenow catalog requests mine`"
+                ));
+                None
+            }
+        },
+        None => Some(Vec::new()),
+    };
+    let numbers: Vec<&str> = requested_items
+        .iter()
+        .flatten()
+        .filter_map(|item| item.get("number").and_then(Value::as_str))
+        .collect();
+    if numbers.is_empty() {
+        output.success(&format!("Ordered {item_name}: {request_number}"));
+        if requested_items.is_some() {
+            output.message("No requested items were found for this request yet; check `servicenow catalog requests mine`.");
+        }
+    } else {
+        output.success(&format!(
+            "Ordered {item_name}: {request_number} / {}",
+            numbers.join(", ")
+        ));
+    }
+    if output.json {
+        output.value(&serde_json::json!({
+            "request": request,
+            "requestedItems": requested_items,
+        }));
+    } else {
+        if let Some(request_id) = &request_id {
+            outln!(
+                "{request_number}  {}",
+                client.record_url("sc_request", request_id)
+            );
+        }
+        for item in requested_items.iter().flatten() {
+            if let (Some(number), Some(sys_id)) = (
+                item.get("number").and_then(Value::as_str),
+                item.get("sys_id").and_then(Value::as_str),
+            ) {
+                outln!("{number}  {}", client.record_url("sc_req_item", sys_id));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves a requested item by sys_id or number. Numbers are not unique, so
+/// several matches fail with the candidates instead of picking one.
+async fn resolve_requested_item(
+    client: &ServiceNowClient,
+    identifier: &str,
+) -> Result<Value, ApiError> {
+    let identifier = identifier.trim();
+    let fields: Vec<String> = ["sys_id", "number", "cat_item", "sys_created_on"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if servicenow_cli::api::validate_sys_id(identifier).is_ok() {
+        return client
+            .get_record("sc_req_item", identifier, Some(&fields), DisplayValue::All)
+            .await;
+    }
+    if identifier.is_empty() || !identifier.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(ApiError::InvalidInput(format!(
+            "invalid requested item '{identifier}'; give a RITM number or sys_id"
+        )));
+    }
+    let records = client
+        .list_records(
+            "sc_req_item",
+            &ListOptions {
+                query: Some(format!("number={identifier}")),
+                fields: Some(fields),
+                limit: 10,
+                display_value: DisplayValue::All,
+                ..ListOptions::default()
+            },
+        )
+        .await?;
+    match records.as_slice() {
+        [] => Err(ApiError::NotFound(format!("requested item {identifier}"))),
+        [record] => Ok(record.clone()),
+        several => Err(ApiError::Conflict(format!(
+            "{} requested items are numbered {identifier}; use the sys_id:\n  {}",
+            several.len(),
+            several
+                .iter()
+                .map(|record| {
+                    let cell = |field: &str| {
+                        record
+                            .get(field)
+                            .and_then(|cell| cell.get("display_value").or(Some(cell)))
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_string()
+                    };
+                    let sys_id = record_sys_id(record).unwrap_or("?");
+                    format!(
+                        "{sys_id} ({}, created {})",
+                        cell("cat_item"),
+                        cell("sys_created_on")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ))),
+    }
+}
+
+fn emit_ritm_variables(
+    output: &OutputConfig,
+    identifier: &str,
+    variables: &[catalog::RitmVariable],
+    include_empty: bool,
+) {
+    // A reorder from the JSON export would replace a cleared value with the
+    // item's default, so a cleared default is kept there.
+    let shown: Vec<&catalog::RitmVariable> = variables
+        .iter()
+        .filter(|variable| {
+            include_empty || !variable.value.is_empty() || (output.json && variable.has_default)
+        })
+        .collect();
+    let withheld: Vec<&str> = shown
+        .iter()
+        .filter(|variable| variable.sensitive)
+        .map(|variable| variable.name.as_str())
+        .collect();
+    if output.json {
+        if !withheld.is_empty() {
+            output.message(&format!(
+                "Omitted sensitive variable(s) {}; supply them yourself with --vars-file.",
+                withheld.join(", ")
+            ));
+        }
+        // The object is input for `catalog order --vars-file`, which refuses
+        // read-only variables, so they are left out.
+        let read_only: Vec<&str> = shown
+            .iter()
+            .filter(|variable| variable.read_only && !variable.sensitive)
+            .map(|variable| variable.name.as_str())
+            .collect();
+        if !read_only.is_empty() {
+            output.message(&format!(
+                "Omitted read-only variable(s) {}, which the form fills itself; see them with --output text.",
+                read_only.join(", ")
+            ));
+        }
+        let reusable: Vec<&&catalog::RitmVariable> = shown
+            .iter()
+            .filter(|variable| !variable.sensitive && !variable.read_only)
+            .collect();
+        let unplaced: Vec<&str> = reusable
+            .iter()
+            .filter(|variable| variable.order_value.is_none())
+            .map(|variable| variable.name.as_str())
+            .collect();
+        if !unplaced.is_empty() {
+            output.message(&format!(
+                "Omitted variable(s) {}: the instance returned them without a value in your time zone; see them with --output text.",
+                unplaced.join(", ")
+            ));
+        }
+        let values: Map<String, Value> = reusable
+            .iter()
+            .filter_map(|variable| {
+                let value = variable.order_value.clone()?;
+                Some((variable.name.clone(), Value::String(value)))
+            })
+            .collect();
+        output.value(&Value::Object(values));
+        return;
+    }
+    let rows: Vec<Value> = shown
+        .iter()
+        .map(|variable| {
+            let display = if variable.sensitive {
+                servicenow_cli::sensitive::REDACTED.to_string()
+            } else {
+                variable.display_value.clone()
+            };
+            serde_json::json!({
+                "name": variable.name,
+                "label": variable.label,
+                "value": display,
+            })
+        })
+        .collect();
+    let fields: Vec<String> = ["name", "label", "value"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    print_records_or(
+        &rows,
+        Some(&fields),
+        output.color,
+        &format!("{identifier} has no variable values."),
+    );
+}
+
 fn read_file_or_stdin(path: &std::path::Path, label: &str) -> Result<String, ApiError> {
     if path == std::path::Path::new("-") {
         let mut value = String::new();
@@ -2628,11 +3397,22 @@ fn emit_mutation_plan(
         "incident": identifier,
         "changes": body,
     });
+    emit_plan(
+        output,
+        &format!("{operation} {identifier}"),
+        &plan,
+        "changes",
+    );
+}
+
+/// Prints a dry-run plan: the whole plan as machine output, or a one-line
+/// summary followed by the plan's `detail_key` section as a human record.
+fn emit_plan(output: &OutputConfig, summary: &str, plan: &Value, detail_key: &str) {
     if output.json {
-        output.value(&plan);
+        output.value(plan);
     } else {
-        outln!("Dry run: {operation} {identifier}\n");
-        print_record(&plan["changes"], output.color);
+        outln!("Dry run: {summary}\n");
+        print_record(&plan[detail_key], output.color);
     }
 }
 
@@ -3362,6 +4142,7 @@ fn command_behavior(path: &str) -> Value {
         "tables create",
         "tables update",
         "tables delete",
+        "catalog order",
     ];
     let local_mutations = [
         "init",
@@ -3413,9 +4194,12 @@ fn command_behavior(path: &str) -> Value {
     let destructive = path.ends_with("attachments delete")
         || path.ends_with("tables delete")
         || path.ends_with("profile remove");
-    let requires_confirmation =
-        destructive || path.ends_with("incidents edit") || path.ends_with("tui");
+    let requires_confirmation = destructive
+        || path.ends_with("incidents edit")
+        || path.ends_with("catalog order")
+        || path.ends_with("tui");
     let supports_dry_run = [
+        "catalog order",
         "incidents resolve",
         "incidents edit",
         "incidents note",

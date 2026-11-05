@@ -1,0 +1,210 @@
+{
+  "result": {
+    "short_description": "Use this form to submit request for new amazon web services (AWS) account",
+    "legacy": false,
+    "kb_article": "",
+    "availability": "on_desktop",
+    "mandatory_attachment": false,
+    "request_method": "submit",
+    "type": "catalog_item",
+    "visible_standalone": true,
+    "sys_class_name": "sc_cat_item",
+    "sys_id": "5a1efa5947520510f53d37d2846d439b",
+    "content_type": "",
+    "order": 0,
+    "hide_sp": false,
+    "make_item_non_conversational": false,
+    "owner": "6816f79cc0a8016401c5a33be04be441",
+    "show_price": false,
+    "show_quantity": true,
+    "url": "",
+    "catalogs": [
+      {
+        "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+        "active": true,
+        "title": "Service Catalog"
+      }
+    ],
+    "name": "AWS account request",
+    "show_wishlist": true,
+    "category": {
+      "sys_id": "22555319db0150104327198d1396195c",
+      "title": "Application and Account Access"
+    },
+    "turn_off_nowassist_conversation": false,
+    "show_delivery_time": true,
+    "categories": [
+      {
+        "sys_id": "2809952237b1300054b6a3549dbe5dd4",
+        "active": true,
+        "category": {
+          "sys_id": "22555319db0150104327198d1396195c",
+          "active": true,
+          "title": "Application and Account Access"
+        },
+        "title": "Software"
+      }
+    ],
+    "variables": [
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Division",
+        "dynamic_value_field": "",
+        "type": 5,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "select_box",
+        "display_type": "Select Box",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "division",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "497e729947520510f53d37d2846d434f",
+        "choices": [
+          {
+            "index": 0,
+            "label": "-- None --",
+            "value": ""
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 1,
+            "recurring_price": 0.0,
+            "label": "IT",
+            "value": "IT",
+            "price_currency": "USD"
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 2,
+            "recurring_price": 0.0,
+            "label": "Product",
+            "value": "Product",
+            "price_currency": "USD"
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 3,
+            "recurring_price": 0.0,
+            "label": "Marketing",
+            "value": "Marketing",
+            "price_currency": "USD"
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 4,
+            "recurring_price": 0.0,
+            "label": "Sales",
+            "value": "Sales",
+            "price_currency": "USD"
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 5,
+            "recurring_price": 0.0,
+            "label": "Finance",
+            "value": "Finance",
+            "price_currency": "USD"
+          }
+        ],
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 10
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Environment",
+        "dynamic_value_field": "",
+        "type": 5,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "select_box",
+        "display_type": "Select Box",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "environment",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "a672439d47520510f53d37d2846d43b5",
+        "choices": [
+          {
+            "index": 0,
+            "label": "-- None --",
+            "value": ""
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 1,
+            "recurring_price": 0.0,
+            "label": "Dev",
+            "value": "Dev",
+            "price_currency": "USD"
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 2,
+            "recurring_price": 0.0,
+            "label": "QA",
+            "value": "QA",
+            "price_currency": "USD"
+          },
+          {
+            "recurring_price_currency": "USD",
+            "price": 0.0,
+            "index": 3,
+            "recurring_price": 0.0,
+            "label": "Prod",
+            "value": "Prod",
+            "price_currency": "USD"
+          }
+        ],
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 20
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Describe the purpose of this account briefly",
+        "dynamic_value_field": "",
+        "type": 2,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "multi_line_text",
+        "display_type": "Multi Line Text",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "describe_briefly_the_purpose_of_this_account",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "c693035147920510f53d37d2846d43fd",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 30
+      }
+    ],
+    "ui_policy": [],
+    "client_script": {
+      "onChange": [],
+      "onSubmit": [],
+      "onLoad": []
+    },
+    "data_lookup": []
+  }
+}

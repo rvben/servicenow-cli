@@ -1,0 +1,384 @@
+{
+  "result": [
+    {
+      "short_description": null,
+      "legacy": true,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "record_producer",
+      "visible_standalone": true,
+      "sys_class_name": "sc_cat_item_producer",
+      "sys_id": "011f117a9f3002002920bde8132e7020",
+      "content_type": "",
+      "order": 30,
+      "hide_sp": true,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": false,
+      "show_quantity": true,
+      "url": "",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Retire a Standard Change Template",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "00728916937002002dcef157b67ffb6d",
+        "title": "Template Management"
+      },
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "Request for email alias",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "submit",
+      "type": "catalog_item",
+      "visible_standalone": true,
+      "sys_class_name": "sc_cat_item",
+      "sys_id": "0317ba9d47120510f53d37d2846d43bb",
+      "content_type": "",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "6816f79cc0a8016401c5a33be04be441",
+      "show_price": false,
+      "show_quantity": true,
+      "url": "",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Request email alias",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "22555319db0150104327198d1396195c",
+        "title": "Application and Account Access"
+      },
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "Microsoft Access",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_both",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "catalog_item",
+      "visible_standalone": true,
+      "local_currency": "USD",
+      "sys_class_name": "pc_software_cat_item",
+      "recurring_price_value": 0.0,
+      "sys_id": "039c516237b1300054b6a3549dbe5dfc",
+      "content_type": "",
+      "price": "$139.99",
+      "recurring_frequency": null,
+      "price_currency": "USD",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": true,
+      "recurring_price": "$0.00",
+      "show_quantity": true,
+      "url": "",
+      "recurring_price_currency": "USD",
+      "localized_price": "$139.99",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Access",
+      "localized_recurring_price": "$0.00",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "2809952237b1300054b6a3549dbe5dd4",
+        "title": "Software"
+      },
+      "price_value": 139.99,
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "Lenovo - Carbon x1",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_both",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "catalog_item",
+      "visible_standalone": true,
+      "local_currency": "USD",
+      "sys_class_name": "sc_cat_item",
+      "recurring_price_value": 100.0,
+      "sys_id": "04b7e94b4f7b4200086eeed18110c7fd",
+      "content_type": "",
+      "price": "$1,100.00",
+      "recurring_frequency": "Annually",
+      "price_currency": "USD",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": true,
+      "recurring_price": "$100.00",
+      "show_quantity": true,
+      "url": "",
+      "recurring_price_currency": "USD",
+      "localized_price": "$1,100.00",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Standard Laptop",
+      "localized_recurring_price": "$100.00",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "d258b953c611227a0146101fb1be7c31",
+        "title": "Hardware"
+      },
+      "price_value": 1100.0,
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "Privacy Filter",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "catalog_item",
+      "visible_standalone": true,
+      "local_currency": "USD",
+      "sys_class_name": "pc_hardware_cat_item",
+      "recurring_price_value": 0.0,
+      "sys_id": "173d429881df2500772e95d75e28626e",
+      "content_type": "",
+      "price": "$42.23",
+      "recurring_frequency": null,
+      "price_currency": "USD",
+      "order": 350,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": true,
+      "recurring_price": "$0.00",
+      "show_quantity": true,
+      "url": "",
+      "recurring_price_currency": "USD",
+      "localized_price": "$42.23",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "3M Privacy Filter - MacBook Pro",
+      "localized_recurring_price": "$0.00",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "2c0b59874f7b4200086eeed18110c71f",
+        "title": "Peripherals"
+      },
+      "price_value": 42.23,
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "Request hardware and software to support a\n\t\t\tdevelopment project\n\t\t",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "order_guide",
+      "visible_standalone": true,
+      "sys_class_name": "sc_cat_item_guide",
+      "sys_id": "25110912372211003e7d40ed9dbe5dd6",
+      "content_type": "",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": false,
+      "show_quantity": true,
+      "url": "",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Request Developer Project Equipment",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "",
+        "title": null
+      },
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "CRP to create catalog client script",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "catalog_item",
+      "visible_standalone": true,
+      "sys_class_name": "sc_cat_item_composite_producer",
+      "sys_id": "2bbb9bd7ffe82210a579ffffffffff1a",
+      "content_type": "",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": false,
+      "show_quantity": true,
+      "url": "",
+      "catalogs": [
+        {
+          "sys_id": "",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Catalog Client Script",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "",
+        "title": null
+      },
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": null,
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "content_item",
+      "visible_standalone": true,
+      "sys_class_name": "sc_cat_item_content",
+      "sys_id": "3c72dc91eb00210045e1a5115206fec7",
+      "content_type": "external",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": false,
+      "show_quantity": true,
+      "url": "/$pwd_change.do",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Change Password",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "e15706fc0a0a0aa7007fc21e1ab70c2f",
+        "title": "Can We Help You?"
+      },
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "This standard change template describes adding a new network switch to a datacenter cabinet",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "",
+      "type": "catalog_item",
+      "visible_standalone": true,
+      "sys_class_name": "std_change_record_producer",
+      "sys_id": "508e02ec47410200e90d87e8dee49058",
+      "content_type": "",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "",
+      "show_price": false,
+      "show_quantity": true,
+      "url": "",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "Add network switch to datacenter cabinet",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "abbcbbbf47700200e90d87e8dee49041",
+        "title": "Network Standard Changes"
+      },
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    },
+    {
+      "short_description": "Use this form to submit request for new amazon web services (AWS) account",
+      "legacy": false,
+      "kb_article": "",
+      "availability": "on_desktop",
+      "mandatory_attachment": false,
+      "request_method": "submit",
+      "type": "catalog_item",
+      "visible_standalone": true,
+      "sys_class_name": "sc_cat_item",
+      "sys_id": "5a1efa5947520510f53d37d2846d439b",
+      "content_type": "",
+      "order": 0,
+      "hide_sp": false,
+      "make_item_non_conversational": false,
+      "owner": "6816f79cc0a8016401c5a33be04be441",
+      "show_price": false,
+      "show_quantity": true,
+      "url": "",
+      "catalogs": [
+        {
+          "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+          "active": true,
+          "title": "Service Catalog"
+        }
+      ],
+      "name": "AWS account request",
+      "show_wishlist": true,
+      "category": {
+        "sys_id": "22555319db0150104327198d1396195c",
+        "title": "Application and Account Access"
+      },
+      "turn_off_nowassist_conversation": false,
+      "show_delivery_time": true
+    }
+  ]
+}

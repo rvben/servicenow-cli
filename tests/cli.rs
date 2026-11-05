@@ -1707,3 +1707,932 @@ async fn a_rate_limited_response_exits_with_the_rate_limit_code() {
         .code(6)
         .stderr(predicate::str::contains("rate limit"));
 }
+
+const AWS_ITEM: &str = "5a1efa5947520510f53d37d2846d439b";
+
+fn catalog_fixture(name: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/tests/fixtures/catalog/{name}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+async fn mount_aws_item(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(catalog_fixture("aws_account_request")),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn forbid_order_post(server: &MockServer) {
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+const AWS_VARS: [&str; 6] = [
+    "--var",
+    "division=IT",
+    "--var",
+    "environment=Dev",
+    "--var",
+    "describe_briefly_the_purpose_of_this_account=Sandbox",
+];
+
+fn set_variable_default(node: &mut serde_json::Value, name: &str, value: &str) -> bool {
+    match node {
+        serde_json::Value::Object(map) => {
+            if map.get("name").and_then(serde_json::Value::as_str) == Some(name) {
+                map.insert("value".into(), value.into());
+                return true;
+            }
+            map.values_mut()
+                .any(|child| set_variable_default(child, name, value))
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .any(|child| set_variable_default(child, name, value)),
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn catalog_show_redacts_sensitive_defaults() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut zoom = catalog_fixture("zoom_webinar");
+    assert!(set_variable_default(&mut zoom, "set_password", "hunter2"));
+    let zoom_id = zoom["result"]["sys_id"].as_str().unwrap().to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(zoom))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    for format in ["json", "text"] {
+        let output = authenticated_command(&config_home, &server)
+            .args(["catalog", "show", &zoom_id, "--output", format])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!stdout.contains("hunter2"), "{format}: {stdout}");
+        assert!(stdout.contains("[REDACTED]"), "{format}: {stdout}");
+    }
+}
+
+#[tokio::test]
+async fn catalog_order_dry_run_validates_without_submitting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .env("SERVICENOW_READ_ONLY", "true")
+        .args(["catalog", "order", AWS_ITEM, "--dry-run", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["dryRun"], true);
+    assert_eq!(plan["operation"], "order");
+    assert_eq!(plan["item"]["sys_id"], AWS_ITEM);
+    assert_eq!(plan["variables"]["division"], "IT");
+    assert_eq!(plan["variables"]["environment"], "Dev");
+}
+
+#[tokio::test]
+async fn catalog_order_names_custom_widgets_it_cannot_fill() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut item = catalog_fixture("aws_account_request");
+    item["result"]["variables"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "name": "cost_center_picker",
+            "label": "Cost center",
+            "friendly_type": "macro_with_abel",
+            "type": 17
+        }));
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(item))
+        .mount(&server)
+        .await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--dry-run", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("custom widgets the CLI cannot show or fill (Cost center)"),
+        "{stderr}"
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(plan["variables"].get("cost_center_picker").is_none());
+}
+
+#[tokio::test]
+async fn catalog_order_is_blocked_by_read_only_mode() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .env("SERVICENOW_READ_ONLY", "true")
+        .args(["catalog", "order", AWS_ITEM, "--yes"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("read-only"));
+}
+
+#[tokio::test]
+async fn catalog_order_without_yes_refuses_a_non_interactive_stdin() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM])
+        .args(AWS_VARS)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("order cancelled"));
+}
+
+#[tokio::test]
+async fn catalog_order_rejects_invalid_variables_before_submitting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes"])
+        .args(["--var", "division=Legal", "--var", "enviroment=Dev"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("division"), "{stderr}");
+    assert!(stderr.contains("environment"), "{stderr}");
+    assert!(
+        stderr.contains("describe_briefly_the_purpose_of_this_account"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_submits_once_and_reports_the_requested_items() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let request_id = "b54ae46e1b181310b97aa975624bcbf2";
+    mount_aws_item(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/order_now"
+        )))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "sysparm_quantity": "1",
+            "variables": {
+                "division": "IT",
+                "environment": "Dev",
+                "describe_briefly_the_purpose_of_this_account": "Sandbox"
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": request_id,
+                "number": "REQ0010001",
+                "request_number": "REQ0010001",
+                "request_id": request_id,
+                "table": "sc_request"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .and(query_param(
+            "sysparm_query",
+            format!("request={request_id}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{"number": "RITM0010001", "sys_id": "0123456789abcdef0123456789abcdef"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["request"]["request_number"], "REQ0010001");
+    assert_eq!(result["requestedItems"][0]["number"], "RITM0010001");
+}
+
+#[tokio::test]
+async fn catalog_order_succeeds_when_the_follow_up_lookup_fails() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let request_id = "b54ae46e1b181310b97aa975624bcbf2";
+    mount_aws_item(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/order_now"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "sys_id": request_id,
+                "number": "REQ0010001",
+                "request_number": "REQ0010001",
+                "request_id": request_id,
+                "table": "sc_request"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": {"message": "Insufficient rights", "detail": ""},
+            "status": "failure"
+        })))
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("do not reorder"), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["request"]["request_number"], "REQ0010001");
+    assert!(result["requestedItems"].is_null(), "{result}");
+}
+
+async fn mount_catalog_search_page(
+    server: &MockServer,
+    offset: usize,
+    items: Vec<serde_json::Value>,
+) {
+    Mock::given(method("GET"))
+        .and(path("/api/sn_sc/servicecatalog/items"))
+        .and(query_param("sysparm_text", "AWS account request"))
+        .and(query_param("sysparm_offset", offset.to_string()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "result": items })),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+fn aws_search_page(exact_sys_id: Option<&str>, fillers: usize) -> Vec<serde_json::Value> {
+    let mut items: Vec<serde_json::Value> = (0..fillers)
+        .map(|index| {
+            serde_json::json!({
+                "sys_id": format!("{index:032x}"),
+                "name": format!("AWS account request add-on {index}"),
+                "sys_class_name": "sc_cat_item"
+            })
+        })
+        .collect();
+    if let Some(sys_id) = exact_sys_id {
+        items.push(serde_json::json!({
+            "sys_id": sys_id,
+            "name": "AWS account request",
+            "sys_class_name": "sc_cat_item"
+        }));
+    }
+    items
+}
+
+#[tokio::test]
+async fn catalog_order_finds_a_second_exact_match_beyond_the_first_page() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    forbid_order_post(&server).await;
+    let other = "ffffffffffffffffffffffffffffffff";
+    mount_catalog_search_page(&server, 0, aws_search_page(Some(AWS_ITEM), 99)).await;
+    mount_catalog_search_page(&server, 100, aws_search_page(Some(other), 3)).await;
+
+    let order = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", "AWS account request", "--dry-run"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(!order.status.success());
+    let stderr = String::from_utf8_lossy(&order.stderr);
+    assert!(stderr.contains("2 catalog items are named"), "{stderr}");
+    assert!(
+        stderr.contains(AWS_ITEM) && stderr.contains(other),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_refuses_a_name_it_cannot_check_for_uniqueness() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    forbid_order_post(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/sn_sc/servicecatalog/items"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "result": aws_search_page(Some(AWS_ITEM), 99) }),
+            ),
+        )
+        .expect(10)
+        .mount(&server)
+        .await;
+
+    let order = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", "AWS account request", "--dry-run"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(!order.status.success());
+    let stderr = String::from_utf8_lossy(&order.stderr);
+    assert!(
+        stderr.contains("more than 1000 catalog items match"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_resolves_a_name_when_later_pages_hold_no_other_match() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    forbid_order_post(&server).await;
+    mount_catalog_search_page(&server, 0, aws_search_page(Some(AWS_ITEM), 99)).await;
+    mount_catalog_search_page(&server, 100, aws_search_page(None, 0)).await;
+
+    let order = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            "AWS account request",
+            "--dry-run",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        order.status.success(),
+        "{}",
+        String::from_utf8_lossy(&order.stderr)
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_refuses_unverifiable_date_formats_but_a_dry_run_only_warns() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut zoom = catalog_fixture("zoom_webinar");
+    let zoom_id = zoom["result"]["sys_id"].as_str().unwrap().to_string();
+    for variable in zoom["result"]["variables"].as_array_mut().unwrap() {
+        if variable["name"] == "add_co_hosts" {
+            variable["mandatory"] = false.into();
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(zoom))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sys_user"))
+        .and(query_param(
+            "sysparm_query",
+            "sys_id=javascript:gs.getUserID()",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": [{}]})))
+        .mount(&server)
+        .await;
+    forbid_order_post(&server).await;
+    let vars = [
+        "--var",
+        "topic=Launch",
+        "--var",
+        "select_webinar_start_time=2026-12-01 10:00:00",
+        "--var",
+        "select_webinar_end_time=2026-12-01 11:00:00",
+    ];
+
+    let dry_run = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", &zoom_id, "--dry-run", "--json"])
+        .args(vars)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&dry_run.stderr);
+    assert!(dry_run.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("a real order needs --allow-unverified-formats"),
+        "{stderr}"
+    );
+
+    let order = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", &zoom_id, "--yes", "--json"])
+        .args(vars)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&order.stderr);
+    assert!(!order.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("pass --allow-unverified-formats to order anyway"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_needs_an_exact_name_but_show_accepts_a_single_match() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    forbid_order_post(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/sn_sc/servicecatalog/items"))
+        .and(query_param("sysparm_text", "AWS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": AWS_ITEM,
+                "name": "AWS account request",
+                "sys_class_name": "sc_cat_item"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let order = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", "AWS", "--dry-run"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(!order.status.success());
+    let stderr = String::from_utf8_lossy(&order.stderr);
+    assert!(stderr.contains("exact item name or sys_id"), "{stderr}");
+    assert!(stderr.contains(AWS_ITEM), "{stderr}");
+
+    let show = authenticated_command(&config_home, &server)
+        .args(["catalog", "show", "AWS", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let item: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(item["result"]["sys_id"], AWS_ITEM);
+    assert_eq!(item["result"]["orderable"], true);
+}
+
+#[test]
+fn schema_marks_catalog_order_as_a_confirmed_dry_runnable_mutation() {
+    let config_home = TempDir::new().unwrap();
+    let output = command(&config_home)
+        .args(["schema", "--command", "catalog order"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(schema["behavior"]["mutation"], true);
+    assert_eq!(schema["behavior"]["sideEffect"], "remote");
+    assert_eq!(schema["behavior"]["requiresConfirmation"], true);
+    assert_eq!(schema["behavior"]["supportsDryRun"], true);
+
+    let search = command(&config_home)
+        .args(["schema", "--command", "catalog search"])
+        .output()
+        .unwrap();
+    let search: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(search["behavior"]["mutation"], false);
+}
+
+#[tokio::test]
+async fn catalog_request_vars_withholds_masked_values() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let zoom_item = "54c9ead947dec110f53d37d2846d43ea";
+    let ritm_id = "0123456789abcdef0123456789abcdef";
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .and(query_param("sysparm_query", "number=RITM0010001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": {"value": ritm_id, "display_value": ritm_id},
+                "number": {"value": "RITM0010001", "display_value": "RITM0010001"},
+                "cat_item": {"value": zoom_item, "display_value": "Zoom webinar"}
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_item}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(catalog_fixture("zoom_webinar")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/table/sc_req_item/{ritm_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "variables.topic": {"value": "Quarterly review", "display_value": "Quarterly review"},
+                "variables.descripion": {"value": "", "display_value": ""},
+                "variables.requires_password": {"value": "true", "display_value": "true"},
+                "variables.set_password": {"value": "hunter2-secret", "display_value": "hunter2-secret"}
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "requests", "vars", "RITM0010001", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let values: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        values,
+        serde_json::json!({"topic": "Quarterly review", "requires_password": "true"})
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("set_password"), "{stderr}");
+    assert!(!stderr.contains("hunter2"), "{stderr}");
+
+    let text = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "requests",
+            "vars",
+            "RITM0010001",
+            "--output",
+            "text",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert!(stdout.contains("[REDACTED]"), "{stdout}");
+    assert!(!stdout.contains("hunter2"), "{stdout}");
+}
+
+#[tokio::test]
+async fn catalog_request_vars_leaves_read_only_values_out_of_the_reusable_export() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let zoom_item = "54c9ead947dec110f53d37d2846d43ea";
+    let ritm_id = "0123456789abcdef0123456789abcdef";
+    let mut zoom = catalog_fixture("zoom_webinar");
+    for variable in zoom["result"]["variables"].as_array_mut().unwrap() {
+        if variable["name"] == "topic" {
+            variable["read_only"] = true.into();
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .and(query_param("sysparm_query", "number=RITM0010001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": {"value": ritm_id, "display_value": ritm_id},
+                "number": {"value": "RITM0010001", "display_value": "RITM0010001"},
+                "cat_item": {"value": zoom_item, "display_value": "Zoom webinar"}
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_item}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(zoom))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/table/sc_req_item/{ritm_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "variables.topic": {"value": "Quarterly review", "display_value": "Quarterly review"},
+                "variables.descripion": {"value": "", "display_value": ""},
+                "variables.requires_password": {"value": "true", "display_value": "true"},
+                "variables.set_password": {"value": "hunter2-secret", "display_value": "hunter2-secret"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "requests", "vars", "RITM0010001", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let values: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(values, serde_json::json!({"requires_password": "true"}));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("read-only variable(s) topic"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_request_vars_export_reorders_like_the_original() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let zoom_item = "54c9ead947dec110f53d37d2846d43ea";
+    let ritm_id = "0123456789abcdef0123456789abcdef";
+    let mut zoom = catalog_fixture("zoom_webinar");
+    for variable in zoom["result"]["variables"].as_array_mut().unwrap() {
+        if variable["name"] == "descripion" {
+            variable["value"] = "Agenda to follow".into();
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .and(query_param("sysparm_query", "number=RITM0010001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{
+                "sys_id": {"value": ritm_id, "display_value": ritm_id},
+                "number": {"value": "RITM0010001", "display_value": "RITM0010001"},
+                "cat_item": {"value": zoom_item, "display_value": "Zoom webinar"}
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_item}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(zoom))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/now/table/sc_req_item/{ritm_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": {
+                "variables.topic": {"value": "Quarterly review", "display_value": "Quarterly review"},
+                "variables.descripion": {"value": "", "display_value": ""},
+                "variables.select_webinar_start_time": {
+                    "value": "2027-03-01 18:00:00",
+                    "display_value": "2027-03-01 10:00:00"
+                },
+                "variables.select_webinar_end_time": {"value": "", "display_value": ""}
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "requests", "vars", "RITM0010001", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Omitting the cleared value would make a reorder submit the default,
+    // and the stored UTC date-time would be read in the user's time zone.
+    let values: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        values,
+        serde_json::json!({
+            "topic": "Quarterly review",
+            "descripion": "",
+            "select_webinar_start_time": "2027-03-01 10:00:00"
+        })
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_errors_never_echo_a_sensitive_value() {
+    let all = order_with_echoed_secret(
+        r#"{"topic": "Launch", "set_password": "s3cr3t-Pa55"}"#,
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "Invalid value s3cr3t-Pa55 for set_password", "detail": "s3cr3t-Pa55"},
+            "status": "failure"
+        })),
+    )
+    .await;
+    assert!(!all.contains("s3cr3t-Pa55"), "{all}");
+    assert!(
+        all.contains("Invalid value [REDACTED] for set_password: [REDACTED]"),
+        "{all}"
+    );
+}
+
+/// A JSON `\u` escape of `hex`, built without writing one in this source.
+fn u_escape(hex: &str) -> String {
+    format!("{}u{hex}", '\\')
+}
+
+#[tokio::test]
+async fn catalog_order_withholds_a_non_json_error_body_when_secrets_were_sent() {
+    // The secret is Zq"Kx\Vé9=. A non-JSON error page can quote it in any
+    // encoding (JSON-escaped, upper or lower hex, HTML-safe), so none of the
+    // page is shown.
+    let body = format!(
+        r#"rejected "Zq\"Kx\\V{}9{}" and "Zq{}Kx{}V{}9{}" and "Zq\"Kx\\Vé9=""#,
+        u_escape("00C9"),
+        u_escape("003D"),
+        u_escape("0022"),
+        u_escape("005c"),
+        u_escape("00e9"),
+        u_escape("003d"),
+    );
+    let all = order_with_echoed_secret(
+        r#"{"topic": "Launch", "set_password": "Zq\"Kx\\Vé9="}"#,
+        ResponseTemplate::new(400).set_body_raw(body, "text/plain"),
+    )
+    .await;
+    assert!(!all.contains("Zq"), "{all}");
+    assert!(!all.contains("Kx"), "{all}");
+    assert!(
+        all.contains("HTTP 400 (response body withheld: the order contains sensitive values)"),
+        "{all}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_withholds_an_error_message_quoting_escaped_json() {
+    // A JSON error message can itself quote the request as JSON text, so
+    // after decoding the response the secret is still escaped.
+    let message = format!(
+        r#"bad request {{"set_password":"Zq\"Kx\\V{}9{}"}}"#,
+        u_escape("00C9"),
+        u_escape("003D"),
+    );
+    let all = order_with_echoed_secret(
+        r#"{"topic": "Launch", "set_password": "Zq\"Kx\\Vé9="}"#,
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": message},
+            "status": "failure"
+        })),
+    )
+    .await;
+    assert!(!all.contains("Zq"), "{all}");
+    assert!(!all.contains("Kx"), "{all}");
+    assert!(all.contains("withheld"), "{all}");
+}
+
+#[tokio::test]
+async fn catalog_order_withholds_an_error_message_quoting_html_or_url_encoding() {
+    // The secret is P&ssword=1. HTML and URL encoding change it without a
+    // backslash, so a message using either is withheld; a raw echo is still
+    // shown with the value replaced.
+    for (message, shown) in [
+        ("Invalid value P&amp;ssword=1", false),
+        ("Invalid value P%26ssword%3D1", false),
+        ("Invalid value P&ssword=1", true),
+    ] {
+        let all = order_with_echoed_secret(
+            r#"{"topic": "Launch", "set_password": "P&ssword=1"}"#,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {"message": message},
+                "status": "failure"
+            })),
+        )
+        .await;
+        assert!(!all.contains("ssword"), "{message}: {all}");
+        if shown {
+            assert!(all.contains("Invalid value [REDACTED]"), "{message}: {all}");
+        } else {
+            assert!(all.contains("error message withheld"), "{message}: {all}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_order_errors_never_echo_part_of_a_sensitive_value() {
+    // A long non-JSON error page is shortened for display; a secret quoted
+    // across the cut must not survive as a prefix.
+    let body = format!("{}s3cr3tPa55w0rdTail and more", "x".repeat(490));
+    let all = order_with_echoed_secret(
+        r#"{"topic": "Launch", "set_password": "s3cr3tPa55w0rdTail"}"#,
+        ResponseTemplate::new(502).set_body_raw(body, "text/html"),
+    )
+    .await;
+    assert!(!all.contains("s3cr3"), "{all}");
+    assert!(all.contains("response body withheld"), "{all}");
+}
+
+#[tokio::test]
+async fn catalog_order_without_secrets_shows_a_non_json_error_body() {
+    let all = order_with_echoed_secret(
+        r#"{"topic": "Launch"}"#,
+        ResponseTemplate::new(502).set_body_raw("upstream gateway down", "text/html"),
+    )
+    .await;
+    assert!(all.contains("upstream gateway down"), "{all}");
+    assert!(!all.contains("withheld"), "{all}");
+}
+
+/// Orders the Zoom fixture (all variables optional) with the given variables
+/// on stdin against an order endpoint answering `error`, and returns stdout
+/// and stderr together.
+async fn order_with_echoed_secret(vars: &str, error: ResponseTemplate) -> String {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut zoom = catalog_fixture("zoom_webinar");
+    fn optional(node: &mut serde_json::Value) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("mandatory") {
+                    map.insert("mandatory".into(), false.into());
+                }
+                map.values_mut().for_each(optional);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(optional),
+            _ => {}
+        }
+    }
+    optional(&mut zoom);
+    let zoom_id = zoom["result"]["sys_id"].as_str().unwrap().to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(zoom))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{zoom_id}/order_now"
+        )))
+        .respond_with(error)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut child = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", &zoom_id, "--yes", "--vars-file", "-"])
+        .args(["--output", "json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(vars.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}

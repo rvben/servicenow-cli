@@ -2,6 +2,7 @@ pub mod api;
 pub mod attachment;
 pub mod auth;
 pub mod browser;
+pub mod catalog;
 pub mod commands;
 pub mod config;
 mod cookies;

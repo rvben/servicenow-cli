@@ -86,6 +86,7 @@ pub struct ServiceNowClient {
     site_url: String,
     table_url: String,
     attachment_url: String,
+    catalog_url: String,
 }
 
 impl ServiceNowClient {
@@ -160,6 +161,7 @@ impl ServiceNowClient {
         let http = builder.build()?;
         let table_url = format!("{site_url}/api/now/table");
         let attachment_url = format!("{site_url}/api/now/attachment");
+        let catalog_url = format!("{site_url}/api/sn_sc/servicecatalog");
 
         Ok(Self {
             http,
@@ -168,6 +170,7 @@ impl ServiceNowClient {
             site_url,
             table_url,
             attachment_url,
+            catalog_url,
         })
     }
 
@@ -576,6 +579,109 @@ impl ServiceNowClient {
         }
     }
 
+    /// Searches the Service Catalog. Results include producers, guides and
+    /// content items alongside orderable items.
+    pub async fn search_catalog_items(
+        &self,
+        text: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Value>, ApiError> {
+        if limit == 0 {
+            return Err(ApiError::InvalidInput(
+                "--limit must be greater than zero".into(),
+            ));
+        }
+        let mut query = vec![
+            ("sysparm_limit", limit.to_string()),
+            ("sysparm_offset", offset.to_string()),
+        ];
+        if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+            query.push(("sysparm_text", text.to_string()));
+        }
+        let response = self
+            .http
+            .get(format!("{}/items", self.catalog_url))
+            .query(&query)
+            .send()
+            .await?;
+        self.decode::<Envelope<Vec<Value>>>(response)
+            .await
+            .map(|envelope| envelope.result)
+    }
+
+    /// Fetches a catalog item with its variables.
+    pub async fn get_catalog_item(&self, sys_id: &str) -> Result<Value, ApiError> {
+        validate_sys_id(sys_id)?;
+        let response = self
+            .http
+            .get(format!("{}/items/{sys_id}", self.catalog_url))
+            .send()
+            .await?;
+        match self.decode::<Envelope<Value>>(response).await {
+            Ok(envelope) => Ok(envelope.result),
+            Err(ApiError::Api {
+                status: 400,
+                message,
+            }) => Err(ApiError::NotFound(format!(
+                "catalog item {sys_id}: {message}"
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Submits `order_now` exactly once. A failure after the request may have
+    /// reached the instance says so, because a retry could order twice.
+    ///
+    /// Pass `scrub` when the body carries sensitive values: an error response
+    /// is then shown only as its decoded JSON message with `scrub` applied,
+    /// and withheld when it is not JSON or the message still holds an escape,
+    /// HTML entity or URL escape, because the instance can quote the request
+    /// back in an encoded form.
+    pub async fn order_catalog_item(
+        &self,
+        sys_id: &str,
+        body: &Value,
+        scrub: Option<&dyn Fn(&str) -> String>,
+    ) -> Result<Value, ApiError> {
+        validate_sys_id(sys_id)?;
+        const MAY_HAVE_ORDERED: &str = "the order may have been placed; check `servicenow catalog requests mine` before retrying";
+        let response = self
+            .http
+            .post(format!("{}/items/{sys_id}/order_now", self.catalog_url))
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_connect() {
+                    ApiError::Http(error)
+                } else {
+                    ApiError::Other(format!(
+                        "order request failed after it was sent ({error}); {MAY_HAVE_ORDERED}"
+                    ))
+                }
+            })?;
+        let decoded = if response.status().is_success() {
+            response
+                .json::<Envelope<Value>>()
+                .await
+                .map_err(ApiError::Http)
+        } else {
+            Err(self.response_error_with(response, scrub).await)
+        };
+        match decoded {
+            Ok(envelope) => Ok(envelope.result),
+            Err(ApiError::Api { status, message }) if status >= 500 => Err(ApiError::Api {
+                status,
+                message: format!("{message}; {MAY_HAVE_ORDERED}"),
+            }),
+            Err(ApiError::Http(error)) => Err(ApiError::Other(format!(
+                "could not read the order response ({error}); {MAY_HAVE_ORDERED}"
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn decode<T: serde::de::DeserializeOwned>(
         &self,
         response: reqwest::Response,
@@ -587,10 +693,18 @@ impl ServiceNowClient {
     }
 
     async fn response_error(&self, response: reqwest::Response) -> ApiError {
+        self.response_error_with(response, None).await
+    }
+
+    async fn response_error_with(
+        &self,
+        response: reqwest::Response,
+        scrub: Option<&dyn Fn(&str) -> String>,
+    ) -> ApiError {
         let browser_session_rejected = matches!(self.auth_type, AuthType::Browser)
             && (response.status() == reqwest::StatusCode::UNAUTHORIZED
                 || response.status().is_redirection());
-        let error = map_response_error(response).await;
+        let error = map_response_error(response, scrub).await;
         if browser_session_rejected {
             ApiError::Auth(format!("browser session expired or was rejected: {error}"))
         } else if matches!(self.auth_type, AuthType::Browser)
@@ -714,29 +828,50 @@ fn basic_auth(username: &str, password: &str) -> String {
     encoded
 }
 
-async fn map_response_error(response: reqwest::Response) -> ApiError {
+/// Characters that start a JSON or string escape (`\`), an HTML entity
+/// (`&`) or a URL escape (`%`). A message still containing one after
+/// scrubbing could hold a sensitive value in encoded form.
+const ESCAPE_MARKERS: [char; 3] = ['\\', '&', '%'];
+
+/// Turns an error response into an [`ApiError`]. With `scrub`, only a
+/// decoded JSON message is shown, with `scrub` applied; anything that could
+/// still hold an encoded secret (a non-JSON body, or a message containing an
+/// escape, entity or URL escape) is withheld.
+async fn map_response_error(
+    response: reqwest::Response,
+    scrub: Option<&dyn Fn(&str) -> String>,
+) -> ApiError {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
-    let message = serde_json::from_str::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            let error = value.get("error")?;
-            let message = error.get("message")?.as_str()?;
-            let detail = error.get("detail").and_then(Value::as_str).unwrap_or("");
-            Some(if detail.is_empty() {
-                message.to_string()
-            } else {
-                format!("{message}: {detail}")
-            })
+    let json_message = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
+        let error = value.get("error")?;
+        let message = error.get("message")?.as_str()?;
+        let detail = error.get("detail").and_then(Value::as_str).unwrap_or("");
+        Some(if detail.is_empty() {
+            message.to_string()
+        } else {
+            format!("{message}: {detail}")
         })
-        .unwrap_or_else(|| {
-            let trimmed = body.trim();
-            if trimmed.is_empty() {
-                format!("HTTP {status}")
+    });
+    let trimmed = body.trim();
+    let message = match (scrub, json_message) {
+        (_, None) if trimmed.is_empty() => format!("HTTP {status}"),
+        (None, Some(message)) => message,
+        (None, None) => trimmed.chars().take(500).collect(),
+        (Some(scrub), Some(message)) => {
+            let scrubbed = scrub(&message);
+            if scrubbed.contains(ESCAPE_MARKERS) {
+                format!(
+                    "HTTP {status} (error message withheld: it contains escaped or encoded text and the order contains sensitive values)"
+                )
             } else {
-                trimmed.chars().take(500).collect()
+                scrubbed
             }
-        });
+        }
+        (Some(_), None) => {
+            format!("HTTP {status} (response body withheld: the order contains sensitive values)")
+        }
+    };
     match status {
         401 | 403 => ApiError::Auth(message),
         404 => ApiError::NotFound(message),

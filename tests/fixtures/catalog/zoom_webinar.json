@@ -1,0 +1,293 @@
+{
+  "result": {
+    "short_description": "Request to book a zoom webinar",
+    "legacy": false,
+    "kb_article": "",
+    "availability": "on_desktop",
+    "mandatory_attachment": false,
+    "request_method": "submit",
+    "type": "catalog_item",
+    "visible_standalone": true,
+    "sys_class_name": "sc_cat_item",
+    "sys_id": "54c9ead947dec110f53d37d2846d43ea",
+    "content_type": "",
+    "order": 0,
+    "hide_sp": false,
+    "make_item_non_conversational": false,
+    "owner": "6816f79cc0a8016401c5a33be04be441",
+    "show_price": false,
+    "show_quantity": true,
+    "url": "",
+    "catalogs": [
+      {
+        "sys_id": "e0d08b13c3330100c8b837659bba8fb4",
+        "active": true,
+        "title": "Service Catalog"
+      }
+    ],
+    "name": "Request zoom webinar",
+    "show_wishlist": true,
+    "category": {
+      "sys_id": "22555319db0150104327198d1396195c",
+      "title": "Application and Account Access"
+    },
+    "turn_off_nowassist_conversation": false,
+    "show_delivery_time": true,
+    "categories": [
+      {
+        "sys_id": "2809952237b1300054b6a3549dbe5dd4",
+        "active": true,
+        "category": {
+          "sys_id": "22555319db0150104327198d1396195c",
+          "active": true,
+          "title": "Application and Account Access"
+        },
+        "title": "Software"
+      }
+    ],
+    "variables": [
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Topic",
+        "dynamic_value_field": "",
+        "type": 6,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "single_line_text",
+        "display_type": "Single Line Text",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "topic",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "bd7259519762c51021983d1e6253af94",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 10
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Description",
+        "dynamic_value_field": "",
+        "type": 2,
+        "mandatory": false,
+        "displayvalue": "",
+        "friendly_type": "multi_line_text",
+        "display_type": "Multi Line Text",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "descripion",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "f393365947120510f53d37d2846d439f",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 20
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Select webinar start time",
+        "dynamic_value_field": "",
+        "type": 10,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "date_time",
+        "display_type": "Date/Time",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "select_webinar_start_time",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "b315f29947120510f53d37d2846d436f",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "t_value": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 30
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Select webinar end time",
+        "dynamic_value_field": "",
+        "type": 10,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "date_time",
+        "display_type": "Date/Time",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "select_webinar_end_time",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "52567e5d47120510f53d37d2846d437a",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "t_value": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 40
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "containerType": "checkbox_container",
+        "active": false,
+        "label": "Options",
+        "dynamic_value_field": "",
+        "type": 0,
+        "mandatory": false,
+        "displayvalue": "",
+        "friendly_type": "container_start",
+        "render_label": true,
+        "read_only": false,
+        "children": [
+          {
+            "disable_initial_slot_fill": false,
+            "active": true,
+            "label": "Requires password",
+            "dynamic_value_field": "",
+            "type": 7,
+            "mandatory": false,
+            "displayvalue": "false",
+            "friendly_type": "check_box",
+            "display_type": "CheckBox",
+            "render_label": true,
+            "read_only": false,
+            "conversational_label": "",
+            "pricing_implications": false,
+            "name": "requires_password",
+            "attributes": "edge_encryption_enabled=true",
+            "id": "cf84d5159762c51021983d1e6253affd",
+            "value": false,
+            "dynamic_value_dot_walk_path": "",
+            "help_text": "",
+            "max_length": 0,
+            "order": 50
+          }
+        ],
+        "conversational_label": null,
+        "name": "",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "176aec6e1b181310b97aa975624bcb7d",
+        "value": null,
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": -1
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "active": true,
+        "label": "Set password for meeting",
+        "dynamic_value_field": "",
+        "type": 25,
+        "mandatory": false,
+        "displayvalue": "",
+        "friendly_type": "masked",
+        "display_type": "Masked",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "set_password",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "cfc322c39752cd10ad627e0e6253af79",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "help_text": "",
+        "max_length": 0,
+        "order": 60
+      },
+      {
+        "disable_initial_slot_fill": false,
+        "columns": [
+          {
+            "label": "Choose field",
+            "type": "",
+            "value": ""
+          },
+          {
+            "label": "Accumulated roles",
+            "type": "string",
+            "value": "accumulated_roles"
+          }
+        ],
+        "selected_filter": "sys_idIN",
+        "active": true,
+        "display_field": "name",
+        "label": "Add Co-Hosts",
+        "dynamic_value_field": "",
+        "type": 21,
+        "mandatory": true,
+        "displayvalue": "",
+        "friendly_type": "list_collector",
+        "display_type": "List Collector",
+        "render_label": true,
+        "read_only": false,
+        "conversational_label": "",
+        "name": "add_co_hosts",
+        "attributes": "edge_encryption_enabled=true",
+        "id": "b0c211919762c51021983d1e6253af94",
+        "value": "",
+        "dynamic_value_dot_walk_path": "",
+        "table": "sys_user",
+        "help_text": "Select the names of all the co-hosts for this meeting",
+        "max_length": 0,
+        "order": 70
+      }
+    ],
+    "ui_policy": [
+      {
+        "source_table": "catalog_ui_policy",
+        "table": "(catalog)",
+        "sys_id": "347691199762c51021983d1e6253af62",
+        "short_description": "Requires password is true",
+        "reverse": true,
+        "onload": true,
+        "script_true": "",
+        "script_false": "",
+        "debug": false,
+        "conditions": [
+          {
+            "newquery": false,
+            "field": "IO:cf84d5159762c51021983d1e6253affd",
+            "oper": "=",
+            "value": "true",
+            "type": "boolean",
+            "or": false
+          }
+        ],
+        "condition_fields": [
+          "IO:cf84d5159762c51021983d1e6253affd"
+        ],
+        "actions": [
+          {
+            "name": "IO:cfc322c39752cd10ad627e0e6253af79",
+            "mandatory": "true",
+            "visible": "true",
+            "disabled": "ignore",
+            "cleared": "false",
+            "valueAction": "",
+            "value": "",
+            "fieldMessageType": "",
+            "fieldMessage": "",
+            "sysId": "9ee65d199762c51021983d1e6253afc8"
+          }
+        ]
+      }
+    ],
+    "client_script": {
+      "onChange": [],
+      "onSubmit": [],
+      "onLoad": []
+    },
+    "data_lookup": []
+  }
+}

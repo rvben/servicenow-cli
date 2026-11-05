@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -476,4 +477,622 @@ fn fixture_body_has_stable_keys() {
     assert_eq!(body.len(), 2);
     assert!(body.contains_key("short_description"));
     assert!(body.contains_key("impact"));
+}
+
+/// Every record an order spawns, by table, in deletion order (children first).
+/// Ids of an order's records that others hang off, kept across cleanup
+/// passes: once a requested item, task, approval or flow is deleted it can no
+/// longer be found from the request, but late notifications can still name it.
+#[derive(Default)]
+struct OrderParents {
+    ritms: BTreeSet<String>,
+    tasks: BTreeSet<String>,
+    approvals: BTreeSet<String>,
+    flows: BTreeSet<String>,
+    /// Variable values, which are found only through their links; once a
+    /// link is deleted, a value that survived is found by its id.
+    options: BTreeSet<String>,
+}
+
+fn id_list<'a>(ids: impl IntoIterator<Item = &'a String>) -> String {
+    ids.into_iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+async fn catalog_order_inventory(
+    client: &ServiceNowClient,
+    request_id: &str,
+    known: &mut OrderParents,
+) -> Result<Vec<(&'static str, Vec<String>)>, ApiError> {
+    async fn ids(
+        client: &ServiceNowClient,
+        table: &str,
+        query: String,
+        field: &str,
+    ) -> Result<Vec<String>, ApiError> {
+        let records = client
+            .list_records(
+                table,
+                &ListOptions {
+                    query: Some(query),
+                    fields: Some(vec![field.to_string()]),
+                    limit: 500,
+                    display_value: DisplayValue::False,
+                    ..ListOptions::default()
+                },
+            )
+            .await?;
+        Ok(records
+            .iter()
+            .filter_map(|record| {
+                let cell = record.get(field)?;
+                cell.get("value")
+                    .or(Some(cell))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
+    let request = ids(
+        client,
+        "sc_request",
+        format!("sys_id={request_id}"),
+        "sys_id",
+    )
+    .await?;
+    let ritms = ids(
+        client,
+        "sc_req_item",
+        format!("request={request_id}"),
+        "sys_id",
+    )
+    .await?;
+    known.ritms.extend(ritms.iter().cloned());
+    let ritm_list = id_list(&known.ritms);
+    let mtom = if known.ritms.is_empty() {
+        Vec::new()
+    } else {
+        let query = format!("request_itemIN{ritm_list}");
+        known.options.extend(
+            ids(
+                client,
+                "sc_item_option_mtom",
+                query.clone(),
+                "sc_item_option",
+            )
+            .await?,
+        );
+        ids(client, "sc_item_option_mtom", query, "sys_id").await?
+    };
+    let options = if known.options.is_empty() {
+        Vec::new()
+    } else {
+        ids(
+            client,
+            "sc_item_option",
+            format!("sys_idIN{}", id_list(&known.options)),
+            "sys_id",
+        )
+        .await?
+    };
+    let tasks = if known.ritms.is_empty() {
+        Vec::new()
+    } else {
+        ids(
+            client,
+            "sc_task",
+            format!("request_itemIN{ritm_list}"),
+            "sys_id",
+        )
+        .await?
+    };
+    known.tasks.extend(tasks.iter().cloned());
+    // Every record a flow, approval, journal entry, attachment or email can
+    // hang off: the request, its requested items, and their tasks.
+    let parents = std::iter::once(request_id.to_string())
+        .chain(known.ritms.iter().cloned())
+        .chain(known.tasks.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Approval subflows are flow contexts whose source is their parent flow
+    // context, not the request, so follow them level by level. Deeper levels
+    // come first in the result so children are deleted before their parents.
+    let mut flow_levels = vec![
+        ids(
+            client,
+            "sys_flow_context",
+            format!("source_recordIN{parents}"),
+            "sys_id",
+        )
+        .await?,
+    ];
+    // Flows deleted by an earlier pass still seed the search for subflows.
+    let mut frontier: BTreeSet<String> = flow_levels[0].iter().cloned().collect();
+    frontier.extend(known.flows.iter().cloned());
+    while !frontier.is_empty() {
+        let query = format!(
+            "source_table=sys_flow_context^source_recordIN{}",
+            id_list(&frontier)
+        );
+        let next = ids(client, "sys_flow_context", query, "sys_id").await?;
+        frontier = next
+            .iter()
+            .filter(|id| !known.flows.contains(*id))
+            .cloned()
+            .collect();
+        known.flows.extend(next.iter().cloned());
+        flow_levels.push(next);
+    }
+    let flow_contexts: Vec<String> = flow_levels.into_iter().rev().flatten().collect();
+    known.flows.extend(flow_contexts.iter().cloned());
+    let approvals = ids(
+        client,
+        "sysapproval_approver",
+        format!("sysapprovalIN{parents}"),
+        "sys_id",
+    )
+    .await?;
+    known.approvals.extend(approvals.iter().cloned());
+    // Notifications about an approval are keyed by the approval record.
+    let notified = std::iter::once(parents.clone())
+        .chain(known.approvals.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(vec![
+        ("sys_flow_context", flow_contexts),
+        (
+            "wf_context",
+            ids(client, "wf_context", format!("idIN{parents}"), "sys_id").await?,
+        ),
+        ("sysapproval_approver", approvals),
+        (
+            "sys_journal_field",
+            ids(
+                client,
+                "sys_journal_field",
+                format!("element_idIN{notified}"),
+                "sys_id",
+            )
+            .await?,
+        ),
+        (
+            "sys_attachment",
+            ids(
+                client,
+                "sys_attachment",
+                format!("table_sys_idIN{notified}"),
+                "sys_id",
+            )
+            .await?,
+        ),
+        (
+            "sys_email",
+            ids(
+                client,
+                "sys_email",
+                format!("instanceIN{notified}"),
+                "sys_id",
+            )
+            .await?,
+        ),
+        ("sc_task", tasks),
+        ("sc_item_option_mtom", mtom),
+        ("sc_item_option", options),
+        ("sc_req_item", ritms),
+        ("sc_request", request),
+    ])
+}
+
+async fn delete_catalog_order(client: &ServiceNowClient, request_id: &str) -> Result<(), ApiError> {
+    // The instance writes notifications from its event queue, so emails about
+    // the order can appear after a deletion pass. Each pass is followed by a
+    // pause before the leftover check, and records that arrived meanwhile
+    // are deleted by the next pass.
+    // A failed read never ends the cleanup: the first pass falls back to the
+    // request itself, and a later one keeps the previous inventory, since
+    // giving up leaves the whole order behind.
+    let mut known = OrderParents::default();
+    let mut read_error = None;
+    let mut inventory = match read_inventory(client, request_id, &mut known).await {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            read_error = Some(error.to_string());
+            vec![("sc_request", vec![request_id.to_string()])]
+        }
+    };
+    let mut failures = Vec::new();
+    for _ in 0..4 {
+        // A refused deletion stops neither the pass nor later passes, which
+        // also catch late records and retry the refused ones; failures are
+        // reported only for records still present at the end.
+        failures.clear();
+        for (table, ids) in &inventory {
+            for id in ids {
+                match client.delete_record(table, id).await {
+                    Ok(_) | Err(ApiError::NotFound(_)) => {}
+                    Err(error) => failures.push(format!("{table} {id}: {error}")),
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        match read_inventory(client, request_id, &mut known).await {
+            Ok(current) => {
+                read_error = None;
+                inventory = current;
+                if inventory.iter().all(|(_, ids)| ids.is_empty()) {
+                    return Ok(());
+                }
+            }
+            Err(error) => read_error = Some(error.to_string()),
+        }
+    }
+    let leftover: Vec<String> = inventory
+        .into_iter()
+        .filter(|(_, ids)| !ids.is_empty())
+        .map(|(table, ids)| format!("{table}: {}", ids.join(" ")))
+        .collect();
+    let refused = if failures.is_empty() {
+        String::new()
+    } else {
+        format!("\ndeletions refused:\n{}", failures.join("\n"))
+    };
+    let unread = read_error
+        .map(|error| {
+            format!("\nthe last inventory read failed, so this list may be incomplete: {error}")
+        })
+        .unwrap_or_default();
+    Err(ApiError::Other(format!(
+        "catalog order cleanup left records behind:\n{}{refused}{unread}",
+        leftover.join("\n")
+    )))
+}
+
+/// Reads the order's records, retrying transient failures.
+async fn read_inventory(
+    client: &ServiceNowClient,
+    request_id: &str,
+    known: &mut OrderParents,
+) -> Result<Vec<(&'static str, Vec<String>)>, ApiError> {
+    let mut attempt = 1;
+    loop {
+        match catalog_order_inventory(client, request_id, known).await {
+            Ok(inventory) => return Ok(inventory),
+            Err(error) if attempt == 3 => return Err(error),
+            Err(_) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
+/// The request an order created: the one it reported, else the one found by
+/// its marker. Transient lookup failures are retried, since giving up leaves
+/// the order behind; a final failure names the marker so it can be found.
+async fn ordered_request(
+    client: &ServiceNowClient,
+    ordered: &Value,
+    marker: &str,
+    order: &std::process::Output,
+) -> String {
+    if let Some(id) = ordered["request"]["request_id"].as_str() {
+        return id.to_string();
+    }
+    let mut last = String::from("no request carries the marker");
+    for _ in 0..3 {
+        match request_for_marker(client, marker).await {
+            Ok(Some(id)) => return id,
+            Ok(None) => last = "no request carries the marker".into(),
+            Err(error) => last = error.to_string(),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    panic!(
+        "could not find the order carrying {marker} ({last}); if it was placed, delete it by hand. Order stderr: {}",
+        String::from_utf8_lossy(&order.stderr)
+    );
+}
+
+/// Finds the request an order created from the unique value it carried, for
+/// when the order command did not report one.
+async fn request_for_marker(
+    client: &ServiceNowClient,
+    marker: &str,
+) -> Result<Option<String>, ApiError> {
+    let first = |table: &'static str, query: String, field: &'static str| async move {
+        let records = client
+            .list_records(
+                table,
+                &ListOptions {
+                    query: Some(query),
+                    fields: Some(vec![field.to_string()]),
+                    limit: 1,
+                    display_value: DisplayValue::False,
+                    ..ListOptions::default()
+                },
+            )
+            .await?;
+        Ok::<_, ApiError>(records.first().and_then(|record| {
+            let cell = record.get(field)?;
+            cell.get("value")
+                .or(Some(cell))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }))
+    };
+    let Some(option) = first("sc_item_option", format!("value={marker}"), "sys_id").await? else {
+        return Ok(None);
+    };
+    let Some(ritm) = first(
+        "sc_item_option_mtom",
+        format!("sc_item_option={option}"),
+        "request_item",
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    first("sc_req_item", format!("sys_id={ritm}"), "request").await
+}
+
+async fn subflow_contexts(client: &ServiceNowClient) -> Vec<String> {
+    let mut ids: Vec<String> = client
+        .list_records(
+            "sys_flow_context",
+            &ListOptions {
+                query: Some("source_table=sys_flow_context".into()),
+                fields: Some(vec!["sys_id".into()]),
+                limit: 1000,
+                display_value: DisplayValue::False,
+                ..ListOptions::default()
+            },
+        )
+        .await
+        .expect("list subflow contexts")
+        .iter()
+        .filter_map(|record| {
+            record
+                .get("sys_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn run_catalog_cli(pdi: &Pdi, home: &TempDir, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_servicenow"))
+        .env("SERVICENOW_INSTANCE", &pdi.instance)
+        .env("SERVICENOW_USERNAME", &pdi.username)
+        .env("SERVICENOW_PASSWORD", &pdi.password)
+        .env("SERVICENOW_AUTH_TYPE", "basic")
+        .env("SERVICENOW_CONFIG_DIR", home.path().join("config"))
+        .env("SERVICENOW_CACHE_DIR", home.path().join("cache"))
+        .env_remove("SERVICENOW_PROFILE")
+        .env_remove("SERVICENOW_READ_ONLY")
+        .args(args)
+        .args(["--output", "json"])
+        .output()
+        .expect("run servicenow")
+}
+
+/// Returns failures instead of panicking: a panic once an order exists would
+/// skip its cleanup.
+fn catalog_cli_json(pdi: &Pdi, home: &TempDir, args: &[&str]) -> Result<(Value, String), String> {
+    let output = run_catalog_cli(pdi, home, args);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        return Err(format!("{args:?} failed: {stderr}"));
+    }
+    let stdout = serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|error| format!("{args:?} printed invalid JSON: {error}"))?;
+    Ok((stdout, stderr))
+}
+
+#[tokio::test]
+#[ignore = "requires a ServiceNow Personal Developer Instance"]
+async fn pdi_catalog_reorder_round_trips_date_times() {
+    let pdi = Pdi::from_env();
+    let client = pdi.client();
+    let home = TempDir::new().unwrap();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after Unix epoch")
+        .as_nanos();
+    let topic = format!("servicenow-cli-e2e-{unique}");
+    let topic_var = format!("topic={topic}");
+    let start = "2027-03-01 10:00:00";
+    let end = "2027-03-01 11:30:00";
+    let start_var = format!("select_webinar_start_time={start}");
+    let end_var = format!("select_webinar_end_time={end}");
+    let order = run_catalog_cli(
+        &pdi,
+        &home,
+        &[
+            "catalog",
+            "order",
+            "Request zoom webinar",
+            "--var",
+            &topic_var,
+            "--var",
+            &start_var,
+            "--var",
+            &end_var,
+            "--var",
+            "add_co_hosts=abel.tuter",
+            "--yes",
+        ],
+    );
+    let ordered = serde_json::from_slice::<Value>(&order.stdout).unwrap_or(Value::Null);
+    let request_id = ordered_request(&client, &ordered, &topic, &order).await;
+
+    let verification: Result<(), String> = async {
+        let number = ordered["requestedItems"][0]["number"]
+            .as_str()
+            .ok_or_else(|| {
+                format!(
+                    "order reported no requested item: {}",
+                    String::from_utf8_lossy(&order.stderr)
+                )
+            })?;
+        let (variables, _) =
+            catalog_cli_json(&pdi, &home, &["catalog", "requests", "vars", number])?;
+        for (name, expected) in [
+            ("select_webinar_start_time", start),
+            ("select_webinar_end_time", end),
+        ] {
+            if variables[name] != expected {
+                return Err(format!(
+                    "{name} read back as {}, expected {expected}: {variables}",
+                    variables[name]
+                ));
+            }
+        }
+        // The export is promised to be reusable as order input.
+        let file = home.path().join("reorder.json");
+        std::fs::write(&file, variables.to_string()).map_err(|error| error.to_string())?;
+        let file = file.to_string_lossy().into_owned();
+        let (plan, _) = catalog_cli_json(
+            &pdi,
+            &home,
+            &[
+                "catalog",
+                "order",
+                "Request zoom webinar",
+                "--vars-file",
+                &file,
+                "--dry-run",
+            ],
+        )?;
+        for (name, expected) in [
+            ("select_webinar_start_time", start),
+            ("select_webinar_end_time", end),
+        ] {
+            if plan["variables"][name] != expected {
+                return Err(format!(
+                    "reorder plan has {name} = {}: {plan}",
+                    plan["variables"][name]
+                ));
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup = delete_catalog_order(&client, &request_id).await;
+    if let Err(error) = verification {
+        match cleanup {
+            Ok(()) => panic!("{error}"),
+            Err(cleanup_error) => panic!("{error}; cleanup also failed: {cleanup_error}"),
+        }
+    }
+    cleanup.expect("delete every record the catalog order created");
+}
+
+#[tokio::test]
+#[ignore = "requires a ServiceNow Personal Developer Instance"]
+async fn pdi_catalog_order_lifecycle() {
+    let pdi = Pdi::from_env();
+    let client = pdi.client();
+    let isolated_home = TempDir::new().unwrap();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after Unix epoch")
+        .as_nanos();
+    let purpose = format!("servicenow-cli-e2e-{unique}");
+    let run = |args: &[&str]| run_catalog_cli(&pdi, &isolated_home, args);
+    let cli = |args: &[&str]| catalog_cli_json(&pdi, &isolated_home, args);
+    let purpose_var = format!("describe_briefly_the_purpose_of_this_account={purpose}");
+    let order_args = [
+        "catalog",
+        "order",
+        "AWS account request",
+        "--var",
+        "division=IT",
+        "--var",
+        "environment=Dev",
+        "--var",
+        &purpose_var,
+    ];
+
+    let (plan, _) = cli(&[&order_args[..], &["--dry-run"]].concat()).unwrap();
+    assert_eq!(plan["dryRun"], true);
+    assert_eq!(plan["variables"]["division"], "IT");
+
+    // Checked independently of the cleanup inventory, which cannot report
+    // records it does not know how to find.
+    let subflows_before = subflow_contexts(&client).await;
+    let order = run(&[&order_args[..], &["--yes"]].concat());
+    let ordered = serde_json::from_slice::<Value>(&order.stdout).unwrap_or(Value::Null);
+    let reported = ordered["request"]["request_id"]
+        .as_str()
+        .map(str::to_string);
+    let request_id = ordered_request(&client, &ordered, &purpose, &order).await;
+
+    let verification: Result<(), String> = async {
+        if !order.status.success() || reported.is_none() {
+            return Err(format!(
+                "order failed or reported no request_id: {}",
+                String::from_utf8_lossy(&order.stderr)
+            ));
+        }
+        let ritm = ordered["requestedItems"]
+            .as_array()
+            .and_then(|items| items.first())
+            .ok_or("order reported no requested items")?;
+        let number = ritm["number"]
+            .as_str()
+            .ok_or("requested item has no number")?;
+
+        // Proves the fallback cleanup path can find a real order.
+        let found = request_for_marker(&client, &purpose)
+            .await
+            .map_err(|error| format!("marker lookup failed: {error}"))?;
+        if found.as_deref() != Some(request_id.as_str()) {
+            return Err(format!(
+                "marker lookup found {found:?}, expected {request_id}"
+            ));
+        }
+
+        let (variables, _) = cli(&["catalog", "requests", "vars", number])?;
+        let expected = serde_json::json!({
+            "division": "IT",
+            "environment": "Dev",
+            "describe_briefly_the_purpose_of_this_account": purpose,
+        });
+        if variables != expected {
+            return Err(format!(
+                "variables read back as {variables}, expected {expected}"
+            ));
+        }
+
+        let (mine, _) = cli(&["catalog", "requests", "mine", "--open", "-n", "50"])?;
+        let listed = mine["result"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["number"] == number));
+        if !listed {
+            return Err(format!(
+                "{number} missing from `catalog requests mine`: {mine}"
+            ));
+        }
+        Ok(())
+    }
+    .await;
+
+    let cleanup = delete_catalog_order(&client, &request_id).await;
+    if let Err(error) = verification {
+        match cleanup {
+            Ok(()) => panic!("{error}"),
+            Err(cleanup_error) => panic!("{error}; cleanup also failed: {cleanup_error}"),
+        }
+    }
+    cleanup.expect("delete every record the catalog order created");
+    assert_eq!(
+        subflow_contexts(&client).await,
+        subflows_before,
+        "the order left approval subflow contexts behind"
+    );
 }
