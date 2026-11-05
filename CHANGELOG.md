@@ -2,6 +2,18 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.0](https://github.com/rvben/servicenow-cli/compare/v0.5.3...v0.6.0) - 2026-11-05
+
+### Added
+
+- **catalog**: order Service Catalog items ([f17e7e7](https://github.com/rvben/servicenow-cli/commit/f17e7e78b80a269aa41af301ca78a7f7e793947c))
+
+### Fixed
+
+- **tui**: redact PINs, passcodes, access keys and similar fields ([4b1b860](https://github.com/rvben/servicenow-cli/commit/4b1b8609e9a7ee881261c5c1f1e36786e8478608))
+- **deps**: patch rustls and quinn-proto vulnerabilities ([3dcef89](https://github.com/rvben/servicenow-cli/commit/3dcef89deafdc0afdb41baa369bd91c83f51a543))
+- **ci**: install uv for dependency validation ([01dd76a](https://github.com/rvben/servicenow-cli/commit/01dd76ae65ed527e8a62bfec5c998282b8e237c7))
+
 ## [0.5.3](https://github.com/rvben/servicenow-cli/compare/v0.5.2...v0.5.3) - 2026-09-29
 
 ### Fixed
