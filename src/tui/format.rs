@@ -9,6 +9,7 @@ use ratatui::text::Line;
 use serde_json::Value;
 
 use super::DEFAULT_INCIDENT_QUERY;
+use crate::sensitive::{REDACTED, is_sensitive_field};
 
 pub(super) fn truthy_field(record: &Value, field: &str) -> bool {
     let Some(value) = record.get(field) else {
@@ -165,7 +166,7 @@ pub(super) fn display_field(record: &Value, field: &str) -> String {
 
 pub(super) fn display_field_value(field: &str, value: &Value) -> String {
     if is_sensitive_field(field) {
-        "[REDACTED]".into()
+        REDACTED.into()
     } else {
         display_value(value)
     }
@@ -276,19 +277,6 @@ pub(super) fn truncate_text(value: &str, max_chars: usize) -> String {
     let mut truncated = value.chars().take(keep).collect::<String>();
     truncated.push('…');
     truncated
-}
-
-pub(super) fn is_sensitive_field(field: &str) -> bool {
-    let normalized = field.to_ascii_lowercase().replace(['-', ' '], "_");
-    normalized.contains("password")
-        || normalized.contains("passwd")
-        || normalized.contains("secret")
-        || normalized.contains("private_key")
-        || normalized.contains("api_key")
-        || normalized.contains("apikey")
-        || normalized
-            .split('_')
-            .any(|part| matches!(part, "token" | "cookie" | "credential" | "authorization"))
 }
 
 pub(super) fn record_sys_id(record: &Value) -> Option<&str> {
