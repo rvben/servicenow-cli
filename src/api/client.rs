@@ -645,7 +645,6 @@ impl ServiceNowClient {
         scrub: Option<&dyn Fn(&str) -> String>,
     ) -> Result<Value, ApiError> {
         validate_sys_id(sys_id)?;
-        const MAY_HAVE_ORDERED: &str = "the order may have been placed; check `servicenow catalog requests mine` before retrying";
         let response = self
             .http
             .post(format!("{}/items/{sys_id}/order_now", self.catalog_url))
@@ -742,6 +741,10 @@ pub fn validate_table(table: &str) -> Result<(), ApiError> {
         )))
     }
 }
+
+/// Remediation for any catalog order whose outcome the CLI cannot establish.
+pub const MAY_HAVE_ORDERED: &str =
+    "the order may have been placed; check `servicenow catalog requests mine` before retrying";
 
 pub fn validate_sys_id(sys_id: &str) -> Result<(), ApiError> {
     if sys_id.len() == 32 && sys_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {

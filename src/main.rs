@@ -3071,6 +3071,9 @@ fn emit_catalog_item(output: &OutputConfig, item: &CatalogItem, site_url: &str) 
     if let Err(reason) = &orderable {
         outln!("Not orderable from the CLI: {reason}\n");
     }
+    if item.instance_orderable == Some(false) {
+        outln!("Note: {}.\n", catalog::INSTANCE_UNORDERABLE);
+    }
     if item.has_client_logic {
         outln!(
             "Note: this item has client-side logic (UI policies or client scripts) the CLI does not run.\n"
@@ -3140,50 +3143,62 @@ async fn emit_order_result(
     item_name: &str,
     request: Value,
 ) -> Result<(), ApiError> {
-    let request_id = request
-        .get("request_id")
-        .or_else(|| request.get("sys_id"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let request_number = request
-        .get("request_number")
-        .or_else(|| request.get("number"))
-        .and_then(Value::as_str)
-        .unwrap_or("the request")
-        .to_string();
+    let (request_id, request_label) = match catalog::OrderOutcome::classify(&request) {
+        catalog::OrderOutcome::Request { sys_id, number } => {
+            let label = number.unwrap_or_else(|| format!("request {sys_id}"));
+            (sys_id, label)
+        }
+        catalog::OrderOutcome::CartOnly { cart_id } => {
+            return Err(ApiError::NotOrdered {
+                message: format!(
+                    "the instance accepted the order but created no request; the item was left in cart {cart_id} ({}) instead, and the instance may also have put a copy in your portal cart. This usually means the instance needs a separate checkout step, or the item cannot be ordered through the API. Nothing was ordered.",
+                    client.record_url("sc_cart", &cart_id)
+                ),
+                cart_id,
+            });
+        }
+        catalog::OrderOutcome::Unrecognized { keys, number } => {
+            let fields = if keys.is_empty() {
+                "no fields".to_string()
+            } else {
+                format!("fields: {}", keys.join(", "))
+            };
+            let named = number
+                .map(|number| format!(", though it named request {number}"))
+                .unwrap_or_default();
+            return Err(ApiError::Other(format!(
+                "the instance answered the order with neither a request id nor a cart ({fields}){named}; {}",
+                servicenow_cli::api::MAY_HAVE_ORDERED
+            )));
+        }
+    };
     // The order is already placed, so a failed follow-up lookup must not turn
     // into an error exit: a retry would place a second order.
-    let requested_items = match request_id
-        .as_deref()
-        .filter(|id| servicenow_cli::api::validate_sys_id(id).is_ok())
+    let requested_items = match client
+        .list_records(
+            "sc_req_item",
+            &ListOptions {
+                query: Some(format!("request={request_id}")),
+                fields: Some(
+                    RITM_LIST_FIELDS
+                        .iter()
+                        .map(|field| (*field).into())
+                        .collect(),
+                ),
+                limit: 100,
+                display_value: DisplayValue::False,
+                ..ListOptions::default()
+            },
+        )
+        .await
     {
-        Some(request_id) => match client
-            .list_records(
-                "sc_req_item",
-                &ListOptions {
-                    query: Some(format!("request={request_id}")),
-                    fields: Some(
-                        RITM_LIST_FIELDS
-                            .iter()
-                            .map(|field| (*field).into())
-                            .collect(),
-                    ),
-                    limit: 100,
-                    display_value: DisplayValue::False,
-                    ..ListOptions::default()
-                },
-            )
-            .await
-        {
-            Ok(items) => Some(items),
-            Err(error) => {
-                output.message(&format!(
-                    "warning: the order was placed, but its requested items could not be read ({error}); do not reorder, check `servicenow catalog requests mine`"
-                ));
-                None
-            }
-        },
-        None => Some(Vec::new()),
+        Ok(items) => Some(items),
+        Err(error) => {
+            output.message(&format!(
+                "warning: the order was placed, but its requested items could not be read ({error}); do not reorder, check `servicenow catalog requests mine`"
+            ));
+            None
+        }
     };
     let numbers: Vec<&str> = requested_items
         .iter()
@@ -3191,13 +3206,13 @@ async fn emit_order_result(
         .filter_map(|item| item.get("number").and_then(Value::as_str))
         .collect();
     if numbers.is_empty() {
-        output.success(&format!("Ordered {item_name}: {request_number}"));
+        output.success(&format!("Ordered {item_name}: {request_label}"));
         if requested_items.is_some() {
             output.message("No requested items were found for this request yet; check `servicenow catalog requests mine`.");
         }
     } else {
         output.success(&format!(
-            "Ordered {item_name}: {request_number} / {}",
+            "Ordered {item_name}: {request_label} / {}",
             numbers.join(", ")
         ));
     }
@@ -3207,12 +3222,10 @@ async fn emit_order_result(
             "requestedItems": requested_items,
         }));
     } else {
-        if let Some(request_id) = &request_id {
-            outln!(
-                "{request_number}  {}",
-                client.record_url("sc_request", request_id)
-            );
-        }
+        outln!(
+            "{request_label}  {}",
+            client.record_url("sc_request", &request_id)
+        );
         for item in requested_items.iter().flatten() {
             if let (Some(number), Some(sys_id)) = (
                 item.get("number").and_then(Value::as_str),
@@ -3975,11 +3988,15 @@ fn command_document(command: &clap::Command, selected_path: Option<&str>) -> Val
             "default": "human table on a terminal; JSON when piped",
             "listEnvelope": {"count": "integer", "result": "array"},
             "recordEnvelope": {"result": "object"},
-            "errorEnvelope": {"error": {"kind": "string", "message": "string", "remediation": "string|null"}},
+            "errorEnvelope": {"error": {
+                "kind": "string", "message": "string", "remediation": "string|null",
+                "cart": "{sys_id: string}, only with kind not_ordered"
+            }},
             "streams": {"stdout": "data", "stderr": "status and errors"},
             "exitCodes": {
                 "0": "success", "1": "unexpected", "2": "invalid_input", "3": "auth or permission",
-                "4": "not_found", "5": "api_error", "6": "rate_limit", "7": "conflict"
+                "4": "not_found", "5": "api_error", "6": "rate_limit", "7": "conflict",
+                "8": "not_ordered"
             }
         }),
     );

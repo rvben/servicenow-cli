@@ -1,8 +1,8 @@
 mod client;
 
 pub use client::{
-    AttachmentMetadata, DisplayValue, ListOptions, ServiceNowClient, normalize_instance,
-    validate_sys_id, validate_table,
+    AttachmentMetadata, DisplayValue, ListOptions, MAY_HAVE_ORDERED, ServiceNowClient,
+    normalize_instance, validate_sys_id, validate_table,
 };
 
 use std::fmt;
@@ -15,6 +15,12 @@ pub enum ApiError {
     Permission(String),
     NotFound(String),
     Conflict(String),
+    /// The instance accepted a catalog order but created no request: the
+    /// item was left in the cart `cart_id` instead.
+    NotOrdered {
+        message: String,
+        cart_id: String,
+    },
     RateLimit,
     Api {
         status: u16,
@@ -32,6 +38,7 @@ impl fmt::Display for ApiError {
             Self::Permission(message) => write!(f, "permission denied: {message}"),
             Self::NotFound(message) => write!(f, "not found: {message}"),
             Self::Conflict(message) => write!(f, "conflict: {message}"),
+            Self::NotOrdered { message, .. } => write!(f, "{message}"),
             Self::RateLimit => write!(f, "ServiceNow rate limit exceeded; wait and retry"),
             Self::Api { status, message } => {
                 write!(f, "ServiceNow API error ({status}): {message}")

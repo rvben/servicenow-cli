@@ -268,6 +268,17 @@ reorder does not bring back a default that was cleared.
 `catalog order` sends one request and never retries it: if a response is lost,
 check `catalog requests mine` before ordering again.
 
+An order succeeds only when the instance creates a request. Some instances
+answer an order by putting the item in a cart instead, for example when
+checkout needs a separate step. Then `catalog order` exits 8 (`kind:
+not_ordered`) and names the cart in `error.cart.sys_id`. The instance may also
+put a copy of the item in your portal cart. Submit the item from one cart at
+most, normally the portal cart, and empty any other cart holding it, since each
+submitted copy is a separate order. Do not order again, because every attempt
+adds another cart item. When the instance
+flags an item as not orderable through the API, `catalog show` notes it and
+`catalog order` warns before ordering.
+
 Items that need the portal are refused with a link to it: record producers,
 order guides, items with a mandatory attachment, and items with a mandatory
 multi-row variable set. The CLI cannot fill multi-row variable sets: an
@@ -358,8 +369,10 @@ never logged. `SERVICENOW_VERBOSE=true` enables the same behavior.
 Machine-readable errors use a stable envelope:
 
 ```json
-{"error":{"kind":"not_found","message":"not found: ..."}}
+{"error":{"kind":"not_found","message":"not found: ...","remediation":null}}
 ```
+
+An error with `kind: not_ordered` also carries `"cart":{"sys_id":"..."}`.
 
 Command-line parsing errors (an unknown flag, a missing required argument, an
 unrecognized subcommand) use the same envelope with `kind: invalid_input` and
@@ -377,6 +390,7 @@ their normal text to stdout with exit code 0.
 | 5 | Other ServiceNow API error |
 | 6 | Rate limited |
 | 7 | Conflict or ambiguous match |
+| 8 | Not ordered: the instance put the item in a cart and created no request (`kind: not_ordered`, with `error.cart.sys_id`) |
 
 The versioned offline command schema describes argument types, defaults, enums,
 side effects, confirmation and dry-run behavior, output envelopes, and exit

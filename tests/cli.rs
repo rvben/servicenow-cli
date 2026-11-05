@@ -2215,6 +2215,336 @@ async fn catalog_order_succeeds_when_the_follow_up_lookup_fails() {
     assert!(result["requestedItems"].is_null(), "{result}");
 }
 
+/// Mounts an `order_now` answer that must be requested exactly once, and
+/// fails the test if the CLI then looks for requested items.
+async fn mount_order_answer(server: &MockServer, result: serde_json::Value) {
+    mount_aws_item(server).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/order_now"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "result": result })),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": []})))
+        .expect(0)
+        .mount(server)
+        .await;
+}
+
+const CART_ID: &str = "90ed51b23b50dbd0b8094b44c3e45aad";
+
+#[tokio::test]
+async fn catalog_order_that_only_fills_a_cart_is_reported_as_not_ordered() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_order_answer(&server, serde_json::json!({ "cart_id": CART_ID })).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(8), "{stderr}");
+    assert!(!stderr.contains("Ordered"), "{stderr}");
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let error: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(error["error"]["kind"], "not_ordered", "{error}");
+    assert_eq!(error["error"]["cart"]["sys_id"], CART_ID, "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("created no request"), "{message}");
+    assert!(message.contains(CART_ID), "{message}");
+    let remediation = error["error"]["remediation"].as_str().unwrap();
+    assert!(remediation.contains("do not retry"), "{remediation}");
+}
+
+#[tokio::test]
+async fn catalog_order_that_only_fills_a_cart_never_claims_success_in_text_mode() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_order_answer(&server, serde_json::json!({ "cart_id": CART_ID })).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--output", "text"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(8), "{stderr}");
+    assert!(
+        !stdout.contains("Ordered") && !stderr.contains("Ordered"),
+        "{stdout}{stderr}"
+    );
+    assert!(!stdout.contains("the request"), "{stdout}");
+    assert!(stderr.contains("Nothing was ordered"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_order_with_an_unrecognized_answer_names_its_keys_but_no_values() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_order_answer(
+        &server,
+        serde_json::json!({ "status": "queued-7f3a9c", "token": "s3cr3t-value" }),
+    )
+    .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(!stderr.contains("Ordered"), "{stderr}");
+    assert!(
+        !stderr.contains("queued-7f3a9c") && !stderr.contains("s3cr3t-value"),
+        "{stderr}"
+    );
+    let error: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("status, token"), "{message}");
+    assert!(message.contains("may have been placed"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_order_with_an_empty_answer_is_not_a_success() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_order_answer(&server, serde_json::json!({})).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(!stderr.contains("Ordered"), "{stderr}");
+    assert!(stderr.contains("no fields"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_order_without_a_request_number_names_the_request_by_sys_id() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let request_id = "b54ae46e1b181310b97aa975624bcbf2";
+    mount_aws_item(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/order_now"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": { "request_id": request_id }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .and(query_param(
+            "sysparm_query",
+            format!("request={request_id}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--output", "text"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Ordered AWS account request: request {request_id}"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("the request"), "{stderr}");
+}
+
+fn aws_item_the_instance_calls(orderable: bool) -> serde_json::Value {
+    let mut item = catalog_fixture("aws_account_request");
+    item["result"]["orderable"] = orderable.into();
+    item
+}
+
+fn unorderable_aws_item() -> serde_json::Value {
+    aws_item_the_instance_calls(false)
+}
+
+#[tokio::test]
+async fn catalog_show_reports_an_item_the_instance_calls_unorderable() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(unorderable_aws_item()))
+        .mount(&server)
+        .await;
+
+    let text = authenticated_command(&config_home, &server)
+        .args(["catalog", "show", AWS_ITEM, "--output", "text"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert!(
+        stdout.contains("the instance reports this item as not orderable through the API"),
+        "{stdout}"
+    );
+
+    let json = authenticated_command(&config_home, &server)
+        .args(["catalog", "show", AWS_ITEM, "--json"])
+        .output()
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(shown["result"]["instance_orderable"], false, "{shown}");
+}
+
+#[tokio::test]
+async fn catalog_show_says_nothing_extra_when_the_instance_calls_an_item_orderable() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(aws_item_the_instance_calls(true)))
+        .mount(&server)
+        .await;
+
+    let text = authenticated_command(&config_home, &server)
+        .args(["catalog", "show", AWS_ITEM, "--output", "text"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert!(!stdout.contains("not orderable"), "{stdout}");
+
+    let json = authenticated_command(&config_home, &server)
+        .args(["catalog", "show", AWS_ITEM, "--json"])
+        .output()
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(shown["result"]["instance_orderable"], true, "{shown}");
+}
+
+#[tokio::test]
+async fn catalog_order_dry_run_warns_about_an_item_the_instance_calls_unorderable() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(unorderable_aws_item()))
+        .mount(&server)
+        .await;
+    forbid_order_post(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--dry-run", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = plan["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("not orderable through the API"))),
+        "{plan}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_warns_before_ordering_an_item_the_instance_calls_unorderable() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(unorderable_aws_item()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/order_now"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": { "cart_id": CART_ID }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--output", "text"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(8), "{stderr}");
+    let warning = stderr
+        .find("warning: the instance reports this item as not orderable through the API")
+        .unwrap_or_else(|| panic!("no warning: {stderr}"));
+    let error = stderr
+        .find("error: ")
+        .unwrap_or_else(|| panic!("no error: {stderr}"));
+    assert!(
+        warning < error,
+        "the warning must precede the outcome: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_with_only_a_request_number_names_it_without_claiming_success() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_order_answer(
+        &server,
+        serde_json::json!({ "request_number": "REQ0010042" }),
+    )
+    .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--yes", "--json"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(!stderr.contains("Ordered"), "{stderr}");
+    let error: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("named request REQ0010042"), "{message}");
+    assert!(message.contains("may have been placed"), "{message}");
+}
+
 async fn mount_catalog_search_page(
     server: &MockServer,
     offset: usize,

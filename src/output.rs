@@ -222,6 +222,8 @@ pub mod exit_codes {
     pub const API: i32 = 5;
     pub const RATE_LIMIT: i32 = 6;
     pub const CONFLICT: i32 = 7;
+    /// The instance answered, and nothing was ordered.
+    pub const NOT_ORDERED: i32 = 8;
 }
 
 pub fn error_kind(error: &ApiError) -> &'static str {
@@ -231,6 +233,7 @@ pub fn error_kind(error: &ApiError) -> &'static str {
         ApiError::Permission(_) => "permission",
         ApiError::NotFound(_) => "not_found",
         ApiError::Conflict(_) => "conflict",
+        ApiError::NotOrdered { .. } => "not_ordered",
         ApiError::RateLimit => "rate_limit",
         ApiError::Api { .. } => "api_error",
         ApiError::Http(_) | ApiError::Other(_) => "unexpected_error",
@@ -243,6 +246,7 @@ pub fn exit_code(error: &ApiError) -> i32 {
         ApiError::Auth(_) | ApiError::Permission(_) => exit_codes::AUTH,
         ApiError::NotFound(_) => exit_codes::NOT_FOUND,
         ApiError::Conflict(_) => exit_codes::CONFLICT,
+        ApiError::NotOrdered { .. } => exit_codes::NOT_ORDERED,
         ApiError::RateLimit => exit_codes::RATE_LIMIT,
         ApiError::Api { .. } => exit_codes::API,
         ApiError::Http(_) | ApiError::Other(_) => exit_codes::GENERAL,
@@ -252,16 +256,15 @@ pub fn exit_code(error: &ApiError) -> i32 {
 pub fn print_error(error: &ApiError, machine_readable: bool) {
     let remediation = error_remediation(error);
     if machine_readable {
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "error": {
-                    "kind": error_kind(error),
-                    "message": error.to_string(),
-                    "remediation": remediation,
-                }
-            })
-        );
+        let mut body = serde_json::json!({
+            "kind": error_kind(error),
+            "message": error.to_string(),
+            "remediation": remediation,
+        });
+        if let ApiError::NotOrdered { cart_id, .. } = error {
+            body["cart"] = serde_json::json!({ "sys_id": cart_id });
+        }
+        eprintln!("{}", serde_json::json!({ "error": body }));
     } else {
         eprintln!("error: {error}");
         if let Some(remediation) = remediation {
@@ -293,6 +296,9 @@ fn error_remediation(error: &ApiError) -> Option<&'static str> {
             ApiError::Auth(_) => Some("run `servicenow auth login` to refresh your credentials"),
             ApiError::Permission(_) => Some(
                 "your credentials work, but this account lacks the role or ACL the operation needs; ask a ServiceNow administrator, or use an account that has it",
+            ),
+            ApiError::NotOrdered { .. } => Some(
+                "submit the item from one cart at most, normally your portal cart, and empty any other cart holding it, since each submitted copy is a separate order; do not retry the order, because every attempt adds another cart item",
             ),
             ApiError::RateLimit => Some("wait briefly, then retry the command"),
             _ => None,

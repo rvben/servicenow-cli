@@ -57,6 +57,82 @@ const CUSTOM_WIDGET_TYPE_CODES: &[i64] = &[14, 15, 17];
 const DATE_FORMAT: &str = "yyyy-MM-dd";
 const TIME_FORMAT: &str = "HH:mm:ss";
 
+/// Shown when the instance flags an item `orderable: false`.
+pub const INSTANCE_UNORDERABLE: &str = "the instance reports this item as not orderable through the API; ordering may only leave it in a cart";
+
+/// What an `order_now` answer says happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderOutcome {
+    /// A request was created. `number` is `None` when the answer omitted it.
+    Request {
+        sys_id: String,
+        number: Option<String>,
+    },
+    /// No request was created; the item was left in this cart.
+    CartOnly { cart_id: String },
+    /// Neither a request id nor a cart: the field names the answer held,
+    /// sorted, and the request number when it named one. Other values are
+    /// never kept, since an answer can echo submitted variables.
+    Unrecognized {
+        keys: Vec<String>,
+        number: Option<String>,
+    },
+}
+
+/// A request number as instances generate them (`REQ0010001`): letters and
+/// digits only, so a value that is not one is never echoed.
+fn request_number(result: &Value, field: &str) -> Option<String> {
+    result
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|number| {
+            !number.is_empty()
+                && number.len() <= 40
+                && number.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(str::to_string)
+}
+
+impl OrderOutcome {
+    /// Classifies the `result` of `POST /items/{sys_id}/order_now`.
+    ///
+    /// A bare `sys_id` names the request only when the answer says it is one
+    /// (`table: sc_request`), or names neither a table nor a cart, so a cart
+    /// or cart item never passes for a request.
+    pub fn classify(result: &Value) -> Self {
+        let id = |field: &str| {
+            result
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|id| validate_sys_id(id).is_ok())
+                .map(str::to_string)
+        };
+        let names_request = match result.get("table").and_then(Value::as_str) {
+            Some(table) => table == "sc_request",
+            None => result.get("cart_id").is_none(),
+        };
+        let request = id("request_id").or_else(|| id("sys_id").filter(|_| names_request));
+        if let Some(sys_id) = request {
+            let number = request_number(result, "request_number")
+                .or_else(|| request_number(result, "number"));
+            return Self::Request { sys_id, number };
+        }
+        if let Some(cart_id) = id("cart_id") {
+            return Self::CartOnly { cart_id };
+        }
+        let mut keys: Vec<String> = result
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        keys.sort();
+        Self::Unrecognized {
+            keys,
+            number: request_number(result, "request_number"),
+        }
+    }
+}
+
 /// Short human label for an item class, as shown in the `KIND` column.
 pub fn kind_label(class: &str) -> &str {
     match class {
@@ -169,6 +245,10 @@ pub struct CatalogItem {
     /// `None` when the instance did not say.
     pub show_quantity: Option<bool>,
     pub mandatory_attachment: Option<bool>,
+    /// The item's `orderable` flag as the instance reports it; `None` when
+    /// the instance did not say. Not every release sets it reliably, so a
+    /// `false` warns instead of refusing.
+    pub instance_orderable: Option<bool>,
     /// Catalog UI policies or client scripts that the portal runs and the CLI does not.
     pub has_client_logic: bool,
     pub variables: Vec<CatalogVariable>,
@@ -194,6 +274,7 @@ impl CatalogItem {
             class: string_field(value, "sys_class_name").unwrap_or_default(),
             show_quantity: value.get("show_quantity").and_then(Value::as_bool),
             mandatory_attachment: value.get("mandatory_attachment").and_then(Value::as_bool),
+            instance_orderable: value.get("orderable").and_then(Value::as_bool),
             has_client_logic: has_client_logic(value),
             variables,
             custom_widgets,
@@ -1106,6 +1187,9 @@ pub async fn prepare_order(
             );
         }
     }
+    if item.instance_orderable == Some(false) {
+        validation.warnings.push(INSTANCE_UNORDERABLE.into());
+    }
     if !validation.problems.is_empty() {
         return Err(ApiError::InvalidInput(format!(
             "cannot order \"{}\":\n  - {}",
@@ -1621,6 +1705,130 @@ mod tests {
                 .any(|warning| warning.contains("left empty")),
             "{:?}",
             result.warnings
+        );
+    }
+
+    const REQUEST: &str = "b54ae46e1b181310b97aa975624bcbf2";
+    const CART: &str = "90ed51b23b50dbd0b8094b44c3e45aad";
+
+    #[test]
+    fn an_order_answer_naming_a_request_is_a_request() {
+        let full = json!({
+            "sys_id": REQUEST, "number": "REQ0010001", "request_number": "REQ0010001",
+            "request_id": REQUEST, "table": "sc_request"
+        });
+        assert_eq!(
+            OrderOutcome::classify(&full),
+            OrderOutcome::Request {
+                sys_id: REQUEST.into(),
+                number: Some("REQ0010001".into())
+            }
+        );
+        assert_eq!(
+            OrderOutcome::classify(&json!({ "sys_id": REQUEST })),
+            OrderOutcome::Request {
+                sys_id: REQUEST.into(),
+                number: None
+            }
+        );
+        // A request wins over a cart when the answer names both.
+        assert!(matches!(
+            OrderOutcome::classify(&json!({ "request_id": REQUEST, "cart_id": CART })),
+            OrderOutcome::Request { .. }
+        ));
+    }
+
+    #[test]
+    fn an_order_answer_with_only_a_cart_is_not_a_request() {
+        assert_eq!(
+            OrderOutcome::classify(&json!({ "cart_id": CART })),
+            OrderOutcome::CartOnly {
+                cart_id: CART.into()
+            }
+        );
+        // The sys_id of another table is not a request id.
+        assert_eq!(
+            OrderOutcome::classify(&json!({ "sys_id": CART, "table": "sc_cart", "cart_id": CART })),
+            OrderOutcome::CartOnly {
+                cart_id: CART.into()
+            }
+        );
+        // An untyped sys_id beside a cart is the cart's, not a request's.
+        assert_eq!(
+            OrderOutcome::classify(&json!({ "sys_id": CART, "cart_id": CART })),
+            OrderOutcome::CartOnly {
+                cart_id: CART.into()
+            }
+        );
+        // So is an untyped sys_id beside an unusable cart id: never a success.
+        assert!(matches!(
+            OrderOutcome::classify(&json!({ "sys_id": CART, "cart_id": "" })),
+            OrderOutcome::Unrecognized { .. }
+        ));
+    }
+
+    #[test]
+    fn an_order_answer_without_valid_ids_is_unrecognized() {
+        assert_eq!(
+            OrderOutcome::classify(&json!({ "request_id": "REQ0010001", "status": "ok" })),
+            OrderOutcome::Unrecognized {
+                keys: vec!["request_id".into(), "status".into()],
+                number: None
+            }
+        );
+        assert_eq!(
+            OrderOutcome::classify(&json!({ "cart_id": "" })),
+            OrderOutcome::Unrecognized {
+                keys: vec!["cart_id".into()],
+                number: None
+            }
+        );
+        assert_eq!(
+            OrderOutcome::classify(&json!(null)),
+            OrderOutcome::Unrecognized {
+                keys: Vec::new(),
+                number: None
+            }
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_answer_keeps_only_a_well_formed_request_number() {
+        assert_eq!(
+            OrderOutcome::classify(&json!({ "request_number": " REQ0010001 " })),
+            OrderOutcome::Unrecognized {
+                keys: vec!["request_number".into()],
+                number: Some("REQ0010001".into())
+            }
+        );
+        // Anything else in the field could be an echoed variable value.
+        for echoed in ["hunter2 secret", "a@b.example", "REQ-1", ""] {
+            assert!(
+                matches!(
+                    OrderOutcome::classify(&json!({ "request_number": echoed })),
+                    OrderOutcome::Unrecognized { number: None, .. }
+                ),
+                "{echoed:?}"
+            );
+        }
+        // A bare `number` is not known to name a request without a request id.
+        assert!(matches!(
+            OrderOutcome::classify(&json!({ "number": "REQ0010001" })),
+            OrderOutcome::Unrecognized { number: None, .. }
+        ));
+    }
+
+    #[test]
+    fn an_explicit_request_id_is_a_request_whatever_table_the_answer_names() {
+        // `table` qualifies the bare `sys_id`; `request_id` names a request by itself.
+        assert_eq!(
+            OrderOutcome::classify(&json!({
+                "request_id": REQUEST, "sys_id": CART, "table": "sc_cart"
+            })),
+            OrderOutcome::Request {
+                sys_id: REQUEST.into(),
+                number: None
+            }
         );
     }
 
