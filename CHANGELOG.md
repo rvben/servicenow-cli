@@ -2,6 +2,12 @@
 
 All notable changes are documented here. Versions follow Semantic Versioning.
 
+## [0.6.3](https://github.com/rvben/servicenow-cli/compare/v0.6.2...v0.6.3) - 2026-11-06
+
+### Added
+
+- **catalog**: add cart show/submit/remove/clear and order --checkout ([ab19c03](https://github.com/rvben/servicenow-cli/commit/ab19c039e5b4b775a0ed08f4f80d67a138126f5b))
+
 ## [0.6.2](https://github.com/rvben/servicenow-cli/compare/v0.6.1...v0.6.2) - 2026-11-05
 
 ### Fixed
