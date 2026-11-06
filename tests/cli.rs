@@ -3169,3 +3169,1411 @@ async fn order_with_echoed_secret(vars: &str, error: ResponseTemplate) -> String
         String::from_utf8_lossy(&output.stderr)
     )
 }
+
+const CART_URL: &str = "/api/sn_sc/servicecatalog/cart";
+const CART_ITEM_ID: &str = "346489831b181710b97aa975624bcb75";
+const OTHER_CART_ITEM_ID: &str = "456489831b181710b97aa975624bcbb2";
+const CART_REQUEST_ID: &str = "c54ae46e1b181310b97aa975624bcbf3";
+
+fn cart_item(cart_item_id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "cart_item_id": cart_item_id,
+        "item_name": name,
+        "quantity": "1",
+        "can_order": true,
+        "catalog_item_id": AWS_ITEM,
+    })
+}
+
+fn cart_answer(items: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut cart = serde_json::json!({ "cart_id": CART_ID, "subtotal_price": "-" });
+    if !items.is_empty() {
+        cart["none"] = serde_json::json!({ "frequency_label": null, "items": items });
+    }
+    serde_json::json!({ "result": cart })
+}
+
+/// Answers the first cart read with `first` and every later one with `later`,
+/// as when the cart changes between two reads.
+async fn mount_changing_cart(
+    server: &MockServer,
+    first: Vec<serde_json::Value>,
+    later: Vec<serde_json::Value>,
+) {
+    Mock::given(method("GET"))
+        .and(path(CART_URL))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cart_answer(first)))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    mount_cart(server, later).await;
+}
+
+async fn mount_cart(server: &MockServer, items: Vec<serde_json::Value>) {
+    Mock::given(method("GET"))
+        .and(path(CART_URL))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cart_answer(items)))
+        .mount(server)
+        .await;
+}
+
+/// Fails the test on any request that could change the instance.
+async fn forbid_writes(server: &MockServer) {
+    for verb in ["POST", "PUT", "PATCH", "DELETE"] {
+        Mock::given(method(verb))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+}
+
+async fn mount_submit_order(server: &MockServer, response: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path(format!("{CART_URL}/submit_order")))
+        .respond_with(response)
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+fn cart_request_answer() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "result": {
+            "request_id": CART_REQUEST_ID,
+            "request_number": "REQ0010002",
+            "table": "sc_request"
+        }
+    }))
+}
+
+async fn mount_cart_request_items(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/api/now/table/sc_req_item"))
+        .and(query_param(
+            "sysparm_query",
+            format!("request={CART_REQUEST_ID}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "result": [{"number": "RITM0010002", "sys_id": "1123456789abcdef0123456789abcdef"}]
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+fn json_error(output: &std::process::Output) -> serde_json::Value {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|line| line.starts_with('{'))
+        .unwrap_or_else(|| panic!("no JSON error on stderr: {stderr}"));
+    serde_json::from_str(line).unwrap()
+}
+
+#[tokio::test]
+async fn catalog_cart_show_lists_items_from_every_frequency_group() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut answer = cart_answer(vec![cart_item(CART_ITEM_ID, "AWS account request")]);
+    answer["result"]["monthly"] = serde_json::json!({
+        "frequency_label": "Monthly",
+        "items": [cart_item(OTHER_CART_ITEM_ID, "Zoom")]
+    });
+    Mock::given(method("GET"))
+        .and(path(CART_URL))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        .mount(&server)
+        .await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .env("SERVICENOW_READ_ONLY", "true")
+        .args(["catalog", "cart", "show", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cart: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cart["cart_id"], CART_ID);
+    let items = cart["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{cart}");
+    let ids: std::collections::BTreeSet<&str> = items
+        .iter()
+        .map(|item| item["cart_item_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [CART_ITEM_ID, OTHER_CART_ITEM_ID].into_iter().collect()
+    );
+    let zoom = items
+        .iter()
+        .find(|item| item["item_name"] == "Zoom")
+        .unwrap();
+    assert_eq!(zoom["frequency"], "monthly");
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "show", "--output", "text"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("2 item(s)"), "{stdout}");
+    assert!(
+        stdout.contains("AWS account request") && stdout.contains(OTHER_CART_ITEM_ID),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_cart_show_reports_an_empty_cart() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(&server, vec![]).await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "show", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let cart: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cart, serde_json::json!({"cart_id": CART_ID, "items": []}));
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "show", "--output", "text"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Your cart is empty."
+    );
+}
+
+#[tokio::test]
+async fn catalog_cart_show_refuses_an_answer_without_a_cart_id() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(CART_URL))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"items": []}})),
+        )
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "show", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("without a cart id"));
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_orders_the_cart_and_reports_the_requested_items() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    mount_submit_order(&server, cart_request_answer()).await;
+    mount_cart_request_items(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "submit", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["request"]["request_number"], "REQ0010002");
+    assert_eq!(result["requestedItems"][0]["number"], "RITM0010002");
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_refuses_an_empty_cart_without_posting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(&server, vec![]).await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "submit", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cart is empty"));
+}
+
+#[tokio::test]
+async fn catalog_cart_writes_are_blocked_by_read_only_mode_before_network_access() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    for args in [
+        vec!["catalog", "cart", "submit", "--yes"],
+        vec!["catalog", "cart", "remove", CART_ITEM_ID, "--yes"],
+        vec!["catalog", "cart", "clear", "--yes"],
+    ] {
+        let output = authenticated_command(&config_home, &server)
+            .env("SERVICENOW_READ_ONLY", "true")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("read-only"),
+            "{args:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_cart_writes_without_yes_refuse_a_non_interactive_stdin() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    forbid_writes(&server).await;
+
+    for (args, refusal) in [
+        (
+            vec!["catalog", "cart", "submit"],
+            "cart submission cancelled",
+        ),
+        (
+            vec!["catalog", "cart", "remove", CART_ITEM_ID],
+            "cart item removal cancelled",
+        ),
+        (vec!["catalog", "cart", "clear"], "cart clearing cancelled"),
+    ] {
+        let output = authenticated_command(&config_home, &server)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(refusal), "{args:?}: {stderr}");
+    }
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_that_answers_with_a_cart_never_suggests_resubmitting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    mount_submit_order(
+        &server,
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"result": {"cart_id": CART_ID}})),
+    )
+    .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "submit", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = json_error(&output);
+    assert_ne!(error["error"]["kind"], "not_ordered", "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("unclear whether anything was ordered"),
+        "{message}"
+    );
+    assert!(message.contains("catalog requests mine"), "{message}");
+    assert!(!error.to_string().contains("cart submit`"), "{error}");
+}
+
+#[tokio::test]
+async fn catalog_cart_remove_deletes_only_an_item_in_the_cart() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("{CART_URL}/{CART_ITEM_ID}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "cart",
+            "remove",
+            &format!(" {} ", CART_ITEM_ID.to_ascii_uppercase()),
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "removed": true,
+            "cart_id": CART_ID,
+            "cart_item_id": CART_ITEM_ID,
+            "item_name": "AWS account request",
+        })
+    );
+}
+
+#[tokio::test]
+async fn catalog_cart_remove_of_an_item_not_in_the_cart_is_not_found_without_deleting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "remove", OTHER_CART_ITEM_ID, "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not in your cart"));
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "remove", "not-a-sys-id", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[tokio::test]
+async fn catalog_cart_remove_reports_an_item_the_instance_no_longer_has_as_not_found() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("{CART_URL}/{CART_ITEM_ID}")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "Invalid Cart Item ID!", "detail": ""},
+            "status": "failure"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "remove", CART_ITEM_ID, "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid Cart Item ID"));
+}
+
+#[tokio::test]
+async fn catalog_cart_clear_empties_a_cart_that_holds_items() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(
+        &server,
+        vec![
+            cart_item(CART_ITEM_ID, "AWS account request"),
+            cart_item(OTHER_CART_ITEM_ID, "Zoom"),
+        ],
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("{CART_URL}/{CART_ID}/empty")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "clear", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!({"cleared": true, "cart_id": CART_ID, "items_removed": 2})
+    );
+}
+
+#[tokio::test]
+async fn catalog_cart_clear_of_an_empty_cart_deletes_nothing_and_needs_no_confirmation() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_cart(&server, vec![]).await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "clear", "--output", "text"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Your cart is already empty."
+    );
+}
+
+fn add_to_cart_url() -> String {
+    format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}/add_to_cart")
+}
+
+/// Mounts an empty cart for the `--checkout` preflight and an `add_to_cart`
+/// answer describing the cart afterwards.
+async fn mount_checkout_add(server: &MockServer, items_after: Vec<serde_json::Value>) {
+    mount_aws_item(server).await;
+    mount_changing_cart(server, vec![], items_after.clone()).await;
+    let mut answer = cart_answer(items_after.clone());
+    answer["result"]["items"] = serde_json::Value::Array(items_after);
+    answer["result"].as_object_mut().unwrap().remove("none");
+    Mock::given(method("POST"))
+        .and(path(add_to_cart_url()))
+        .and(wiremock::matchers::body_json(serde_json::json!({
+            "sysparm_quantity": "1",
+            "variables": {
+                "division": "IT",
+                "environment": "Dev",
+                "describe_briefly_the_purpose_of_this_account": "Sandbox"
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_adds_the_item_and_submits_the_cart() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_checkout_add(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    mount_submit_order(&server, cart_request_answer()).await;
+    mount_cart_request_items(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/order_now"
+        )))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["request"]["request_number"], "REQ0010002");
+    assert_eq!(result["requestedItems"][0]["number"], "RITM0010002");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_refuses_a_cart_that_already_holds_items() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    mount_cart(&server, vec![cart_item(OTHER_CART_ITEM_ID, "Zoom")]).await;
+    forbid_writes(&server).await;
+
+    for extra in [vec!["--yes"], vec!["--dry-run"]] {
+        let output = authenticated_command(&config_home, &server)
+            .args(["catalog", "order", AWS_ITEM, "--checkout", "--json"])
+            .args(&extra)
+            .args(AWS_VARS)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7), "{extra:?}");
+        assert!(output.stdout.is_empty(), "{extra:?}");
+        let error = json_error(&output);
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("Zoom"), "{message}");
+        assert!(message.contains("catalog cart clear"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_dry_run_marks_the_plan_without_writing() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    mount_cart(&server, vec![]).await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .env("SERVICENOW_READ_ONLY", "true")
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--dry-run",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["dryRun"], true);
+    assert_eq!(plan["checkout"], true);
+    assert_eq!(plan["variables"]["division"], "IT");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_refuses_to_order_for_someone_else_before_network_access() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--requested-for",
+            "abel.tuter",
+            "--yes",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--requested-for"));
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_does_not_submit_a_cart_that_gained_other_items() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_checkout_add(
+        &server,
+        vec![
+            cart_item(CART_ITEM_ID, "AWS account request"),
+            cart_item(OTHER_CART_ITEM_ID, "Zoom"),
+        ],
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{CART_URL}/submit_order")))
+        .respond_with(cart_request_answer())
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(8));
+    let error = json_error(&output);
+    assert_eq!(error["error"]["kind"], "not_ordered", "{error}");
+    assert_eq!(error["error"]["cart"]["sys_id"], CART_ID, "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("2 item(s)"), "{message}");
+    assert!(message.contains("still in your cart"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_with_a_refused_submission_leaves_the_item_in_the_cart() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_checkout_add(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    mount_submit_order(
+        &server,
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "Cart is empty!", "detail": ""},
+            "status": "failure"
+        })),
+    )
+    .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(8));
+    let error = json_error(&output);
+    assert_eq!(error["error"]["kind"], "not_ordered", "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("submitting the cart failed"), "{message}");
+    assert!(message.contains("Cart is empty!"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_with_a_server_error_on_submission_may_have_ordered() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_checkout_add(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+    mount_submit_order(
+        &server,
+        ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": {"message": "Service unavailable", "detail": ""},
+            "status": "failure"
+        })),
+    )
+    .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_ne!(
+        output.status.code(),
+        Some(8),
+        "a server error may have ordered"
+    );
+    let error = json_error(&output);
+    assert_ne!(error["error"]["kind"], "not_ordered", "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("may have"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_is_blocked_by_read_only_mode_before_reading_the_cart() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    Mock::given(method("GET"))
+        .and(path(CART_URL))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cart_answer(vec![])))
+        .expect(0)
+        .mount(&server)
+        .await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .env("SERVICENOW_READ_ONLY", "true")
+        .args(["catalog", "order", AWS_ITEM, "--checkout", "--yes"])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("read-only"));
+}
+
+/// Mounts the Zoom item with every variable optional and returns its id.
+async fn mount_optional_zoom(server: &MockServer) -> String {
+    let zoom = catalog_fixture("zoom_webinar");
+    let zoom_id = zoom["result"]["sys_id"].as_str().unwrap().to_string();
+    let mut optional = zoom.clone();
+    fn relax(node: &mut serde_json::Value) {
+        match node {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("mandatory") {
+                    map.insert("mandatory".into(), false.into());
+                }
+                map.values_mut().for_each(relax);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(relax),
+            _ => {}
+        }
+    }
+    relax(&mut optional);
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(optional))
+        .mount(server)
+        .await;
+    zoom_id
+}
+
+fn zoom_in_cart(zoom_id: &str) -> serde_json::Value {
+    let mut item = cart_item(CART_ITEM_ID, "Zoom");
+    item["catalog_item_id"] = zoom_id.into();
+    item
+}
+
+fn refusal_quoting_the_secret() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+        "error": {"message": "Invalid value s3cr3t-Pa55 for set_password", "detail": "s3cr3t-Pa55"},
+        "status": "failure"
+    }))
+}
+
+/// Orders Zoom with `--checkout`, passing its password variable on stdin,
+/// and returns the output with stdout and stderr joined.
+fn checkout_zoom(
+    config_home: &TempDir,
+    server: &MockServer,
+    zoom_id: &str,
+) -> (Option<i32>, String) {
+    let mut child = authenticated_command(config_home, server)
+        .args(["catalog", "order", zoom_id, "--checkout", "--yes"])
+        .args(["--vars-file", "-", "--output", "json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"topic": "Launch", "set_password": "s3cr3t-Pa55"}"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.code(), all)
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_never_echoes_a_sensitive_value_from_a_failed_submission() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let zoom_id = mount_optional_zoom(&server).await;
+    mount_changing_cart(&server, vec![], vec![zoom_in_cart(&zoom_id)]).await;
+    let mut added = cart_answer(vec![]);
+    added["result"]["items"] = serde_json::json!([zoom_in_cart(&zoom_id)]);
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{zoom_id}/add_to_cart"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(added))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_submit_order(&server, refusal_quoting_the_secret()).await;
+
+    let (code, all) = checkout_zoom(&config_home, &server, &zoom_id);
+    assert_eq!(code, Some(8), "{all}");
+    assert!(!all.contains("s3cr3t-Pa55"), "{all}");
+    assert!(all.contains("[REDACTED]"), "{all}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_never_echoes_a_sensitive_value_from_a_refused_add() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let zoom_id = mount_optional_zoom(&server).await;
+    mount_cart(&server, vec![]).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{zoom_id}/add_to_cart"
+        )))
+        .respond_with(refusal_quoting_the_secret())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{CART_URL}/submit_order")))
+        .respond_with(cart_request_answer())
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let (code, all) = checkout_zoom(&config_home, &server, &zoom_id);
+    assert_eq!(code, Some(5), "{all}");
+    assert!(!all.contains("s3cr3t-Pa55"), "{all}");
+    assert!(all.contains("[REDACTED]"), "{all}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_that_lists_no_added_item_stops_without_submitting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_checkout_add(&server, vec![]).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{CART_URL}/submit_order")))
+        .respond_with(cart_request_answer())
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let error = json_error(&output);
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("listed no items"), "{message}");
+    assert!(message.contains("nothing was ordered"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_never_submits_a_cart_holding_a_different_item() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut other = cart_item(OTHER_CART_ITEM_ID, "Zoom");
+    other["catalog_item_id"] = "54c9ead947dec110f53d37d2846d43ea".into();
+    mount_checkout_add(&server, vec![other]).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{CART_URL}/submit_order")))
+        .respond_with(cart_request_answer())
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(8));
+    let message = json_error(&output)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("\"Zoom\" instead"), "{message}");
+}
+
+/// Mounts a cart holding `items` and a submission refused with a message
+/// that quotes a secret.
+async fn mount_cart_refusing_with_a_secret(server: &MockServer, items: Vec<serde_json::Value>) {
+    mount_cart(server, items).await;
+    mount_submit_order(
+        server,
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "Invalid value s3cr3t-Pa55 for set_password"},
+            "status": "failure"
+        })),
+    )
+    .await;
+}
+
+fn submit_cart(config_home: &TempDir, server: &MockServer) -> std::process::Output {
+    authenticated_command(config_home, server)
+        .args(["catalog", "cart", "submit", "--yes", "--json"])
+        .output()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_withholds_the_error_for_a_cart_with_a_sensitive_item() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let zoom = catalog_fixture("zoom_webinar");
+    let zoom_id = zoom["result"]["sys_id"].as_str().unwrap().to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/sn_sc/servicecatalog/items/{zoom_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(zoom))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut zoom_in_cart = cart_item(CART_ITEM_ID, "Zoom");
+    zoom_in_cart["catalog_item_id"] = zoom_id.to_uppercase().into();
+    mount_cart_refusing_with_a_secret(&server, vec![zoom_in_cart]).await;
+
+    let output = submit_cart(&config_home, &server);
+    assert_eq!(output.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("s3cr3t-Pa55"), "{stderr}");
+    assert!(stderr.contains("error message withheld"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_withholds_the_error_when_an_item_cannot_be_checked() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut unknown = cart_item(CART_ITEM_ID, "AWS account request");
+    unknown.as_object_mut().unwrap().remove("catalog_item_id");
+    mount_cart_refusing_with_a_secret(&server, vec![unknown]).await;
+
+    let output = submit_cart(&config_home, &server);
+    assert_eq!(output.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("s3cr3t-Pa55"), "{stderr}");
+    assert!(stderr.contains("error message withheld"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_shows_the_error_for_a_cart_without_sensitive_items() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    mount_cart_refusing_with_a_secret(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+
+    let output = submit_cart(&config_home, &server);
+    assert_eq!(output.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Invalid value"), "{stderr}");
+    assert!(!stderr.contains("error message withheld"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_whose_item_left_the_cart_after_a_refusal_may_have_ordered() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    // The add answer lists the item, but by the time the refusal is checked
+    // the cart is empty again: the portal ordered or removed it.
+    mount_aws_item(&server).await;
+    mount_cart(&server, vec![]).await;
+    let added = serde_json::json!({"result": {
+        "cart_id": CART_ID,
+        "items": [cart_item(CART_ITEM_ID, "AWS account request")],
+    }});
+    Mock::given(method("POST"))
+        .and(path(add_to_cart_url()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(added))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_submit_order(
+        &server,
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "Cart is empty!"}, "status": "failure"
+        })),
+    )
+    .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let message = json_error(&output)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("may have been ordered"), "{message}");
+    assert!(message.contains("catalog requests mine"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_refuses_a_cart_that_changed_after_it_was_read() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    mount_changing_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+        vec![
+            cart_item(CART_ITEM_ID, "AWS account request"),
+            cart_item(OTHER_CART_ITEM_ID, "Added in the portal"),
+        ],
+    )
+    .await;
+    forbid_writes(&server).await;
+
+    let output = submit_cart(&config_home, &server);
+    assert_eq!(output.status.code(), Some(7));
+    let message = json_error(&output)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("Added in the portal"), "{message}");
+    assert!(message.contains("nothing was changed"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_refuses_a_cart_whose_quantity_changed() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    let mut more = cart_item(CART_ITEM_ID, "AWS account request");
+    more["quantity"] = "3".into();
+    mount_changing_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+        vec![more],
+    )
+    .await;
+    forbid_writes(&server).await;
+
+    let output = submit_cart(&config_home, &server);
+    assert_eq!(output.status.code(), Some(7));
+}
+
+#[tokio::test]
+async fn catalog_cart_clear_refuses_a_cart_that_changed_after_it_was_read() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_changing_cart(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+        vec![
+            cart_item(CART_ITEM_ID, "AWS account request"),
+            cart_item(OTHER_CART_ITEM_ID, "Added in the portal"),
+        ],
+    )
+    .await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "cart", "clear", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_withholds_the_error_for_a_cart_with_a_multi_row_set() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item_with_multi_row_set(&server, false).await;
+    mount_cart_refusing_with_a_secret(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request")],
+    )
+    .await;
+
+    let output = submit_cart(&config_home, &server);
+    assert_eq!(output.status.code(), Some(5));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("s3cr3t-Pa55"), "{stderr}");
+    assert!(stderr.contains("error message withheld"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_withholds_the_error_when_an_item_definition_cannot_be_read() {
+    for status in [404, 500] {
+        let config_home = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/sn_sc/servicecatalog/items/{AWS_ITEM}")))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        mount_cart_refusing_with_a_secret(
+            &server,
+            vec![cart_item(CART_ITEM_ID, "AWS account request")],
+        )
+        .await;
+
+        let output = submit_cart(&config_home, &server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(5), "{status}: {stderr}");
+        assert!(!stderr.contains("s3cr3t-Pa55"), "{status}: {stderr}");
+        assert!(
+            stderr.contains("error message withheld"),
+            "{status}: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_cart_submit_withholds_the_error_when_any_one_item_is_sensitive() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    let zoom_id = mount_optional_zoom(&server).await;
+    let mut zoom = zoom_in_cart(&zoom_id);
+    zoom["cart_item_id"] = OTHER_CART_ITEM_ID.into();
+    mount_cart_refusing_with_a_secret(
+        &server,
+        vec![cart_item(CART_ITEM_ID, "AWS account request"), zoom],
+    )
+    .await;
+
+    let output = submit_cart(&config_home, &server);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(5), "{stderr}");
+    assert!(!stderr.contains("s3cr3t-Pa55"), "{stderr}");
+    assert!(stderr.contains("error message withheld"), "{stderr}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_asks_before_adding_anything() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    mount_cart(&server, vec![]).await;
+    forbid_writes(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args(["catalog", "order", AWS_ITEM, "--checkout"])
+        .args(AWS_VARS)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cancelled"));
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_matches_the_added_item_in_any_case() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut added = cart_item(CART_ITEM_ID, "AWS account request");
+    added["catalog_item_id"] = AWS_ITEM.to_uppercase().into();
+    mount_checkout_add(&server, vec![added]).await;
+    mount_submit_order(&server, cart_request_answer()).await;
+    mount_cart_request_items(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            &AWS_ITEM.to_uppercase(),
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_submits_a_lone_added_item_the_answer_does_not_identify() {
+    // The cart was empty before the add, so a single item in the answer is
+    // the added one even when the instance omits its catalog item id.
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    let mut added = cart_item(CART_ITEM_ID, "AWS account request");
+    added.as_object_mut().unwrap().remove("catalog_item_id");
+    mount_checkout_add(&server, vec![added]).await;
+    mount_submit_order(&server, cart_request_answer()).await;
+    mount_cart_request_items(&server).await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_with_an_unreadable_cart_after_a_refusal_may_have_ordered() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    Mock::given(method("GET"))
+        .and(path(CART_URL))
+        .respond_with(ResponseTemplate::new(200).set_body_json(cart_answer(vec![])))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(CART_URL))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let added = serde_json::json!({"result": {
+        "cart_id": CART_ID,
+        "items": [cart_item(CART_ITEM_ID, "AWS account request")],
+    }});
+    Mock::given(method("POST"))
+        .and(path(add_to_cart_url()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(added))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_submit_order(
+        &server,
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": {"message": "Cart is empty!"}, "status": "failure"
+        })),
+    )
+    .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let message = json_error(&output)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("may have been ordered"), "{message}");
+}
+
+#[tokio::test]
+async fn catalog_order_checkout_with_an_unreadable_add_answer_stops_without_submitting() {
+    let config_home = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    mount_aws_item(&server).await;
+    mount_cart(&server, vec![]).await;
+    Mock::given(method("POST"))
+        .and(path(add_to_cart_url()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"items": []}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{CART_URL}/submit_order")))
+        .respond_with(cart_request_answer())
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = authenticated_command(&config_home, &server)
+        .args([
+            "catalog",
+            "order",
+            AWS_ITEM,
+            "--checkout",
+            "--yes",
+            "--json",
+        ])
+        .args(AWS_VARS)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let message = json_error(&output)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.contains("could not be read"), "{message}");
+    assert!(message.contains("nothing was ordered"), "{message}");
+}

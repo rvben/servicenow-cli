@@ -1,8 +1,8 @@
 mod client;
 
 pub use client::{
-    AttachmentMetadata, DisplayValue, ListOptions, MAY_HAVE_ORDERED, ServiceNowClient,
-    normalize_instance, validate_sys_id, validate_table,
+    AttachmentMetadata, DisplayValue, ListOptions, MAY_HAVE_ADDED_TO_CART, MAY_HAVE_ORDERED,
+    ServiceNowClient, normalize_instance, validate_sys_id, validate_table,
 };
 
 use std::fmt;

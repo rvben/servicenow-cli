@@ -133,6 +133,142 @@ impl OrderOutcome {
     }
 }
 
+/// The caller's cart, as `GET /cart` or `add_to_cart` describes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cart {
+    pub cart_id: String,
+    pub items: Vec<CartItem>,
+}
+
+/// One item in a [`Cart`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CartItem {
+    pub cart_item_id: String,
+    pub name: String,
+    /// The catalog item this is a copy of, when the instance names one.
+    pub catalog_item_id: Option<String>,
+    /// `false` when the instance says the item cannot be ordered as it is.
+    pub can_order: Option<bool>,
+    /// The item as the instance described it, plus `frequency`: the
+    /// recurring price frequency the instance grouped it under.
+    pub details: Value,
+}
+
+impl Cart {
+    /// Reads a cart answer. `GET /cart` groups items by recurring price
+    /// frequency, one object per frequency (`none` for one-off prices) with an
+    /// `items` array; `add_to_cart` lists them under a top-level `items`.
+    pub fn from_api(result: &Value) -> Result<Self, ApiError> {
+        let missing_id =
+            || ApiError::Other("the instance described the cart without a cart id".into());
+        let object = result.as_object().ok_or_else(missing_id)?;
+        let cart_id = object
+            .get("cart_id")
+            .and_then(Value::as_str)
+            .filter(|id| validate_sys_id(id).is_ok())
+            .ok_or_else(missing_id)?
+            .to_string();
+        let mut groups: Vec<(&str, &Vec<Value>)> = Vec::new();
+        for (frequency, group) in object {
+            if let Some(items) = group.get("items").and_then(Value::as_array) {
+                groups.push((frequency, items));
+            }
+        }
+        if let Some(items) = object.get("items").and_then(Value::as_array) {
+            groups.push(("none", items));
+        }
+        // An item listed both in a frequency group and at the top level is
+        // one item: counting it twice would misreport the cart.
+        let mut seen = BTreeSet::new();
+        let mut items = Vec::new();
+        for (frequency, group) in groups {
+            for item in group {
+                let item = CartItem::from_api(item, frequency)?;
+                if seen.insert(item.cart_item_id.clone()) {
+                    items.push(item);
+                }
+            }
+        }
+        Ok(Self { cart_id, items })
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "cart_id": self.cart_id,
+            "items": self.items.iter().map(|item| item.details.clone()).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn item(&self, cart_item_id: &str) -> Option<&CartItem> {
+        self.items
+            .iter()
+            .find(|item| item.cart_item_id.eq_ignore_ascii_case(cart_item_id))
+    }
+
+    /// What identifies the cart's contents: its id and each item with its
+    /// quantity, in a stable order.
+    pub fn fingerprint(&self) -> (String, Vec<(String, Option<String>)>) {
+        let mut items: Vec<(String, Option<String>)> = self
+            .items
+            .iter()
+            .map(|item| {
+                let quantity = item.details.get("quantity").map(|value| match value {
+                    Value::String(text) => text.trim().to_string(),
+                    other => other.to_string(),
+                });
+                (item.cart_item_id.clone(), quantity)
+            })
+            .collect();
+        items.sort();
+        (self.cart_id.clone(), items)
+    }
+
+    /// The items' names, for messages about the whole cart.
+    pub fn item_names(&self) -> String {
+        self.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl CartItem {
+    fn from_api(item: &Value, frequency: &str) -> Result<Self, ApiError> {
+        let cart_item_id = item
+            .get("cart_item_id")
+            .and_then(Value::as_str)
+            .filter(|id| validate_sys_id(id).is_ok())
+            .ok_or_else(|| {
+                ApiError::Other("the instance listed a cart item without a cart item id".into())
+            })?
+            .to_ascii_lowercase();
+        let name = ["item_name", "name"]
+            .iter()
+            .find_map(|field| item.get(*field).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("(unnamed item)")
+            .to_string();
+        let mut details = item.clone();
+        if let Some(object) = details.as_object_mut() {
+            object.insert("frequency".into(), Value::String(frequency.to_string()));
+        }
+        let catalog_item_id = item
+            .get("catalog_item_id")
+            .and_then(Value::as_str)
+            .filter(|id| validate_sys_id(id).is_ok())
+            .map(str::to_ascii_lowercase);
+        Ok(Self {
+            cart_item_id,
+            name,
+            catalog_item_id,
+            can_order: item.get("can_order").and_then(Value::as_bool),
+            details,
+        })
+    }
+}
+
 /// Short human label for an item class, as shown in the `KIND` column.
 pub fn kind_label(class: &str) -> &str {
     match class {
@@ -1500,6 +1636,128 @@ pub fn ritm_variables(item: &CatalogItem, record: &Value) -> Vec<RitmVariable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CART_ITEM: &str = "346489831b181710b97aa975624bcb75";
+
+    #[test]
+    fn a_cart_lists_items_from_every_frequency_group() {
+        let cart = Cart::from_api(&json!({
+            "cart_id": CART,
+            "none": {"frequency_label": null, "items": [{
+                "cart_item_id": CART_ITEM,
+                "item_name": "AWS account request",
+                "quantity": "1",
+                "can_order": true,
+            }]},
+            "monthly": {"frequency_label": "Monthly", "items": [{
+                "cart_item_id": "456489831b181710b97aa975624bcbb2",
+                "item_name": "Zoom",
+                "can_order": false,
+            }]},
+            "subtotal_price": "-",
+        }))
+        .unwrap();
+        assert_eq!(cart.cart_id, CART);
+        let names: Vec<&str> = cart.items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["Zoom", "AWS account request"]);
+        assert_eq!(cart.items[0].can_order, Some(false));
+        assert_eq!(cart.items[0].details["frequency"], "monthly");
+        assert_eq!(cart.items[1].details["frequency"], "none");
+        assert_eq!(cart.items[1].details["quantity"], "1");
+        assert_eq!(cart.item_names(), "Zoom, AWS account request");
+    }
+
+    #[test]
+    fn an_empty_cart_has_no_items() {
+        let cart = Cart::from_api(&json!({
+            "cart_id": CART,
+            "show_subtotal_price": "false",
+            "subtotal_price": "-",
+        }))
+        .unwrap();
+        assert!(cart.items.is_empty());
+        assert_eq!(cart.to_json(), json!({"cart_id": CART, "items": []}));
+    }
+
+    #[test]
+    fn an_add_to_cart_answer_lists_the_whole_cart_at_the_top_level() {
+        let cart = Cart::from_api(&json!({
+            "cart_id": CART,
+            "items": [{"cart_item_id": CART_ITEM, "item_name": "AWS account request"}],
+            "subtotal": "$0.00",
+        }))
+        .unwrap();
+        assert_eq!(cart.items.len(), 1);
+        assert_eq!(cart.items[0].cart_item_id, CART_ITEM);
+        assert_eq!(cart.items[0].can_order, None);
+    }
+
+    #[test]
+    fn an_item_listed_in_a_group_and_at_the_top_level_counts_once() {
+        let cart = Cart::from_api(&json!({
+            "cart_id": CART,
+            "none": {"items": [{"cart_item_id": CART_ITEM, "item_name": "AWS account request"}]},
+            "items": [{
+                "cart_item_id": CART_ITEM.to_uppercase(),
+                "item_name": "AWS account request",
+                "catalog_item_id": "5A1EFA5947520510F53D37D2846D439B",
+            }],
+        }))
+        .unwrap();
+        assert_eq!(cart.items.len(), 1);
+        assert_eq!(cart.items[0].cart_item_id, CART_ITEM);
+        assert_eq!(cart.items[0].details["frequency"], "none");
+    }
+
+    #[test]
+    fn a_cart_item_names_its_catalog_item_in_lowercase() {
+        let cart = Cart::from_api(&json!({
+            "cart_id": CART,
+            "items": [{
+                "cart_item_id": CART_ITEM,
+                "catalog_item_id": "5A1EFA5947520510F53D37D2846D439B",
+            }],
+        }))
+        .unwrap();
+        assert_eq!(
+            cart.items[0].catalog_item_id.as_deref(),
+            Some("5a1efa5947520510f53d37d2846d439b")
+        );
+    }
+
+    #[test]
+    fn a_cart_without_a_usable_cart_id_is_refused() {
+        for answer in [
+            json!({}),
+            json!({"cart_id": "not-a-sys-id"}),
+            json!([CART]),
+            json!(CART),
+        ] {
+            let error = Cart::from_api(&answer).unwrap_err();
+            assert!(error.to_string().contains("without a cart id"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_cart_item_without_a_usable_id_is_refused() {
+        for item in [json!({"item_name": "AWS"}), json!({"cart_item_id": "x"})] {
+            let error =
+                Cart::from_api(&json!({"cart_id": CART, "none": {"items": [item]}})).unwrap_err();
+            assert!(error.to_string().contains("cart item id"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_cart_item_is_found_by_id_in_any_case() {
+        let cart = Cart::from_api(&json!({
+            "cart_id": CART,
+            "none": {"items": [{"cart_item_id": CART_ITEM, "name": "  "}]},
+        }))
+        .unwrap();
+        assert_eq!(cart.items[0].name, "(unnamed item)");
+        assert!(cart.item(&CART_ITEM.to_uppercase()).is_some());
+        assert!(cart.item("ffffffffffffffffffffffffffffffff").is_none());
+    }
 
     fn fixture(name: &str) -> CatalogItem {
         let path = format!(

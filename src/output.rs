@@ -298,7 +298,7 @@ fn error_remediation(error: &ApiError) -> Option<&'static str> {
                 "your credentials work, but this account lacks the role or ACL the operation needs; ask a ServiceNow administrator, or use an account that has it",
             ),
             ApiError::NotOrdered { .. } => Some(
-                "submit the item from one cart at most, normally your portal cart, and empty any other cart holding it, since each submitted copy is a separate order; do not retry the order, because every attempt adds another cart item",
+                "see what your cart holds with `servicenow catalog cart show`, then order it with `servicenow catalog cart submit` or empty it with `servicenow catalog cart clear`; do not retry the order, because every attempt adds another cart item; if the portal shows a cart of its own, submit the item from one cart only, since each submitted copy is a separate order",
             ),
             ApiError::RateLimit => Some("wait briefly, then retry the command"),
             _ => None,

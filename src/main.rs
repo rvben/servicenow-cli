@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{IsTerminal, Read, Write};
 
 use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
@@ -672,6 +673,11 @@ enum CatalogCommand {
         #[arg(long)]
         allow_unverified_formats: bool,
 
+        /// Order through your cart: add the item, then submit the cart. For
+        /// instances that answer a plain order with a cart; needs an empty cart
+        #[arg(long)]
+        checkout: bool,
+
         /// Validate and show the order without submitting it
         #[arg(long)]
         dry_run: bool,
@@ -681,9 +687,49 @@ enum CatalogCommand {
         yes: bool,
     },
 
+    /// Show, order, or empty your cart (the one the portal shows)
+    #[command(subcommand)]
+    Cart(CatalogCartCommand),
+
     /// Track requested items
     #[command(subcommand, visible_alias = "request")]
     Requests(CatalogRequestsCommand),
+}
+
+#[derive(Subcommand)]
+enum CatalogCartCommand {
+    /// List the items in your cart
+    #[command(
+        after_help = "Reading the cart makes the instance create an empty one when you have none."
+    )]
+    Show,
+
+    /// Order everything in your cart
+    #[command(
+        after_help = "The cart is submitted as it is when the instance receives the request, so\nitems added in the portal after the confirmation are ordered too."
+    )]
+    Submit {
+        /// Submit without prompting
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Remove one item from your cart
+    Remove {
+        /// Cart item id, as `catalog cart show` lists it
+        cart_item_id: String,
+
+        /// Remove without prompting
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Remove every item from your cart
+    Clear {
+        /// Clear without prompting
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2751,9 +2797,15 @@ async fn run_catalog(
             requested_for,
             allow_unknown_vars,
             allow_unverified_formats,
+            checkout,
             dry_run,
             yes,
         } => {
+            if checkout && requested_for.is_some() {
+                return Err(ApiError::InvalidInput(
+                    "--checkout cannot order for someone else: the instance ignores --requested-for for items added to a cart, so the request would be raised for you; order without --checkout".into(),
+                ));
+            }
             let file_values = match vars_file {
                 Some(path) => {
                     catalog::parse_vars_document(&read_file_or_stdin(&path, "catalog variables")?)?
@@ -2802,11 +2854,22 @@ async fn run_catalog(
                     item.custom_widgets.join(", ")
                 ));
             }
-            let plan_json = plan.plan_json();
+            let mut plan_json = plan.plan_json();
+            if checkout {
+                if !dry_run {
+                    config.require_writable()?;
+                }
+                ensure_cart_empty(client).await?;
+                plan_json["checkout"] = Value::Bool(true);
+            }
+            let through_cart = if checkout { " through your cart" } else { "" };
             if dry_run {
                 emit_plan(
                     output,
-                    &format!("order \"{}\" (quantity {})", plan.item_name, plan.quantity),
+                    &format!(
+                        "order \"{}\" (quantity {}){through_cart}",
+                        plan.item_name, plan.quantity
+                    ),
                     &plan_json,
                     "variables",
                 );
@@ -2815,7 +2878,7 @@ async fn run_catalog(
             config.require_writable()?;
             if !yes && !output.json {
                 outln!(
-                    "Order \"{}\" (quantity {})\n",
+                    "Order \"{}\" (quantity {}){through_cart}\n",
                     plan.item_name,
                     plan.quantity
                 );
@@ -2831,17 +2894,31 @@ async fn run_catalog(
                 "order cancelled; rerun with --yes to submit without prompting",
             )?;
             let scrubber = plan.error_scrubber();
-            let request = client
-                .order_catalog_item(
-                    &plan.item_sys_id,
-                    &plan.request_body(),
-                    scrubber
-                        .as_ref()
-                        .map(|scrub| scrub as &dyn Fn(&str) -> String),
+            let scrub = scrubber
+                .as_ref()
+                .map(|scrub| scrub as &dyn Fn(&str) -> String);
+            if checkout {
+                let added = client
+                    .add_catalog_item_to_cart(&plan.item_sys_id, &plan.request_body(), scrub)
+                    .await?;
+                let request = submit_added_item(client, &plan.item_sys_id, &added, scrub).await?;
+                emit_order_result(client, output, &plan.item_name, request, OrderSource::Cart)
+                    .await?;
+            } else {
+                let request = client
+                    .order_catalog_item(&plan.item_sys_id, &plan.request_body(), scrub)
+                    .await?;
+                emit_order_result(
+                    client,
+                    output,
+                    &plan.item_name,
+                    request,
+                    OrderSource::OrderNow,
                 )
                 .await?;
-            emit_order_result(client, output, &plan.item_name, request).await?;
+            }
         }
+        CatalogCommand::Cart(command) => run_catalog_cart(command, client, config, output).await?,
         CatalogCommand::Requests(CatalogRequestsCommand::Mine {
             limit,
             open,
@@ -3137,11 +3214,311 @@ fn emit_catalog_item(output: &OutputConfig, item: &CatalogItem, site_url: &str) 
     );
 }
 
+async fn run_catalog_cart(
+    command: CatalogCartCommand,
+    client: &ServiceNowClient,
+    config: &Config,
+    output: &OutputConfig,
+) -> Result<(), ApiError> {
+    match command {
+        CatalogCartCommand::Show => {
+            let cart = catalog::Cart::from_api(&client.get_cart().await?)?;
+            if output.json {
+                output.value(&cart.to_json());
+            } else if cart.items.is_empty() {
+                outln!("Your cart is empty.");
+            } else {
+                outln!(
+                    "Cart {} ({} item(s))  {}\n",
+                    cart.cart_id,
+                    cart.items.len(),
+                    client.record_url("sc_cart", &cart.cart_id)
+                );
+                print_cart_items(&cart, output);
+            }
+        }
+        CatalogCartCommand::Submit { yes } => {
+            config.require_writable()?;
+            let cart = catalog::Cart::from_api(&client.get_cart().await?)?;
+            if cart.items.is_empty() {
+                return Err(ApiError::InvalidInput(
+                    "your cart is empty, so there is nothing to submit".into(),
+                ));
+            }
+            for item in &cart.items {
+                if item.can_order == Some(false) {
+                    output.message(&format!(
+                        "warning: the instance reports that \"{}\" cannot be ordered as it is; it may refuse the cart",
+                        item.name
+                    ));
+                }
+            }
+            if !yes && !output.json {
+                print_cart_items(&cart, output);
+                outln!();
+            }
+            confirm_destructive(
+                yes,
+                format!("Order the {} item(s) in your cart?", cart.items.len()),
+                "cart submission cancelled; rerun with --yes to submit without prompting",
+            )?;
+            let withhold = |_: &str| WITHHELD_FOR_CART.to_string();
+            let scrub = if cart_may_hold_secrets(client, &cart).await {
+                Some(&withhold as &dyn Fn(&str) -> String)
+            } else {
+                None
+            };
+            ensure_cart_unchanged(client, &cart).await?;
+            let request = client.submit_cart(scrub).await?;
+            emit_order_result(
+                client,
+                output,
+                &cart.item_names(),
+                request,
+                OrderSource::Cart,
+            )
+            .await?;
+        }
+        CatalogCartCommand::Remove { cart_item_id, yes } => {
+            config.require_writable()?;
+            let cart_item_id = cart_item_id.trim().to_ascii_lowercase();
+            servicenow_cli::api::validate_sys_id(&cart_item_id)?;
+            let cart = catalog::Cart::from_api(&client.get_cart().await?)?;
+            let item = cart.item(&cart_item_id).ok_or_else(|| {
+                ApiError::NotFound(format!(
+                    "cart item {cart_item_id} is not in your cart; `servicenow catalog cart show` lists what is"
+                ))
+            })?;
+            confirm_destructive(
+                yes,
+                format!("Remove \"{}\" from your cart?", item.name),
+                "cart item removal cancelled; rerun with --yes to remove without prompting",
+            )?;
+            client.remove_cart_item(&cart_item_id).await?;
+            if output.json {
+                output.value(&serde_json::json!({
+                    "removed": true,
+                    "cart_id": cart.cart_id,
+                    "cart_item_id": cart_item_id,
+                    "item_name": item.name,
+                }));
+            } else {
+                outln!("Removed \"{}\" from your cart.", item.name);
+            }
+        }
+        CatalogCartCommand::Clear { yes } => {
+            config.require_writable()?;
+            let cart = catalog::Cart::from_api(&client.get_cart().await?)?;
+            if !cart.items.is_empty() {
+                confirm_destructive(
+                    yes,
+                    format!("Remove all {} item(s) from your cart?", cart.items.len()),
+                    "cart clearing cancelled; rerun with --yes to clear without prompting",
+                )?;
+                ensure_cart_unchanged(client, &cart).await?;
+                client.empty_cart(&cart.cart_id).await?;
+            }
+            if output.json {
+                output.value(&serde_json::json!({
+                    "cleared": true,
+                    "cart_id": cart.cart_id,
+                    "items_removed": cart.items.len(),
+                }));
+            } else if cart.items.is_empty() {
+                outln!("Your cart is already empty.");
+            } else {
+                outln!("Removed {} item(s) from your cart.", cart.items.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_cart_items(cart: &catalog::Cart, output: &OutputConfig) {
+    let rows: Vec<Value> = cart
+        .items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "item_name": item.name,
+                "quantity": item.details.get("quantity").cloned().unwrap_or(Value::Null),
+                "cart_item_id": item.cart_item_id,
+            })
+        })
+        .collect();
+    let fields: Vec<String> = ["item_name", "quantity", "cart_item_id"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    print_records_or(&rows, Some(&fields), output.color, "Your cart is empty.");
+}
+
+/// Replaces the instance's error message for a cart that may hold sensitive
+/// values: the cart answer lists no variable values, so none can be scrubbed.
+const WITHHELD_FOR_CART: &str = "error message withheld: your cart may hold sensitive values the CLI cannot see, so the message could quote one; open the cart in the portal to see why";
+
+/// Whether any item in `cart` has a sensitive variable. The cart answer
+/// carries no variable values, so this reads each item's definition, and an
+/// item that cannot be read counts as sensitive.
+async fn cart_may_hold_secrets(client: &ServiceNowClient, cart: &catalog::Cart) -> bool {
+    let mut ids = BTreeSet::new();
+    for item in &cart.items {
+        match &item.catalog_item_id {
+            Some(id) => {
+                ids.insert(id.clone());
+            }
+            None => return true,
+        }
+    }
+    for id in ids {
+        let sensitive = match client.get_catalog_item(&id).await {
+            Ok(value) => catalog::CatalogItem::from_api(&value).map_or(true, |item| {
+                // A multi-row set's rows are typed in the portal and its
+                // columns are not listed here, so any of them could hold
+                // a secret.
+                item.variables.iter().any(|variable| {
+                    variable.is_sensitive() || variable.kind == catalog::VariableKind::MultiRowSet
+                })
+            }),
+            Err(_) => true,
+        };
+        if sensitive {
+            return true;
+        }
+    }
+    false
+}
+
+/// `catalog order --checkout` submits the whole cart, so it starts only from
+/// an empty one: anything already there would be ordered too.
+async fn ensure_cart_empty(client: &ServiceNowClient) -> Result<(), ApiError> {
+    let cart = catalog::Cart::from_api(&client.get_cart().await?)?;
+    if cart.items.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::Conflict(format!(
+        "your cart already holds {} item(s) ({}), and --checkout submits the whole cart, so they would be ordered too; review it with `servicenow catalog cart show`, then order it with `servicenow catalog cart submit` or empty it with `servicenow catalog cart clear`",
+        cart.items.len(),
+        cart.item_names()
+    )))
+}
+
+/// Submits the cart an `add_to_cart` answer describes, provided it holds only
+/// the item just added. Until the submission is sent, nothing is ordered and
+/// the item stays in the cart, so every refusal says how to finish or undo it.
+async fn submit_added_item(
+    client: &ServiceNowClient,
+    item_sys_id: &str,
+    added: &Value,
+    scrub: Option<&dyn Fn(&str) -> String>,
+) -> Result<Value, ApiError> {
+    let cart = catalog::Cart::from_api(added).map_err(|error| {
+        ApiError::Other(format!(
+            "the item was added to your cart, but the answer could not be read ({error}); nothing was ordered, so check `servicenow catalog cart show` before retrying"
+        ))
+    })?;
+    let left_in_cart = |reason: String| ApiError::NotOrdered {
+        message: format!(
+            "{reason}; nothing was ordered, and the item is still in your cart {} ({})",
+            cart.cart_id,
+            client.record_url("sc_cart", &cart.cart_id)
+        ),
+        cart_id: cart.cart_id.clone(),
+    };
+    if cart.items.is_empty() {
+        // Without the item in the answer, nothing says where it went.
+        return Err(ApiError::Other(format!(
+            "the instance accepted the item for cart {} but listed no items in it; {}",
+            cart.cart_id,
+            servicenow_cli::api::MAY_HAVE_ADDED_TO_CART
+        )));
+    }
+    if let [only] = cart.items.as_slice()
+        && only
+            .catalog_item_id
+            .as_deref()
+            .is_some_and(|id| !id.eq_ignore_ascii_case(item_sys_id))
+    {
+        return Err(left_in_cart(format!(
+            "your cart changed while the item was added and now holds \"{}\" instead, so it was not submitted",
+            only.name
+        )));
+    }
+    if cart.items.len() != 1 {
+        return Err(left_in_cart(format!(
+            "your cart changed while the item was added and now holds {} item(s) ({}), so it was not submitted",
+            cart.items.len(),
+            cart.item_names()
+        )));
+    }
+    match client.submit_cart(scrub).await {
+        Ok(request) => Ok(request),
+        // A failure after the submission was sent, or a server error, may
+        // have ordered and already says so. Anything else (a connection that
+        // never opened, or an answer refusing the submission) ordered nothing.
+        Err(error @ (ApiError::Other(_) | ApiError::Api { status: 500.., .. })) => Err(error),
+        Err(error) => {
+            // The cart is shared with the portal, which may have ordered or
+            // removed the item meanwhile: only a cart still holding it shows
+            // that nothing was ordered.
+            let added_id = &cart.items[0].cart_item_id;
+            let still_there = match client.get_cart().await {
+                Ok(answer) => {
+                    catalog::Cart::from_api(&answer).is_ok_and(|now| now.item(added_id).is_some())
+                }
+                Err(_) => false,
+            };
+            if still_there {
+                Err(left_in_cart(format!(
+                    "the item was added to your cart, but submitting the cart failed ({error})"
+                )))
+            } else {
+                Err(ApiError::Other(format!(
+                    "submitting the cart failed ({error}), and the added item is no longer in your cart, so it may have been ordered or removed elsewhere; check `servicenow catalog requests mine` and `servicenow catalog cart show` before ordering again"
+                )))
+            }
+        }
+    }
+}
+
+/// Re-reads the cart just before a write and refuses when it no longer holds
+/// what the user confirmed: the cart is shared with the portal, and a change
+/// would otherwise be ordered or removed unseen.
+async fn ensure_cart_unchanged(
+    client: &ServiceNowClient,
+    confirmed: &catalog::Cart,
+) -> Result<(), ApiError> {
+    let now = catalog::Cart::from_api(&client.get_cart().await?)?;
+    if now.fingerprint() != confirmed.fingerprint() {
+        return Err(ApiError::Conflict(format!(
+            "your cart changed after it was read (it now holds {} item(s): {}); nothing was changed, so review it with `servicenow catalog cart show` and run the command again",
+            now.items.len(),
+            if now.items.is_empty() {
+                "none".to_string()
+            } else {
+                now.item_names()
+            }
+        )));
+    }
+    Ok(())
+}
+
+/// Which call an order answer came from, since a cart answer means something
+/// different for each.
+#[derive(Clone, Copy)]
+enum OrderSource {
+    /// `order_now`, which some instances answer with a cart.
+    OrderNow,
+    /// A cart submission, which should only ever answer with a request.
+    Cart,
+}
+
 async fn emit_order_result(
     client: &ServiceNowClient,
     output: &OutputConfig,
     item_name: &str,
     request: Value,
+    source: OrderSource,
 ) -> Result<(), ApiError> {
     let (request_id, request_label) = match catalog::OrderOutcome::classify(&request) {
         catalog::OrderOutcome::Request { sys_id, number } => {
@@ -3149,13 +3526,21 @@ async fn emit_order_result(
             (sys_id, label)
         }
         catalog::OrderOutcome::CartOnly { cart_id } => {
-            return Err(ApiError::NotOrdered {
-                message: format!(
-                    "the instance accepted the order but created no request; the item was left in cart {cart_id} ({}) instead, and the instance may also have put a copy in your portal cart. This usually means the instance needs a separate checkout step, or the item cannot be ordered through the API. Nothing was ordered.",
-                    client.record_url("sc_cart", &cart_id)
+            let cart_url = client.record_url("sc_cart", &cart_id);
+            let message = match source {
+                OrderSource::OrderNow => format!(
+                    "the instance accepted the order but created no request; the item was left in cart {cart_id} ({cart_url}) instead, and the instance may also have put a copy in your portal cart. This usually means the instance needs a separate checkout step (`servicenow catalog order --checkout` orders through the cart), or the item cannot be ordered through the API. Nothing was ordered."
                 ),
-                cart_id,
-            });
+                // A cart submission is never meant to answer with a cart, so
+                // nothing here says whether it ordered: resubmitting could
+                // order twice.
+                OrderSource::Cart => {
+                    return Err(ApiError::Other(format!(
+                        "the instance answered the cart submission with cart {cart_id} ({cart_url}) instead of a request, so it is unclear whether anything was ordered; check `servicenow catalog requests mine` and `servicenow catalog cart show` before submitting again"
+                    )));
+                }
+            };
+            return Err(ApiError::NotOrdered { message, cart_id });
         }
         catalog::OrderOutcome::Unrecognized { keys, number } => {
             let fields = if keys.is_empty() {
@@ -4174,6 +4559,9 @@ fn command_behavior(path: &str) -> Value {
         "tables update",
         "tables delete",
         "catalog order",
+        "catalog cart submit",
+        "catalog cart remove",
+        "catalog cart clear",
     ];
     let local_mutations = [
         "init",
@@ -4224,10 +4612,13 @@ fn command_behavior(path: &str) -> Value {
     };
     let destructive = path.ends_with("attachments delete")
         || path.ends_with("tables delete")
+        || path.ends_with("catalog cart remove")
+        || path.ends_with("catalog cart clear")
         || path.ends_with("profile remove");
     let requires_confirmation = destructive
         || path.ends_with("incidents edit")
         || path.ends_with("catalog order")
+        || path.ends_with("catalog cart submit")
         || path.ends_with("tui");
     let supports_dry_run = [
         "catalog order",

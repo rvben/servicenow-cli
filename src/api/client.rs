@@ -645,21 +645,118 @@ impl ServiceNowClient {
         scrub: Option<&dyn Fn(&str) -> String>,
     ) -> Result<Value, ApiError> {
         validate_sys_id(sys_id)?;
-        let response = self
+        let request = self
             .http
             .post(format!("{}/items/{sys_id}/order_now", self.catalog_url))
-            .json(body)
-            .send()
+            .json(body);
+        self.send_once(request, scrub, "order", MAY_HAVE_ORDERED)
             .await
-            .map_err(|error| {
-                if error.is_connect() {
-                    ApiError::Http(error)
-                } else {
-                    ApiError::Other(format!(
-                        "order request failed after it was sent ({error}); {MAY_HAVE_ORDERED}"
-                    ))
-                }
-            })?;
+    }
+
+    /// Adds an item to the caller's cart exactly once, with the same
+    /// guarantees and `scrub` handling as [`Self::order_catalog_item`]. The
+    /// instance ignores `sysparm_requested_for` here: whoever submits the cart
+    /// is the requester.
+    pub async fn add_catalog_item_to_cart(
+        &self,
+        sys_id: &str,
+        body: &Value,
+        scrub: Option<&dyn Fn(&str) -> String>,
+    ) -> Result<Value, ApiError> {
+        validate_sys_id(sys_id)?;
+        let request = self
+            .http
+            .post(format!("{}/items/{sys_id}/add_to_cart", self.catalog_url))
+            .json(body);
+        self.send_once(request, scrub, "add-to-cart", MAY_HAVE_ADDED_TO_CART)
+            .await
+    }
+
+    /// Reads the caller's cart, the one the portal shows. The instance creates
+    /// an empty cart when the caller has none.
+    pub async fn get_cart(&self) -> Result<Value, ApiError> {
+        let response = self
+            .http
+            .get(format!("{}/cart", self.catalog_url))
+            .send()
+            .await?;
+        self.decode::<Envelope<Value>>(response)
+            .await
+            .map(|envelope| envelope.result)
+    }
+
+    /// Orders everything in the caller's cart exactly once, with the same
+    /// `scrub` handling as [`Self::order_catalog_item`]. This works whether or
+    /// not the instance requires a separate checkout step.
+    pub async fn submit_cart(
+        &self,
+        scrub: Option<&dyn Fn(&str) -> String>,
+    ) -> Result<Value, ApiError> {
+        let request = self
+            .http
+            .post(format!("{}/cart/submit_order", self.catalog_url));
+        self.send_once(request, scrub, "cart submission", MAY_HAVE_ORDERED)
+            .await
+    }
+
+    /// Removes one item from the caller's cart.
+    pub async fn remove_cart_item(&self, cart_item_id: &str) -> Result<(), ApiError> {
+        validate_sys_id(cart_item_id)?;
+        let response = self
+            .http
+            .delete(format!("{}/cart/{cart_item_id}", self.catalog_url))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        match self.response_error(response).await {
+            // The instance answers an unknown or already removed item with a
+            // plain 400.
+            ApiError::Api {
+                status: 400,
+                message,
+            } => Err(ApiError::NotFound(format!(
+                "cart item {cart_item_id}: {message}"
+            ))),
+            error => Err(error),
+        }
+    }
+
+    /// Removes every item from the cart `cart_id`.
+    pub async fn empty_cart(&self, cart_id: &str) -> Result<(), ApiError> {
+        validate_sys_id(cart_id)?;
+        let response = self
+            .http
+            .delete(format!("{}/cart/{cart_id}/empty", self.catalog_url))
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(self.response_error(response).await)
+        }
+    }
+
+    /// Sends a request that must not be repeated, and decodes its result.
+    /// Once the request may have reached the instance, a failure carries
+    /// `uncertain`, which tells the caller what may have happened.
+    async fn send_once(
+        &self,
+        request: reqwest::RequestBuilder,
+        scrub: Option<&dyn Fn(&str) -> String>,
+        what: &str,
+        uncertain: &str,
+    ) -> Result<Value, ApiError> {
+        let response = request.send().await.map_err(|error| {
+            if error.is_connect() {
+                ApiError::Http(error)
+            } else {
+                ApiError::Other(format!(
+                    "{what} request failed after it was sent ({error}); {uncertain}"
+                ))
+            }
+        })?;
         let decoded = if response.status().is_success() {
             response
                 .json::<Envelope<Value>>()
@@ -672,10 +769,10 @@ impl ServiceNowClient {
             Ok(envelope) => Ok(envelope.result),
             Err(ApiError::Api { status, message }) if status >= 500 => Err(ApiError::Api {
                 status,
-                message: format!("{message}; {MAY_HAVE_ORDERED}"),
+                message: format!("{message}; {uncertain}"),
             }),
             Err(ApiError::Http(error)) => Err(ApiError::Other(format!(
-                "could not read the order response ({error}); {MAY_HAVE_ORDERED}"
+                "could not read the {what} response ({error}); {uncertain}"
             ))),
             Err(error) => Err(error),
         }
@@ -745,6 +842,10 @@ pub fn validate_table(table: &str) -> Result<(), ApiError> {
 /// Remediation for any catalog order whose outcome the CLI cannot establish.
 pub const MAY_HAVE_ORDERED: &str =
     "the order may have been placed; check `servicenow catalog requests mine` before retrying";
+
+/// Remediation for an add-to-cart request whose outcome the CLI cannot
+/// establish.
+pub const MAY_HAVE_ADDED_TO_CART: &str = "the item may have been added to your cart, though nothing was ordered; check `servicenow catalog cart show` before retrying";
 
 pub fn validate_sys_id(sys_id: &str) -> Result<(), ApiError> {
     if sys_id.len() == 32 && sys_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {

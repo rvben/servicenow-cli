@@ -719,3 +719,117 @@ async fn a_qualified_lookup_must_return_the_chosen_record() {
         "{error}"
     );
 }
+
+const CART_ITEM: &str = "346489831b181710b97aa975624bcb75";
+
+#[tokio::test]
+async fn adding_to_the_cart_posts_once_and_a_server_error_says_it_may_have_been_added() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/add_to_cart"
+        )))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .add_catalog_item_to_cart(
+            AWS_ITEM,
+            &json!({"sysparm_quantity": "1", "variables": {}}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("503"), "{message}");
+    assert!(message.contains("may have been added"), "{message}");
+    assert!(message.contains("nothing was ordered"), "{message}");
+}
+
+#[tokio::test]
+async fn an_unreadable_add_to_cart_answer_says_it_may_have_been_added() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/sn_sc/servicecatalog/items/{AWS_ITEM}/add_to_cart"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy</html>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .add_catalog_item_to_cart(
+            AWS_ITEM,
+            &json!({"sysparm_quantity": "1", "variables": {}}),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("may have been added"), "{error}");
+}
+
+#[tokio::test]
+async fn a_cart_submission_is_sent_once_and_a_server_error_may_have_ordered() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/sn_sc/servicecatalog/cart/submit_order"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server).submit_cart(None).await.unwrap_err();
+    assert!(
+        matches!(error, ApiError::Api { status: 500, .. }),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("may have been placed"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn removing_a_cart_item_the_instance_rejects_is_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/sn_sc/servicecatalog/cart/{CART_ITEM}")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "Invalid Cart Item ID!", "detail": ""},
+            "status": "failure"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .remove_cart_item(CART_ITEM)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::NotFound(_)), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains(CART_ITEM), "{message}");
+    assert!(message.contains("Invalid Cart Item ID!"), "{message}");
+}
+
+#[tokio::test]
+async fn removing_a_cart_item_reports_other_failures_unchanged() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/sn_sc/servicecatalog/cart/{CART_ITEM}")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"message": "Insufficient rights", "detail": ""},
+            "status": "failure"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .remove_cart_item(CART_ITEM)
+        .await
+        .unwrap_err();
+    assert!(!matches!(error, ApiError::NotFound(_)), "{error:?}");
+}

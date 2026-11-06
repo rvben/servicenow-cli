@@ -272,12 +272,49 @@ An order succeeds only when the instance creates a request. Some instances
 answer an order by putting the item in a cart instead, for example when
 checkout needs a separate step. Then `catalog order` exits 8 (`kind:
 not_ordered`) and names the cart in `error.cart.sys_id`. The instance may also
-put a copy of the item in your portal cart. Submit the item from one cart at
-most, normally the portal cart, and empty any other cart holding it, since each
-submitted copy is a separate order. Do not order again, because every attempt
-adds another cart item. When the instance
-flags an item as not orderable through the API, `catalog show` notes it and
-`catalog order` warns before ordering.
+put a copy of the item in your cart. Do not order again, because every attempt
+adds another cart item. Finish or undo it with the cart commands instead:
+
+```sh
+# See what your cart holds, then order all of it or remove what you do not want
+servicenow catalog cart show
+servicenow catalog cart submit
+servicenow catalog cart remove <cart_item_id>
+servicenow catalog cart clear
+
+# Or order through the cart in one step, on an instance that needs checkout
+servicenow catalog order "AWS account request" --vars-file request.yaml --checkout --yes
+```
+
+`catalog order --checkout` adds the item to your cart and submits it, which
+works whether or not the instance has a separate checkout step. It submits the
+whole cart, so it refuses to start (exit 7, `kind: conflict`) while your cart
+holds anything. Empty the cart first, or order it with `catalog cart submit`.
+It cannot order for someone else, because the instance ignores
+`--requested-for` for cart items, so the two flags are refused together. When the
+submission is refused, it exits 8 and leaves the item in your cart rather than
+removing it; if the item has left the cart by then (the cart is shared with
+the portal), it says the item may have been ordered instead. When the outcome
+is unknown (a server error or a lost response), it says the order may have
+been placed: check `catalog requests mine` before submitting again. That
+is exit 1 (`kind: unexpected_error`), as is a submission the instance answers
+with a cart instead of a request; exit 8 always means nothing was ordered.
+`--checkout --dry-run` reads your cart (creating an empty one if you have
+none), refuses with exit 7 while it holds anything, and adds `"checkout": true`
+to the plan.
+
+`cart submit` orders every item in the cart, including any added in the
+portal, and shows them before asking. `cart submit` and `cart clear` read the
+cart again just before acting and refuse (exit 7) if it changed since it was
+shown, so nothing added in the portal meanwhile is ordered or removed unseen.
+The cart does not show variable values, so when an item in it has a sensitive
+variable or a multi-row variable set (or cannot be checked), `cart submit`
+withholds the instance's error message rather than risk quoting one. `cart
+remove` and `cart clear` ask before
+removing anything. Reading the cart creates an empty one when you have none,
+as the portal does. The cart commands honor read-only profiles. When the
+instance flags an item as not orderable through the API, `catalog show` notes
+it and `catalog order` warns before ordering.
 
 Items that need the portal are refused with a link to it: record producers,
 order guides, items with a mandatory attachment, and items with a mandatory
@@ -390,7 +427,7 @@ their normal text to stdout with exit code 0.
 | 5 | Other ServiceNow API error |
 | 6 | Rate limited |
 | 7 | Conflict or ambiguous match |
-| 8 | Not ordered: the instance put the item in a cart and created no request (`kind: not_ordered`, with `error.cart.sys_id`) |
+| 8 | Not ordered: the item was left in a cart and no request was created (`kind: not_ordered`, with `error.cart.sys_id`) |
 
 The versioned offline command schema describes argument types, defaults, enums,
 side effects, confirmation and dry-run behavior, output envelopes, and exit
