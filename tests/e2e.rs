@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures_util::FutureExt;
 use serde_json::{Map, Value};
 use servicenow_cli::api::{ApiError, DisplayValue, ListOptions, ServiceNowClient};
 use servicenow_cli::config::AuthType;
@@ -789,7 +790,38 @@ async fn delete_fixture(
     fixture: &mut Fixture,
     flows_before: &BTreeSet<String>,
 ) -> Result<(), ApiError> {
-    delete_records(client, fixture).await?;
+    delete_fixtures(client, std::slice::from_mut(fixture), flows_before).await
+}
+
+/// [`delete_fixture`] for several fixtures at once. Every fixture is deleted
+/// before any flow is checked, since each one's flows keep running until its
+/// own records are gone.
+async fn delete_fixtures(
+    client: &ServiceNowClient,
+    fixtures: &mut [Fixture],
+    flows_before: &BTreeSet<String>,
+) -> Result<(), ApiError> {
+    let mut failures = Vec::new();
+    for fixture in fixtures.iter_mut() {
+        if let Err(error) = delete_records(client, fixture).await {
+            failures.push(error.to_string());
+        }
+    }
+    if let Err(error) = wait_for_flows(client, flows_before).await {
+        failures.push(error.to_string());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Other(failures.join("\n")))
+    }
+}
+
+/// Requires every flow started since `flows_before` was read to finish.
+async fn wait_for_flows(
+    client: &ServiceNowClient,
+    flows_before: &BTreeSet<String>,
+) -> Result<(), ApiError> {
     // Deleting a record cancels its flows asynchronously.
     let mut left = BTreeSet::new();
     for _ in 0..6 {
@@ -959,12 +991,11 @@ async fn request_for_marker(
                 .map(str::to_string)
         }))
     };
-    let Some(option) = first("sc_item_option", format!("value={marker}"), "sys_id").await? else {
-        return Ok(None);
-    };
+    // Cart copies of an item carry the marker too, so the link to the
+    // requested item is found through whichever copy it points at.
     let Some(ritm) = first(
         "sc_item_option_mtom",
-        format!("sc_item_option={option}"),
+        format!("sc_item_option.value={marker}"),
         "request_item",
     )
     .await?
@@ -1200,6 +1231,349 @@ async fn pdi_catalog_order_lifecycle() {
         &mut Fixture::catalog_order(&request_id),
         &flows_before,
     )
+    .await;
+    conclude(verification, cleanup);
+}
+
+/// Exits with `code` and returns the parsed JSON error, or says why not.
+fn cli_error(output: &std::process::Output, code: i32) -> Result<Value, String> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() != Some(code) {
+        return Err(format!(
+            "expected exit {code}, got {:?}: {stderr}",
+            output.status.code()
+        ));
+    }
+    serde_json::from_str(stderr.trim())
+        .map_err(|error| format!("error output is not JSON ({error}): {stderr}"))
+}
+
+/// Ids of `table` records `query` matches, for before/after comparisons.
+async fn id_set(
+    client: &ServiceNowClient,
+    table: &str,
+    query: &str,
+) -> Result<BTreeSet<String>, String> {
+    record_ids(client, table, query.to_string(), "sys_id")
+        .await
+        .map(|ids| ids.into_iter().collect())
+        .map_err(|error| format!("read {table} ({query}): {error}"))
+}
+
+const TWO_STEP_CHECKOUT: &str = "glide.sc.checkout.twostep";
+
+async fn set_property(
+    client: &ServiceNowClient,
+    sys_id: &str,
+    value: &str,
+) -> Result<(), ApiError> {
+    client
+        .update_record(
+            "sys_properties",
+            sys_id,
+            &object([("value", Value::String(value.to_string()))]),
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Drives `catalog cart` and `catalog order --checkout` against an instance
+/// that requires a separate checkout step, where a plain order only fills a
+/// cart, and then against one that does not.
+#[tokio::test]
+#[ignore = "requires a ServiceNow Personal Developer Instance"]
+async fn pdi_catalog_cart_lifecycle() {
+    let pdi = Pdi::from_env();
+    let client = pdi.client();
+    let isolated_home = TempDir::new().unwrap();
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock is after Unix epoch")
+        .as_nanos();
+    let markers: Vec<String> = (1..=6)
+        .map(|n| format!("servicenow-cli-e2e-cart-{unique}-{n}"))
+        .collect();
+    let run = |args: &[&str]| run_catalog_cli(&pdi, &isolated_home, args);
+    let cli = |args: &[&str]| catalog_cli_json(&pdi, &isolated_home, args);
+    let order_args = |marker: &str| -> Vec<String> {
+        [
+            "catalog",
+            "order",
+            "AWS account request",
+            "--var",
+            "division=IT",
+            "--var",
+            "environment=Dev",
+            "--var",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .chain([
+            format!("describe_briefly_the_purpose_of_this_account={marker}"),
+            "--yes".to_string(),
+        ])
+        .collect()
+    };
+    let order = |marker: &str, extra: &[&str]| {
+        let args = order_args(marker);
+        let args: Vec<&str> = args
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .collect();
+        run(&args)
+    };
+    let cart_items = || -> Result<Vec<Value>, String> {
+        let (cart, _) = cli(&["catalog", "cart", "show"])?;
+        cart["items"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| format!("cart show listed no items array: {cart}"))
+    };
+
+    let property = client
+        .find_one(
+            "sys_properties",
+            "name",
+            TWO_STEP_CHECKOUT,
+            Some(vec!["sys_id".to_string(), "value".to_string()]),
+            DisplayValue::False,
+        )
+        .await
+        .expect("read the two-step checkout property");
+    let property_id = property["sys_id"].as_str().unwrap().to_string();
+    let original_two_step = property["value"].as_str().unwrap_or("false").to_string();
+    let user_carts = "user=javascript:gs.getUserID()";
+    let user_cart_items = "cart.user=javascript:gs.getUserID()";
+    let carts_before = id_set(&client, "sc_cart", user_carts).await.unwrap();
+    let cart_items_before = id_set(&client, "sc_cart_item", user_cart_items)
+        .await
+        .unwrap();
+    // Removing a cart item leaves its variable values behind, so every new
+    // value of the ordered item that this user created is the test's to
+    // delete; values other users create meanwhile are not.
+    let item_options = "item_option_new.cat_item.name=AWS account request\
+        ^sys_created_by=javascript:gs.getUserName()"
+        .to_string();
+    let item_options_before = id_set(&client, "sc_item_option", &item_options)
+        .await
+        .unwrap();
+    let flows_before = unreclaimable_flows(&client)
+        .await
+        .expect("read running flows");
+    assert!(
+        cart_items().unwrap().is_empty(),
+        "the PDI user's cart must start empty, since the test submits it"
+    );
+    let mut reported_requests = BTreeSet::new();
+
+    // A panic mid-verification must still reach the cleanup, which restores
+    // the instance-wide checkout property.
+    let verification: Result<(), String> = std::panic::AssertUnwindSafe(async {
+        set_property(&client, &property_id, "true")
+            .await
+            .map_err(|error| format!("enable two-step checkout: {error}"))?;
+
+        // A plain order only fills a cart, and leaves a copy in the portal cart.
+        let error = cli_error(&order(&markers[0], &[]), 8)?;
+        if error["error"]["cart"]["sys_id"].as_str().is_none() {
+            return Err(format!("a cart-only order named no cart: {error}"));
+        }
+        let items = cart_items()?;
+        if items.len() != 1 || items[0]["item_name"] != "AWS account request" {
+            return Err(format!("expected the portal copy in the cart: {items:?}"));
+        }
+        let copy = items[0]["cart_item_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        // --checkout refuses to submit a cart that already holds something.
+        let error = cli_error(&order(&markers[1], &["--checkout"]), 7)?;
+        if error["error"]["kind"] != "conflict" {
+            return Err(format!("expected a conflict: {error}"));
+        }
+        if request_for_marker(&client, &markers[1])
+            .await
+            .map_err(|error| {
+                format!("look for a request from the refused --checkout order: {error}")
+            })?
+            .is_some()
+        {
+            return Err("the refused --checkout order created a request".into());
+        }
+        if cart_items()?.len() != 1 {
+            return Err("the refused --checkout order changed the cart".into());
+        }
+
+        // remove takes the copy out; a second removal finds nothing.
+        let (removed, _) = cli(&["catalog", "cart", "remove", &copy, "--yes"])?;
+        if removed["removed"] != true || removed["item_name"] != "AWS account request" {
+            return Err(format!("unexpected remove answer: {removed}"));
+        }
+        if !cart_items()?.is_empty() {
+            return Err("the cart is not empty after removing its only item".into());
+        }
+        cli_error(&run(&["catalog", "cart", "remove", &copy, "--yes"]), 4)?;
+
+        // clear empties a cart, and answers an empty one without failing.
+        cli_error(&order(&markers[2], &[]), 8)?;
+        let (cleared, _) = cli(&["catalog", "cart", "clear", "--yes"])?;
+        if cleared["items_removed"] != 1 {
+            return Err(format!("expected clear to remove one item: {cleared}"));
+        }
+        let (cleared, _) = cli(&["catalog", "cart", "clear", "--yes"])?;
+        if cleared["items_removed"] != 0 || !cart_items()?.is_empty() {
+            return Err(format!("expected an already empty cart: {cleared}"));
+        }
+        cli_error(&run(&["catalog", "cart", "submit", "--yes"]), 2)?;
+
+        // submit orders the portal copy of a cart-only order exactly once.
+        cli_error(&order(&markers[3], &[]), 8)?;
+        let (submitted, _) = cli(&["catalog", "cart", "submit", "--yes"])?;
+        let request = submitted["request"]["request_id"]
+            .as_str()
+            .ok_or_else(|| format!("cart submit reported no request: {submitted}"))?;
+        reported_requests.insert(request.to_string());
+        let ritms = submitted["requestedItems"].as_array().map_or(0, Vec::len);
+        if ritms != 1 {
+            return Err(format!(
+                "cart submit created {ritms} requested items: {submitted}"
+            ));
+        }
+        if !cart_items()?.is_empty() {
+            return Err("the cart is not empty after submitting it".into());
+        }
+
+        // --checkout orders in one step, with two-step checkout on and off.
+        for (marker, two_step) in [(&markers[4], "true"), (&markers[5], "false")] {
+            set_property(&client, &property_id, two_step)
+                .await
+                .map_err(|error| format!("set two-step checkout to {two_step}: {error}"))?;
+            let ordered = order(marker, &["--checkout"]);
+            let ordered: Value = serde_json::from_slice(&ordered.stdout).map_err(|error| {
+                format!(
+                    "--checkout (two-step {two_step}) printed no JSON ({error}): {}",
+                    String::from_utf8_lossy(&ordered.stderr)
+                )
+            })?;
+            let request = ordered["request"]["request_id"]
+                .as_str()
+                .ok_or_else(|| format!("--checkout reported no request: {ordered}"))?;
+            reported_requests.insert(request.to_string());
+            let number = ordered["requestedItems"][0]["number"]
+                .as_str()
+                .ok_or_else(|| format!("--checkout reported no requested item: {ordered}"))?;
+            let (variables, _) = cli(&["catalog", "requests", "vars", number])?;
+            if variables["describe_briefly_the_purpose_of_this_account"] != marker.as_str() {
+                return Err(format!("{number} carries the wrong variables: {variables}"));
+            }
+            if !cart_items()?.is_empty() {
+                return Err(format!(
+                    "--checkout (two-step {two_step}) left the cart non-empty"
+                ));
+            }
+        }
+        Ok(())
+    })
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|panic| {
+        Err(panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_string()))
+            .map_or_else(
+                || "verification panicked".to_string(),
+                |text| format!("verification panicked: {text}"),
+            ))
+    });
+
+    let cleanup: Result<(), ApiError> = async {
+        let mut failures = Vec::new();
+        if let Err(error) = set_property(&client, &property_id, &original_two_step).await {
+            failures.push(format!(
+                "restore {TWO_STEP_CHECKOUT}={original_two_step}: {error}"
+            ));
+        }
+        let mut requests = reported_requests.clone();
+        for marker in &markers {
+            match request_for_marker(&client, marker).await {
+                Ok(found) => requests.extend(found),
+                Err(error) => failures.push(format!("find the order carrying {marker}: {error}")),
+            }
+        }
+        let mut orders: Vec<Fixture> = requests
+            .iter()
+            .map(|id| Fixture::catalog_order(id))
+            .collect();
+        if let Err(error) = delete_fixtures(&client, &mut orders, &flows_before).await {
+            failures.push(format!("orders: {error}"));
+        }
+        // Cart-only orders leave their item in a cart of its own, and every
+        // cart item has variable values of its own.
+        let ids = |result: Result<BTreeSet<String>, String>, failures: &mut Vec<String>| {
+            result.unwrap_or_else(|error| {
+                failures.push(error);
+                BTreeSet::new()
+            })
+        };
+        let items = ids(
+            id_set(&client, "sc_cart_item", user_cart_items).await,
+            &mut failures,
+        );
+        for item in items.difference(&cart_items_before) {
+            let options = ids(
+                id_set(&client, "sc_item_option", &format!("cart_item={item}")).await,
+                &mut failures,
+            );
+            for option in options {
+                if let Err(error) = client.delete_record("sc_item_option", &option).await {
+                    failures.push(format!("sc_item_option {option}: {error}"));
+                }
+            }
+            if let Err(error) = client.delete_record("sc_cart_item", item).await {
+                failures.push(format!("sc_cart_item {item}: {error}"));
+            }
+        }
+        let options = ids(
+            id_set(&client, "sc_item_option", &item_options).await,
+            &mut failures,
+        );
+        for option in options.difference(&item_options_before) {
+            if let Err(error) = client.delete_record("sc_item_option", option).await {
+                failures.push(format!("sc_item_option {option}: {error}"));
+            }
+        }
+        let carts = ids(id_set(&client, "sc_cart", user_carts).await, &mut failures);
+        for cart in carts.difference(&carts_before) {
+            if let Err(error) = client.delete_record("sc_cart", cart).await {
+                failures.push(format!("sc_cart {cart}: {error}"));
+            }
+        }
+        let mut left = Vec::new();
+        for (table, query, before) in [
+            ("sc_cart_item", user_cart_items, &cart_items_before),
+            ("sc_cart", user_carts, &carts_before),
+            (
+                "sc_item_option",
+                item_options.as_str(),
+                &item_options_before,
+            ),
+        ] {
+            let current = ids(id_set(&client, table, query).await, &mut failures);
+            let new: Vec<String> = current.difference(before).cloned().collect();
+            if !new.is_empty() {
+                left.push(format!("{table}: {}", new.join(" ")));
+            }
+        }
+        failures.extend(left.into_iter().map(|left| format!("left behind: {left}")));
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ApiError::Other(failures.join("\n")))
+        }
+    }
     .await;
     conclude(verification, cleanup);
 }

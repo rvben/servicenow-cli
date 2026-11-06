@@ -22,6 +22,8 @@ const DELETED_FROM: &[&str] = &[
     "sysapproval_approver",
     "sc_item_option",
     "sc_item_option_mtom",
+    "sc_cart",
+    "sc_cart_item",
     "task_sla",
     "sys_attachment",
     "sys_email",
